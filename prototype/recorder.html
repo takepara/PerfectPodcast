@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f1e9">
+  <meta name="description" content="PerfectPodcast ローカル録音プロトタイプ">
+  <title>PerfectPodcast — Local Recorder</title>
+  <link rel="stylesheet" href="./recorder.css">
+  <script type="module" src="./recorder.js"></script>
+</head>
+<body>
+  <div class="top-rule" aria-hidden="true"></div>
+  <main class="shell">
+    <header class="topbar">
+      <a class="brand" href="./recorder.html" aria-label="PerfectPodcast ホーム">
+        <span class="brand-mark" aria-hidden="true">P</span>
+        <span>perfect<span class="brand-light">podcast</span></span>
+      </a>
+    </header>
+
+    <section id="setupView" class="view">
+      <div class="intro">
+        <h1>ローカル録音</h1>
+        <p class="intro-copy">音声は約1秒ごとにこの端末へ保存されます。保存済みの録音はあとから WAV として書き出せます。</p>
+      </div>
+      <div class="setup-grid">
+        <form id="setupForm" class="panel setup-panel">
+          <div class="panel-heading">
+            <h2>新しい収録</h2>
+          </div>
+          <label class="field">
+            <span>あなたの名前</span>
+            <input id="participantName" name="participantName" maxlength="60" placeholder="例：山田 花子" required>
+          </label>
+          <div class="device-row">
+            <label class="field">
+              <span>録音マイク</span>
+              <select id="micDevice" name="micDevice"><option value="">デバイスを確認しています…</option></select>
+            </label>
+            <button id="detectDevices" class="button button-quiet device-action" type="button">デバイスを検出</button>
+          </div>
+          <p id="setupMessage" class="inline-message" role="status"></p>
+          <button class="button button-primary" type="submit">スタジオを開く</button>
+          <p class="form-note">Chrome / Edge と HTTPS または localhost を使用してください。マイク名が表示されない場合は「デバイスを検出」を押してください。</p>
+        </form>
+        <aside class="panel recent-panel">
+          <div class="panel-heading compact">
+            <h2>保存したセッション</h2>
+          </div>
+          <div id="sessionList" class="session-list">
+            <p class="empty-state">保存済みのセッションはありません。</p>
+          </div>
+          <p class="privacy-note">音声と台帳はこの端末の IndexedDB に保存します。サーバーへ音声は送信しません。</p>
+        </aside>
+      </div>
+      <footer class="page-footer">PCM 24-bit · 48 kHz · mono · WAV</footer>
+    </section>
+
+    <section id="studioView" class="view" hidden>
+      <div class="studio-head">
+        <button id="backButton" class="text-button" type="button"><span aria-hidden="true">←</span> セッション一覧</button>
+        <div class="studio-title-row">
+          <div><h1 id="studioTitle">収録</h1></div>
+          <div class="participant-chip"><span class="avatar">P</span><span id="participantLabel">Participant</span></div>
+        </div>
+      </div>
+
+      <div class="studio-grid">
+        <section class="panel record-panel" aria-labelledby="recordHeading">
+          <div class="panel-topline">
+            <div class="status-line"><span id="statusDot" class="status-dot"></span><span id="statusText">録音を始める準備ができました</span></div>
+            <span class="format-pill">24-bit / 48 kHz WAV</span>
+          </div>
+          <h2 id="recordHeading" class="visually-hidden">録音操作</h2>
+          <div id="timer" class="timer" aria-live="off">00:00</div>
+          <div class="meter-block">
+            <div class="meter-label"><span>入力レベル</span><span id="meterHint">マイク待機中</span></div>
+            <div class="meter" role="meter" aria-label="マイク入力レベル" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <div id="meterFill" class="meter-fill"></div>
+            </div>
+          </div>
+          <div class="controls">
+            <button id="recordButton" class="button button-record" type="button"><span aria-hidden="true">●</span> 録音開始</button>
+            <button id="stopButton" class="button button-stop" type="button" disabled><span aria-hidden="true">■</span> 停止して保存</button>
+          </div>
+          <div id="errorText" class="error-text" role="alert" aria-live="assertive"></div>
+          <div class="capture-note"><span aria-hidden="true">↳</span><span>録音は約1秒ごとに端末へ確定保存されます。一時停止はありません。区切るときは停止して新しいtakeを開始してください。</span></div>
+        </section>
+
+        <aside class="panel storage-panel" aria-labelledby="storageHeading">
+          <div class="panel-heading compact">
+            <span class="storage-icon" aria-hidden="true">▤</span>
+            <h2 id="storageHeading">端末の保存状況</h2>
+          </div>
+          <div class="storage-number"><strong id="storageAvailable">確認中</strong><span>推定空き容量</span></div>
+          <div class="storage-track"><div id="storageFill" class="storage-fill"></div></div>
+          <p id="storageDetail" class="storage-detail">ブラウザーの保存容量を確認しています。</p>
+          <div class="storage-divider"></div>
+          <div class="saved-total"><span>このセッションの保存済み</span><strong id="sessionSaved">0.00 MB</strong></div>
+          <div class="saved-total"><span>保存チャンク</span><strong id="chunkCount">0</strong></div>
+          <p class="storage-caveat">容量はブラウザーの推定値です。端末の故障やサイトデータ削除からの復旧はできません。</p>
+        </aside>
+      </div>
+
+      <section class="panel takes-panel" aria-labelledby="takesHeading">
+        <div class="takes-heading">
+          <h2 id="takesHeading">このセッションの録音</h2>
+          <span id="takeCount" class="count-pill">0 takes</span>
+        </div>
+        <div id="takeList" class="take-list">
+          <p class="empty-state">録音したtakeがここに表示されます。</p>
+        </div>
+      </section>
+      <footer class="page-footer studio-footer">ローカル保存 <span>·</span> 自動削除なし <span>·</span> WAV は明示操作で書き出し</footer>
+    </section>
+  </main>
+  <div id="notice" class="notice" role="status" aria-live="polite"></div>
+</body>
+</html>
