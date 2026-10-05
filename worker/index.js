@@ -1,7 +1,7 @@
 const ROOM_ID_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const ALLOWED_MESSAGES = {
-  host: new Set(['approved', 'denied', 'offer', 'auth-confirm', 'candidate', 'ice-restart']),
+  host: new Set(['approved', 'denied', 'offer', 'auth-confirm', 'candidate', 'ice-restart', 'recording-state']),
   guest: new Set(['join-request', 'answer', 'candidate', 'ice-restart-answer'])
 };
 
@@ -60,6 +60,10 @@ export class RoomSignaling {
     const role = this.peers.get(socket);
     if (!message || typeof message.type !== 'string' || !ALLOWED_MESSAGES[role].has(message.type)) {
       this.reject(socket, '許可されていないシグナリングメッセージです。');
+      return;
+    }
+    if (message.type === 'recording-state' && typeof message.recording !== 'boolean') {
+      this.reject(socket, '録音状態の形式が不正です。');
       return;
     }
     const recipientRole = role === 'host' ? 'guest' : 'host';

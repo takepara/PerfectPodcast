@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { fingerprintFromSdp, invitationProof, transcript } from '../prototype/room-call.js';
+import { RoomSignaling } from '../worker/index.js';
 
 test('reads the DTLS SHA-256 fingerprint from CRLF SDP', () => {
   const fingerprint = 'A1:B2:C3:D4';
@@ -32,4 +33,56 @@ test('invitation proof is bound to its room, nonce, and guest key', async () => 
   assert.notEqual(await invitationProof(secret, 'room-a', 'nonce-b', 'guest-key', 1000), proof);
   assert.notEqual(await invitationProof(secret, 'room-a', 'nonce-a', 'other-key', 1000), proof);
   assert.notEqual(await invitationProof(secret, 'room-a', 'nonce-a', 'guest-key', 1001), proof);
+});
+
+test('only the host can relay valid recording-state messages', async () => {
+  const originalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = { OPEN: 1 };
+  const makeSocket = () => ({
+    readyState: 1,
+    messages: [],
+    send(message) { this.messages.push(JSON.parse(message)); },
+    close() { this.readyState = 3; }
+  });
+  try {
+    const host = makeSocket();
+    const guest = makeSocket();
+    const signaling = new RoomSignaling({});
+    signaling.peers.set(host, 'host');
+    signaling.peers.set(guest, 'guest');
+
+    await signaling.onMessage(host, { data: JSON.stringify({ type: 'recording-state', recording: true }) });
+    assert.deepEqual(guest.messages, [{ type: 'recording-state', recording: true }]);
+
+    await signaling.onMessage(guest, { data: JSON.stringify({ type: 'recording-state', recording: false }) });
+    assert.equal(guest.readyState, 3);
+    assert.equal(host.messages.some((message) => message.type === 'recording-state'), false);
+  } finally {
+    if (originalWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = originalWebSocket;
+  }
+});
+
+test('rejects malformed host recording-state messages', async () => {
+  const originalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = { OPEN: 1 };
+  const host = {
+    readyState: 1,
+    messages: [],
+    send(message) { this.messages.push(JSON.parse(message)); },
+    close() { this.readyState = 3; }
+  };
+  try {
+    const guest = { readyState: 1, messages: [], send(message) { this.messages.push(JSON.parse(message)); }, close() { this.readyState = 3; } };
+    const signaling = new RoomSignaling({});
+    signaling.peers.set(host, 'host');
+    signaling.peers.set(guest, 'guest');
+
+    await signaling.onMessage(host, { data: JSON.stringify({ type: 'recording-state', recording: 'yes' }) });
+    assert.equal(host.readyState, 3);
+    assert.equal(guest.messages.length, 0);
+  } finally {
+    if (originalWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = originalWebSocket;
+  }
 });

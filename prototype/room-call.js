@@ -93,11 +93,23 @@ function signalingUrl(roomId) {
 }
 
 export class RoomCall {
-  constructor({ getSession, getParticipantName, getMicrophoneStream, releaseMicrophone, onError }) {
+  constructor({
+    getSession,
+    getParticipantName,
+    getMicrophoneStream,
+    releaseMicrophone,
+    getRecordingState,
+    onRecordingState,
+    onLocalStream,
+    onError
+  }) {
     this.getSession = getSession;
     this.getParticipantName = getParticipantName;
     this.getMicrophoneStream = getMicrophoneStream;
     this.releaseMicrophone = releaseMicrophone;
+    this.getRecordingState = getRecordingState || (() => false);
+    this.onRecordingState = onRecordingState;
+    this.onLocalStream = onLocalStream;
     this.onError = onError;
     this.socket = null;
     this.peerConnection = null;
@@ -107,6 +119,7 @@ export class RoomCall {
     this.guestIdentity = null;
     this.guestNonce = null;
     this.pendingGuest = null;
+    this.remoteRecordingState = null;
     this.usedNonces = new Map();
     this.authFields = null;
     this.localSender = null;
@@ -115,6 +128,18 @@ export class RoomCall {
     this.retryCount = 0;
     this.disconnectTimer = null;
     this.socketReady = null;
+    this.remoteAudioContext = null;
+    this.remoteAudioSource = null;
+    this.remoteAnalyser = null;
+    this.remoteSilentGain = null;
+    this.remoteSamples = null;
+    this.remoteHistory = new Float32Array(600);
+    this.remoteHistoryCount = 0;
+    this.remoteAnimationFrame = null;
+    this.remoteSampledAt = 0;
+    this.remoteWaveformStartedAt = 0;
+    this.remoteRulerSecond = -1;
+    this.remoteTrack = null;
     this.invitation = this.readInvitation();
     this.bindControls();
   }
@@ -123,12 +148,17 @@ export class RoomCall {
     return Boolean(this.peerConnection || this.socket);
   }
 
+  get isGuest() {
+    return this.inviteMode;
+  }
+
   readInvitation() {
     const params = new URLSearchParams(window.location.hash.slice(1));
+    this.inviteMode = ['session', 'invite', 'host'].some((key) => params.has(key));
     const roomId = params.get('session');
     const secret = params.get('invite');
     const hostPublicKey = params.get('host');
-    if (!roomId && !secret && !hostPublicKey) return null;
+    if (!this.inviteMode) return null;
     if (!roomId || !ROOM_ID_PATTERN.test(roomId) || !secret || !hostPublicKey) {
       this.setStatus('招待リンクが正しくありません。ホストに新しいリンクを依頼してください。', true);
       return null;
@@ -150,10 +180,48 @@ export class RoomCall {
     $('leaveRoomButton').addEventListener('click', () => { void this.leave(); });
     $('copyInviteButton').addEventListener('click', () => { void this.copyInvite(); });
     $('playRemoteAudioButton').addEventListener('click', () => { void this.playRemoteAudio(); });
-    if (this.invitation) {
-      $('createRoomButton').hidden = true;
-      $('joinRoomButton').hidden = false;
-      this.setStatus('招待を確認しました。名前を確認し、参加申請してください。');
+    this.applyRoleUI();
+  }
+
+  applyRoleUI() {
+    const guestMode = this.inviteMode;
+    $('setupTitle').textContent = guestMode ? '招待された収録' : 'ローカル録音';
+    $('setupInstructions').textContent = guestMode
+      ? 'あなたはゲストとして招待されています。表示名とマイクを設定してスタジオへ進み、ホストに参加申請してください。ホストが録音を操作し、あなたの音声もこの端末に自動保存されます。'
+      : 'この端末で収録を始めるか、スタジオからゲストを招待できます。';
+    $('setupFormTitle').textContent = guestMode ? 'ゲスト参加の準備' : '収録の準備';
+    $('participantNameLabel').textContent = guestMode ? 'ホストに表示する名前' : 'あなたの名前';
+    $('micDeviceLabel').textContent = guestMode ? '通話・録音に使うマイク' : '録音マイク';
+    $('openStudioButton').textContent = guestMode ? 'ゲスト用スタジオへ進む' : 'スタジオを開く';
+    $('openStudioButton').disabled = guestMode && !this.invitation;
+    $('recentPanel').hidden = guestMode;
+    $('setupView').querySelector('.setup-grid').classList.toggle('guest-mode', guestMode);
+    $('roomPanel').classList.toggle('guest-mode', guestMode);
+    $('roleBadge').textContent = guestMode ? 'ゲスト' : 'ホスト';
+    $('roleBadge').classList.toggle('guest', guestMode);
+    $('roomRoleLabel').textContent = guestMode ? 'ゲスト操作' : 'ホスト操作';
+    $('roomHeading').textContent = guestMode ? '招待された部屋に参加' : 'ゲストを招待';
+    $('roomInstructions').textContent = guestMode
+      ? 'ホストに参加申請を送り、承認されると音声通話が始まります。'
+      : '招待リンクを共有し、参加申請が届いたら相手を確認して承認してください。';
+    $('createRoomButton').hidden = guestMode;
+    $('joinRoomButton').hidden = !guestMode || !this.invitation;
+    $('joinRoomButton').disabled = guestMode && !this.invitation;
+    $('recordControls').hidden = guestMode;
+    $('hostRecordingNotice').hidden = !guestMode;
+    $('joinRoomButton').textContent = 'ホストに参加申請';
+    $('takesHeading').textContent = guestMode ? 'この端末のゲスト録音' : 'このセッションの録音';
+    $('remoteWaveformTitle').textContent = guestMode ? 'ホストのトラック' : 'ゲストのトラック';
+    $('remoteWaveformParticipant').textContent = guestMode ? 'ホスト' : 'ゲスト';
+    this.setRemoteWaveState('未接続');
+    if (guestMode && !this.invitation) {
+      $('setupInstructions').textContent = '招待リンクが正しくありません。ホストに新しいリンクを依頼してください。';
+      $('setupInstructions').classList.add('setup-error');
+      $('setupMessage').textContent = 'このリンクからゲスト参加できません。';
+    } else if (guestMode) {
+      this.setStatus('招待を確認しました。準備ができたらホストに参加申請してください。');
+    } else {
+      this.setStatus('招待リンクを作成してゲストを招待できます。');
     }
   }
 
@@ -167,6 +235,168 @@ export class RoomCall {
 
   setCallState(message) {
     $('callState').textContent = message;
+  }
+
+  setHostRecordingState(recording) {
+    if (this.localRole !== 'host') return;
+    if (typeof recording !== 'boolean') {
+      this.setStatus('録音状態をゲストへ同期できませんでした。', true);
+      return;
+    }
+    if (!this.connected && !this.pendingGuest) return;
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      this.setStatus('ゲストとの接続がないため、録音状態を同期できませんでした。', true);
+      return;
+    }
+    try {
+      this.send({ type: 'recording-state', recording });
+    } catch (error) {
+      this.setStatus(`ゲストへ録音状態を同期できませんでした: ${error.message}`, true);
+    }
+  }
+
+  receiveRecordingState(message) {
+    if (this.localRole !== 'guest' || typeof message.recording !== 'boolean') {
+      this.setStatus('ホストから不正な録音状態が届きました。', true);
+      return;
+    }
+    this.remoteRecordingState = message.recording;
+    if (this.connected || !message.recording) this.onRecordingState?.(message.recording);
+  }
+
+  setRemoteWaveState(message, active = false) {
+    const state = $('remoteWaveformState');
+    if (!state) return;
+    state.textContent = message;
+    state.classList.toggle('remote-live', active);
+  }
+
+  async startRemoteWaveform(stream, track) {
+    this.stopRemoteWaveform();
+    if (!window.AudioContext) throw new Error('このブラウザーでは波形表示を利用できません。');
+    this.remoteTrack = track;
+    this.remoteAudioContext = new AudioContext();
+    this.remoteAudioSource = this.remoteAudioContext.createMediaStreamSource(stream);
+    this.remoteAnalyser = this.remoteAudioContext.createAnalyser();
+    this.remoteAnalyser.fftSize = 1024;
+    this.remoteSamples = new Float32Array(this.remoteAnalyser.fftSize);
+    this.remoteSilentGain = this.remoteAudioContext.createGain();
+    this.remoteSilentGain.gain.value = 0;
+    this.remoteAudioSource.connect(this.remoteAnalyser);
+    this.remoteAnalyser.connect(this.remoteSilentGain).connect(this.remoteAudioContext.destination);
+    this.remoteHistory.fill(0);
+    this.remoteHistoryCount = 0;
+    this.remoteSampledAt = 0;
+    this.remoteWaveformStartedAt = performance.now();
+    this.remoteRulerSecond = -1;
+    this.setRemoteWaveState(track.muted ? '音声待ち' : '波形準備中');
+    this.drawRemoteWaveform();
+    if (this.remoteAudioContext.state === 'suspended') {
+      void this.remoteAudioContext.resume().catch((error) => {
+        this.setRemoteWaveState('波形停止');
+        this.setCallState(`相手の音声は接続中ですが、波形表示を開始できません: ${error.message}`);
+      });
+    }
+  }
+
+  drawRemoteWaveform() {
+    const canvas = $('remoteWaveformCanvas');
+    const context = canvas.getContext('2d');
+    if (!context) {
+      this.setRemoteWaveState('波形描画エラー');
+      return;
+    }
+    if (!canvas.parentElement) {
+      this.setRemoteWaveState('波形描画エラー');
+      return;
+    }
+    const bounds = canvas.parentElement.getBoundingClientRect();
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    const width = Math.max(1, Math.round(bounds.width * pixelRatio));
+    const height = Math.max(1, Math.round(bounds.height * pixelRatio));
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+    context.clearRect(0, 0, width, height);
+    context.beginPath();
+    context.lineWidth = 1;
+    context.strokeStyle = '#3b464e';
+    context.moveTo(0, height / 2);
+    context.lineTo(width, height / 2);
+    context.stroke();
+
+    const now = performance.now();
+    if (this.remoteAudioContext?.state === 'running' && this.remoteAnalyser && this.remoteSamples &&
+        this.remoteTrack?.readyState === 'live' && !this.remoteTrack.muted && now - this.remoteSampledAt >= 100) {
+      this.remoteAnalyser.getFloatTimeDomainData(this.remoteSamples);
+      let peak = 0;
+      for (const sample of this.remoteSamples) peak = Math.max(peak, Math.abs(sample));
+      if (this.remoteHistoryCount === this.remoteHistory.length) {
+        this.remoteHistory.copyWithin(0, 1);
+        this.remoteHistory[this.remoteHistory.length - 1] = peak;
+      } else {
+        this.remoteHistory[this.remoteHistoryCount] = peak;
+        this.remoteHistoryCount += 1;
+      }
+      this.remoteSampledAt = now;
+      this.setRemoteWaveState('LIVE', true);
+    } else if (this.remoteTrack?.muted) {
+      this.setRemoteWaveState('音声待ち');
+    }
+
+    if (this.remoteHistoryCount > 0) {
+      context.beginPath();
+      context.lineWidth = Math.max(1, pixelRatio);
+      context.strokeStyle = '#ff596b';
+      context.shadowColor = 'rgb(255 89 107 / 35%)';
+      context.shadowBlur = 5 * pixelRatio;
+      for (let index = 0; index < this.remoteHistoryCount; index += 1) {
+        const x = (index / this.remoteHistory.length) * width;
+        const amplitude = Math.sqrt(Math.max(0, this.remoteHistory[index])) * height * 0.44;
+        context.moveTo(x, height / 2 - amplitude);
+        context.lineTo(x, height / 2 + amplitude);
+      }
+      context.stroke();
+      context.shadowBlur = 0;
+    }
+
+    const elapsed = (now - this.remoteWaveformStartedAt) / 1000;
+    const rulerSecond = Math.floor(elapsed);
+    if (rulerSecond !== this.remoteRulerSecond) {
+      const firstMark = elapsed >= 60 ? elapsed - 60 : 0;
+      for (let index = 0; index < 5; index += 1) {
+        const total = Math.max(0, Math.floor(firstMark + index * 15));
+        const label = `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
+        $('remoteWaveMark' + index).textContent = label;
+      }
+      this.remoteRulerSecond = rulerSecond;
+    }
+    this.remoteAnimationFrame = window.requestAnimationFrame(() => this.drawRemoteWaveform());
+  }
+
+  stopRemoteWaveform() {
+    if (this.remoteAnimationFrame !== null) {
+      window.cancelAnimationFrame(this.remoteAnimationFrame);
+      this.remoteAnimationFrame = null;
+    }
+    this.remoteAudioSource?.disconnect();
+    this.remoteAnalyser?.disconnect();
+    this.remoteSilentGain?.disconnect();
+    if (this.remoteAudioContext && this.remoteAudioContext.state !== 'closed') {
+      void this.remoteAudioContext.close();
+    }
+    this.remoteAudioContext = null;
+    this.remoteAudioSource = null;
+    this.remoteAnalyser = null;
+    this.remoteSilentGain = null;
+    this.remoteSamples = null;
+    this.remoteTrack = null;
+    this.remoteHistory.fill(0);
+    this.remoteHistoryCount = 0;
+    const canvas = $('remoteWaveformCanvas');
+    const context = canvas.getContext('2d');
+    if (context) context.clearRect(0, 0, canvas.width, canvas.height);
   }
 
   async createRoom() {
@@ -200,8 +430,10 @@ export class RoomCall {
       $('inviteField').hidden = false;
       $('createRoomButton').hidden = true;
       $('leaveRoomButton').hidden = false;
+      $('leaveRoomButton').textContent = '招待を終了';
       this.setStatus('招待を作成しました。リンクを相手に共有してください。');
       this.setCallState('相手の参加申請を待っています');
+      this.setRemoteWaveState('ゲスト待ち');
     } catch (error) {
       this.setStatus(`招待を作成できませんでした: ${error.message}`, true);
       this.resetRoomState();
@@ -238,8 +470,10 @@ export class RoomCall {
       });
       this.setStatus('参加申請を送りました。ホストの承認を待っています。');
       this.setCallState('ホストの承認待ち');
+      this.setRemoteWaveState('承認待ち');
       $('joinRoomButton').hidden = true;
       $('leaveRoomButton').hidden = false;
+      $('leaveRoomButton').textContent = '参加申請を取り消す';
     } catch (error) {
       this.setStatus(`参加申請に失敗しました: ${error.message}`, true);
       await this.leave({ keepMessage: true });
@@ -318,6 +552,8 @@ export class RoomCall {
         await this.receiveJoinRequest(message);
       } else if (message.type === 'approved' && this.localRole === 'guest') {
         this.setStatus('ホストが参加を承認しました。通話を接続しています…');
+        $('leaveRoomButton').textContent = '通話を終了';
+        this.setRemoteWaveState('接続中');
       } else if (message.type === 'denied') {
         this.setStatus('ホストが参加申請を拒否しました。', true);
         await this.leave({ keepMessage: true });
@@ -327,15 +563,28 @@ export class RoomCall {
         await this.receiveAnswer(message);
       } else if (message.type === 'auth-confirm' && this.localRole === 'guest') {
         await this.receiveAuthConfirm(message);
+      } else if (message.type === 'recording-state') {
+        this.receiveRecordingState(message);
       } else if (message.type === 'candidate') {
         await this.receiveCandidate(message.candidate);
       } else if (message.type === 'peer-left' && this.localRole === 'host') {
         this.pendingGuest = null;
+        this.connected = false;
         this.peerConnection?.close();
         this.peerConnection = null;
         this.localSender = null;
+        this.stopRemoteWaveform();
+        $('remoteAudio').srcObject = null;
+        await this.releaseMicrophone();
+        this.onLocalStream?.(null);
+        $('guestRequestCard').hidden = true;
+        $('approveGuestButton').hidden = true;
+        $('denyGuestButton').hidden = true;
+        $('remoteWaveformParticipant').textContent = 'ゲスト';
+        this.setRemoteWaveState('未接続');
         this.setCallState('相手が退出しました。新しい参加申請を待っています。');
         this.setStatus('相手との接続が終了しました。');
+        $('leaveRoomButton').textContent = '招待を終了';
       } else if (message.type === 'ice-restart' && this.localRole === 'guest') {
         await this.answerIceRestart(message);
       } else if (message.type === 'ice-restart-answer' && this.localRole === 'host') {
@@ -394,11 +643,14 @@ export class RoomCall {
       publicKey: message.publicKey,
       verifyKey: key
     };
-    $('guestRequest').textContent = `${this.pendingGuest.name} さんが参加を申請しています。相手の本人性は表示名では確認できません。`;
-    $('guestRequest').hidden = false;
+    $('guestRequestName').textContent = this.pendingGuest.name;
+    $('remoteWaveformParticipant').textContent = this.pendingGuest.name;
+    $('guestRequestCard').hidden = false;
     $('approveGuestButton').hidden = false;
     $('denyGuestButton').hidden = false;
-    this.setStatus('参加申請が届きました。内容を確認して承認してください。');
+    this.setStatus('ゲストから申請が届きました。下の申請カードで名前を確認してください。');
+    this.setCallState('参加申請を確認してください');
+    this.setRemoteWaveState('承認待ち');
   }
 
   async approveGuest() {
@@ -427,11 +679,11 @@ export class RoomCall {
         sdp: this.peerConnection.localDescription.sdp,
         auth: { ...this.authFields, signature }
       });
-      $('guestRequest').hidden = true;
-      $('approveGuestButton').hidden = true;
-      $('denyGuestButton').hidden = true;
-      this.setStatus('認証付きWebRTC接続を確立しています。認証完了までマイク音声は送信されません。');
+      $('guestRequestCard').hidden = true;
+      this.setStatus('ゲストを承認しました。安全な通話接続を確立しています。');
       this.setCallState('通話を接続しています…');
+      this.setRemoteWaveState('接続中');
+      $('leaveRoomButton').textContent = '通話を終了';
     } catch (error) {
       this.setStatus(`参加者を承認できませんでした: ${error.message}`, true);
       $('approveGuestButton').disabled = false;
@@ -444,10 +696,12 @@ export class RoomCall {
     if (!this.pendingGuest) return;
     this.send({ type: 'denied' });
     this.pendingGuest = null;
-    $('guestRequest').hidden = true;
+    $('guestRequestCard').hidden = true;
     $('approveGuestButton').hidden = true;
     $('denyGuestButton').hidden = true;
     this.setStatus('参加申請を拒否しました。');
+    this.setCallState('申請を拒否しました。別の申請を待っています');
+    this.setRemoteWaveState('ゲスト待ち');
   }
 
   async createPeerConnection() {
@@ -460,9 +714,27 @@ export class RoomCall {
         this.send({ type: 'candidate', candidate: candidate.toJSON() });
       }
     });
-    this.peerConnection.addEventListener('track', ({ streams }) => {
-      if (streams[0]) {
-        $('remoteAudio').srcObject = streams[0];
+    this.peerConnection.addEventListener('track', (event) => {
+      const audio = $('remoteAudio');
+      audio.srcObject = event.streams[0] || new MediaStream([event.track]);
+      void this.startRemoteWaveform(audio.srcObject, event.track).catch((error) => {
+        this.setRemoteWaveState('波形エラー');
+        this.setStatus(`相手の波形を表示できませんでした: ${error.message}`, true);
+      });
+      event.track.addEventListener('unmute', () => { void this.playRemoteAudio(); });
+      event.track.addEventListener('mute', () => {
+        $('playRemoteAudioButton').hidden = true;
+        this.setRemoteWaveState('音声停止');
+        this.setCallState('相手の音声が一時中断しています。相手のマイク状態を確認してください。');
+      });
+      event.track.addEventListener('ended', () => {
+        $('playRemoteAudioButton').hidden = true;
+        this.setRemoteWaveState('終了');
+        this.setCallState('相手の音声トラックが終了しました。');
+      });
+      if (event.track.muted) {
+        this.setCallState('通話接続を待っています。相手のマイク音声はまだ届いていません。');
+      } else {
         void this.playRemoteAudio();
       }
     });
@@ -471,7 +743,12 @@ export class RoomCall {
       if (state === 'connected') {
         window.clearTimeout(this.disconnectTimer);
         this.retryCount = 0;
-        this.setCallState('通話中 · Opus');
+        if ($('playRemoteAudioButton').hidden) {
+          const track = $('remoteAudio').srcObject?.getAudioTracks().find((item) => item.readyState === 'live');
+          this.setCallState(track && !track.muted
+            ? '通話中 · Opus · 相手の音声を受信しています'
+            : '通話接続済み · 相手のマイク音声を待っています');
+        }
       } else if (state === 'failed') {
         this.setCallState('接続に失敗しました。再接続またはローカル録音を続けてください。');
         this.scheduleIceRestart(0);
@@ -552,6 +829,7 @@ export class RoomCall {
     this.connected = true;
     this.setStatus('参加者の署名とDTLS fingerprintを確認しました。');
     this.setCallState('通話を接続しています…');
+    this.setHostRecordingState(Boolean(this.getRecordingState()));
     await this.flushCandidates();
   }
 
@@ -573,6 +851,7 @@ export class RoomCall {
     this.connected = true;
     this.setStatus('ホストと双方の署名・DTLS fingerprintを確認しました。');
     this.setCallState('通話を接続しています…');
+    if (this.remoteRecordingState !== null) this.onRecordingState?.(this.remoteRecordingState);
   }
 
   async receiveCandidate(candidate) {
@@ -641,15 +920,35 @@ export class RoomCall {
     } catch {
       this.setStatus('通話は認証済みです。32 kbps上限を設定できず、ブラウザー既定値で接続しています。');
     }
+    this.onLocalStream?.(stream);
   }
 
   async playRemoteAudio() {
-    try {
-      await $('remoteAudio').play();
+    if (this.remoteAudioContext?.state === 'suspended') {
+      void this.remoteAudioContext.resume().catch((error) => {
+        this.setRemoteWaveState('波形停止');
+        this.setCallState(`相手の音声は接続中ですが、波形表示を開始できません: ${error.message}`);
+      });
+    }
+    const audio = $('remoteAudio');
+    const track = audio.srcObject?.getAudioTracks().find((item) => item.readyState === 'live' && !item.muted);
+    if (!track) {
       $('playRemoteAudioButton').hidden = true;
-    } catch {
-      $('playRemoteAudioButton').hidden = false;
-      this.setCallState('ブラウザーが自動再生を制限しています。「相手の音声を再生」を押してください。');
+      this.setCallState('相手の音声はまだ届いていません。相手のマイクと通話状態を確認してください。');
+      return;
+    }
+    try {
+      await audio.play();
+      $('playRemoteAudioButton').hidden = true;
+      this.setCallState('通話中 · 相手の音声を再生しています');
+    } catch (error) {
+      if (error.name === 'NotAllowedError') {
+        $('playRemoteAudioButton').hidden = false;
+        this.setCallState('相手の音声は届いていますが、自動再生が制限されています。「音声の再生を許可」を押してください。');
+        return;
+      }
+      $('playRemoteAudioButton').hidden = true;
+      this.setCallState(`相手の音声を再生できません: ${error.message}`);
     }
   }
 
@@ -667,6 +966,7 @@ export class RoomCall {
   async leave({ keepMessage = false } = {}) {
     window.clearTimeout(this.disconnectTimer);
     const previousRole = this.localRole;
+    const wasConnected = this.connected;
     this.peerConnection?.close();
     this.peerConnection = null;
     if (this.socket) {
@@ -676,6 +976,7 @@ export class RoomCall {
     }
     this.localRole = null;
     this.pendingGuest = null;
+    this.remoteRecordingState = null;
     this.guestIdentity = null;
     this.guestNonce = null;
     this.authFields = null;
@@ -683,23 +984,34 @@ export class RoomCall {
     this.pendingCandidates = [];
     this.connected = false;
     $('remoteAudio').srcObject = null;
+    this.stopRemoteWaveform();
+    $('remoteWaveformParticipant').textContent = this.inviteMode ? 'ホスト' : 'ゲスト';
+    this.setRemoteWaveState('未接続');
     $('leaveRoomButton').hidden = true;
-    $('guestRequest').hidden = true;
+    $('guestRequestCard').hidden = true;
     $('approveGuestButton').hidden = true;
     $('denyGuestButton').hidden = true;
     $('approveGuestButton').disabled = false;
     $('denyGuestButton').disabled = false;
     $('playRemoteAudioButton').hidden = true;
-    if (this.invitation) {
+    if (this.inviteMode) {
       $('joinRoomButton').hidden = false;
-      $('joinRoomButton').disabled = false;
+      $('joinRoomButton').disabled = !this.invitation;
     } else {
       $('createRoomButton').hidden = false;
     }
     await this.releaseMicrophone();
+    this.onLocalStream?.(null);
     if (previousRole === 'host') this.resetRoomState();
     this.setCallState('通話は未接続です');
-    if (!keepMessage) this.setStatus('通話を終了しました。ローカル録音データはこの端末に残っています。');
+    if (!keepMessage) {
+      const message = previousRole === 'guest' && !wasConnected
+        ? '参加申請を取り消しました。'
+        : previousRole === 'host' && !wasConnected
+          ? '招待を終了しました。'
+          : '通話を終了しました。ローカル録音データはこの端末に残っています。';
+      this.setStatus(message);
+    }
   }
 
   resetRoomState() {

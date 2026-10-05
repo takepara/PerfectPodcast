@@ -39,6 +39,13 @@ let sourceNode = null;
 let analyserNode = null;
 let recorderNode = null;
 let silentGain = null;
+let previewAudioContext = null;
+let previewSourceNode = null;
+let previewAnalyserNode = null;
+let previewSilentGain = null;
+let previewSamples = null;
+let previewStream = null;
+let previewStartedAt = 0;
 let recording = false;
 let finalizing = false;
 let starting = false;
@@ -58,6 +65,8 @@ let waveformCount = 0;
 let lastWaveformSample = 0;
 let lastRulerSecond = -1;
 let waveformElapsedSeconds = 0;
+let hostRecordingCommand = Promise.resolve();
+let lastHostRecordingState = null;
 
 const requestResult = (request) => new Promise((resolve, reject) => {
   request.addEventListener('success', () => resolve(request.result), { once: true });
@@ -140,12 +149,77 @@ function updateMeter(peak) {
   $('meterHint').textContent = lastPeak >= 0.999 ? '入力が大きすぎます' : db >= -40 ? '入力を検出中' : '小さな音を待っています';
 }
 
+function setLocalWaveformState(text, live = false) {
+  $('waveformState').textContent = text;
+  $('waveformState').classList.toggle('live', live);
+}
+
+function startLocalPreview(stream) {
+  if (!stream || recording || starting || previewStream === stream) return;
+  stopLocalPreview();
+  if (!window.AudioContext) {
+    setLocalWaveformState('波形非対応');
+    return;
+  }
+  try {
+    previewStream = stream;
+    previewAudioContext = new AudioContext();
+    previewSourceNode = previewAudioContext.createMediaStreamSource(stream);
+    previewAnalyserNode = previewAudioContext.createAnalyser();
+    previewAnalyserNode.fftSize = 2048;
+    previewSamples = new Float32Array(previewAnalyserNode.fftSize);
+    previewSilentGain = previewAudioContext.createGain();
+    previewSilentGain.gain.value = 0;
+    previewSourceNode.connect(previewAnalyserNode);
+    previewAnalyserNode.connect(previewSilentGain).connect(previewAudioContext.destination);
+    previewStartedAt = performance.now();
+    waveformHistory.fill(0);
+    waveformCount = 0;
+    lastWaveformSample = 0;
+    const context = previewAudioContext;
+    if (context.state === 'running') {
+      setLocalWaveformState('LIVE', true);
+    } else if (context.state === 'suspended') {
+      setLocalWaveformState('波形準備中');
+      void context.resume().then(() => {
+        if (previewAudioContext === context && !recording) setLocalWaveformState('LIVE', true);
+      }).catch((error) => {
+        if (previewAudioContext !== context) return;
+        setLocalWaveformState('波形停止');
+        setMessage(`自分の波形を開始できませんでした: ${error.message}`, true);
+      });
+    } else {
+      setLocalWaveformState('波形停止');
+    }
+  } catch (error) {
+    stopLocalPreview();
+    setLocalWaveformState('波形エラー');
+    setMessage(`自分の波形を開始できませんでした: ${error.message}`, true);
+  }
+}
+
+function stopLocalPreview() {
+  previewSourceNode?.disconnect();
+  previewAnalyserNode?.disconnect();
+  previewSilentGain?.disconnect();
+  if (previewAudioContext && previewAudioContext.state !== 'closed') {
+    void previewAudioContext.close();
+  }
+  previewAudioContext = null;
+  previewSourceNode = null;
+  previewAnalyserNode = null;
+  previewSilentGain = null;
+  previewSamples = null;
+  previewStream = null;
+}
+
 function drawWaveform() {
   const context = waveformCanvas.getContext('2d');
-  const bounds = waveformCanvas.getBoundingClientRect();
+  if (!context || !waveformCanvas.parentElement) return;
+  const bounds = waveformCanvas.parentElement.getBoundingClientRect();
   const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
-  const width = Math.round(bounds.width * pixelRatio);
-  const height = Math.round(bounds.height * pixelRatio);
+  const width = Math.max(1, Math.round(bounds.width * pixelRatio));
+  const height = Math.max(1, Math.round(bounds.height * pixelRatio));
   if (waveformCanvas.width !== width || waveformCanvas.height !== height) {
     waveformCanvas.width = width;
     waveformCanvas.height = height;
@@ -160,11 +234,17 @@ function drawWaveform() {
 
   const now = performance.now();
   if (recording) waveformElapsedSeconds = (now - takeStartedAt) / 1000;
+  else if (previewStream && previewAudioContext?.state === 'running') {
+    waveformElapsedSeconds = (now - previewStartedAt) / 1000;
+  }
   const elapsedSeconds = waveformElapsedSeconds;
-  if (analyserNode && waveformSamples && recording && now - lastWaveformSample >= 100) {
-    analyserNode.getFloatTimeDomainData(waveformSamples);
+  const currentAnalyser = recording ? analyserNode : previewAnalyserNode;
+  const currentSamples = recording ? waveformSamples : previewSamples;
+  const canSample = recording || Boolean(previewStream && previewAudioContext?.state === 'running');
+  if (currentAnalyser && currentSamples && canSample && now - lastWaveformSample >= 100) {
+    currentAnalyser.getFloatTimeDomainData(currentSamples);
     let peak = 0;
-    for (const sample of waveformSamples) peak = Math.max(peak, Math.abs(sample));
+    for (const sample of currentSamples) peak = Math.max(peak, Math.abs(sample));
     if (waveformCount === waveformHistory.length) {
       waveformHistory.copyWithin(0, 1);
       waveformHistory[waveformHistory.length - 1] = peak;
@@ -173,6 +253,7 @@ function drawWaveform() {
       waveformCount += 1;
     }
     lastWaveformSample = now;
+    setLocalWaveformState('LIVE', true);
   }
   if (waveformCount > 0) {
     context.beginPath();
@@ -182,7 +263,7 @@ function drawWaveform() {
     context.shadowBlur = 5 * pixelRatio;
     for (let index = 0; index < waveformCount; index += 1) {
       const x = (index / waveformHistory.length) * width;
-      const amplitude = Math.min(1, waveformHistory[index] * 2.5) * height * 0.44;
+      const amplitude = Math.sqrt(Math.max(0, waveformHistory[index])) * height * 0.44;
       context.moveTo(x, height / 2 - amplitude);
       context.lineTo(x, height / 2 + amplitude);
     }
@@ -319,7 +400,7 @@ async function renderTakes() {
 
 async function openSession(session) {
   activeSession = session;
-  $('studioTitle').textContent = session.name;
+  $('studioTitle').textContent = roomCall?.inviteMode ? 'ゲスト収録' : session.name;
   $('participantLabel').textContent = session.participant;
   $('waveformParticipant').textContent = session.participant;
   waveformHistory.fill(0);
@@ -331,6 +412,7 @@ async function openSession(session) {
   studioView.hidden = false;
   $('waveformState').textContent = '待機中';
   $('waveformState').classList.remove('live');
+  if (roomCall?.isActive && mediaStream && !recording) startLocalPreview(mediaStream);
   if (waveformFrame === null) drawWaveform();
   errorText.textContent = '';
   setStatus('録音を始める準備ができました');
@@ -489,6 +571,7 @@ async function createTake() {
   }
   await stopDiagnostics({ stopCapture: !roomCall?.isActive });
   await ensureCaptureStream();
+  stopLocalPreview();
   audioContext = new AudioContext({ sampleRate: TARGET_RATE });
   const settings = mediaStream.getAudioTracks()[0].getSettings();
   if (audioContext.sampleRate !== TARGET_RATE || (settings.sampleRate && settings.sampleRate !== TARGET_RATE)) {
@@ -605,6 +688,7 @@ async function stopRecording(recoveryReason = null) {
   if (!activeTake || finalizing) return;
   finalizing = true;
   recording = false;
+  roomCall?.setHostRecordingState(false);
   window.clearInterval(elapsedTimer);
   recordButton.disabled = true;
   stopButton.disabled = true;
@@ -630,6 +714,7 @@ async function stopRecording(recoveryReason = null) {
     failure ||= `IndexedDB への保存に失敗しました: ${error.message}`;
   }
   await stopDiagnostics({ stopCapture: !roomCall?.isActive });
+  if (roomCall?.isActive && mediaStream) startLocalPreview(mediaStream);
   const status = failure ? 'recovered' : 'stopped';
   activeTake = {
     ...activeTake,
@@ -664,6 +749,7 @@ async function startRecording() {
   recordButton.disabled = true;
   try {
     await createTake();
+    if (recording) roomCall?.setHostRecordingState(true);
   } catch (error) {
     await stopDiagnostics({ stopCapture: !roomCall?.isActive });
     if (activeTake?.status === 'recording') {
@@ -680,7 +766,34 @@ async function startRecording() {
     stopButton.disabled = true;
   } finally {
     starting = false;
+    if (roomCall?.isActive && !recording && mediaStream) startLocalPreview(mediaStream);
   }
+}
+
+function applyHostRecordingState(isRecording) {
+  const previousState = lastHostRecordingState;
+  lastHostRecordingState = isRecording;
+  hostRecordingCommand = hostRecordingCommand.then(async () => {
+    if (isRecording) {
+      $('hostRecordingStatus').textContent = 'ホストの録音に合わせて録音を開始しています…';
+      if (!recording) await startRecording();
+      $('hostRecordingStatus').textContent = recording
+        ? 'ホストに合わせて録音中です'
+        : 'この端末では録音を開始できませんでした。下のエラーを確認してください。';
+      return;
+    }
+    if (recording) {
+      $('hostRecordingStatus').textContent = 'ホストの停止に合わせて保存しています…';
+      await stopRecording();
+    }
+    $('hostRecordingStatus').textContent = previousState
+      ? 'ホストに合わせて停止し、この端末に保存しました'
+      : 'ホストの録音を待っています';
+  }).catch((error) => {
+    errorText.textContent = `ホストの録音状態を反映できませんでした: ${error.message}`;
+    $('hostRecordingStatus').textContent = '録音状態を反映できませんでした。エラーを確認してください。';
+  });
+  return hostRecordingCommand;
 }
 
 function makeFilename(take, extension = 'wav') {
@@ -777,11 +890,19 @@ setupForm.addEventListener('submit', async (event) => {
 });
 
 $('detectDevices').addEventListener('click', () => { void detectDevices(); });
-recordButton.addEventListener('click', () => { void startRecording(); });
-stopButton.addEventListener('click', () => { void stopRecording(); });
+recordButton.addEventListener('click', () => {
+  if (!roomCall?.isGuest) void startRecording();
+});
+stopButton.addEventListener('click', () => {
+  if (!roomCall?.isGuest) void stopRecording();
+});
 $('backButton').addEventListener('click', async () => {
   if (recording || finalizing) {
     setMessage('録音を停止して保存してからセッション一覧へ戻ってください。', true);
+    return;
+  }
+  if (roomCall?.isActive) {
+    setMessage('通話または招待を終了してからセッション一覧へ戻ってください。', true);
     return;
   }
   activeSession = null;
@@ -807,6 +928,16 @@ async function initialize() {
       getParticipantName: () => participantNameInput.value,
       getMicrophoneStream: ensureCaptureStream,
       releaseMicrophone: releaseCaptureStream,
+      getRecordingState: () => recording,
+      onRecordingState: (isRecording) => { void applyHostRecordingState(isRecording); },
+      onLocalStream: (stream) => {
+        if (stream) {
+          startLocalPreview(stream);
+        } else {
+          stopLocalPreview();
+          if (!recording) setLocalWaveformState('待機中');
+        }
+      },
       onError: (error) => { errorText.textContent = error.message; }
     });
     await recoverInterruptedTakes();
