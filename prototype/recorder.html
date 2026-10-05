@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#f5f1e9">
+  <meta name="theme-color" content="#101318">
   <meta name="description" content="PerfectPodcast ローカル録音プロトタイプ">
   <title>PerfectPodcast — Local Recorder</title>
   <link rel="stylesheet" href="./recorder.css">
@@ -22,7 +22,6 @@
     <section id="setupView" class="view">
       <div class="intro">
         <h1>ローカル録音</h1>
-        <p class="intro-copy">音声は約1秒ごとにこの端末へ保存されます。保存済みの録音はあとから WAV として書き出せます。</p>
       </div>
       <div class="setup-grid">
         <form id="setupForm" class="panel setup-panel">
@@ -42,7 +41,6 @@
           </div>
           <p id="setupMessage" class="inline-message" role="status"></p>
           <button class="button button-primary" type="submit">スタジオを開く</button>
-          <p class="form-note">Chrome / Edge と HTTPS または localhost を使用してください。マイク名が表示されない場合は「デバイスを検出」を押してください。</p>
         </form>
         <aside class="panel recent-panel">
           <div class="panel-heading compact">
@@ -51,7 +49,6 @@
           <div id="sessionList" class="session-list">
             <p class="empty-state">保存済みのセッションはありません。</p>
           </div>
-          <p class="privacy-note">音声と台帳はこの端末の IndexedDB に保存します。サーバーへ音声は送信しません。</p>
         </aside>
       </div>
       <footer class="page-footer">PCM 24-bit · 48 kHz · mono · WAV</footer>
@@ -85,7 +82,6 @@
             <button id="stopButton" class="button button-stop" type="button" disabled><span aria-hidden="true">■</span> 停止して保存</button>
           </div>
           <div id="errorText" class="error-text" role="alert" aria-live="assertive"></div>
-          <div class="capture-note"><span aria-hidden="true">↳</span><span>録音は約1秒ごとに端末へ確定保存されます。一時停止はありません。区切るときは停止して新しいtakeを開始してください。</span></div>
         </section>
 
         <aside class="panel storage-panel" aria-labelledby="storageHeading">
@@ -99,9 +95,27 @@
           <div class="storage-divider"></div>
           <div class="saved-total"><span>このセッションの保存済み</span><strong id="sessionSaved">0.00 MB</strong></div>
           <div class="saved-total"><span>保存チャンク</span><strong id="chunkCount">0</strong></div>
-          <p class="storage-caveat">容量はブラウザーの推定値です。端末の故障やサイトデータ削除からの復旧はできません。</p>
         </aside>
       </div>
+
+      <section class="panel waveform-panel" aria-labelledby="waveformHeading">
+        <div class="waveform-heading">
+          <div class="waveform-track-title">
+            <span class="track-indicator" aria-hidden="true"></span>
+            <div>
+              <h2 id="waveformHeading">参加者トラック</h2>
+              <p id="waveformParticipant">この端末の入力</p>
+            </div>
+          </div>
+          <span id="waveformState" class="waveform-state">待機中</span>
+        </div>
+        <div class="waveform-timeline">
+          <span id="waveMark0">00:00</span><span id="waveMark1">00:15</span><span id="waveMark2">00:30</span><span id="waveMark3">00:45</span><span id="waveMark4">01:00</span>
+        </div>
+        <div class="waveform-canvas-wrap">
+          <canvas id="waveformCanvas" aria-label="参加者のマイク入力をリアルタイム表示する波形"></canvas>
+        </div>
+      </section>
 
       <section class="panel takes-panel" aria-labelledby="takesHeading">
         <div class="takes-heading">
@@ -112,7 +126,6 @@
           <p class="empty-state">録音したtakeがここに表示されます。</p>
         </div>
       </section>
-      <footer class="page-footer studio-footer">ローカル保存 <span>·</span> 自動削除なし <span>·</span> WAV は明示操作で書き出し</footer>
     </section>
   </main>
   <div id="notice" class="notice" role="status" aria-live="polite"></div>

@@ -25,13 +25,16 @@ const stopButton = $('stopButton');
 const errorText = $('errorText');
 const notice = $('notice');
 const meter = document.querySelector('[role="meter"]');
+const waveformCanvas = $('waveformCanvas');
 
 let database;
 let activeSession = null;
 let activeTake = null;
+const pendingWavDownloads = new Map();
 let audioContext = null;
 let mediaStream = null;
 let sourceNode = null;
+let analyserNode = null;
 let recorderNode = null;
 let silentGain = null;
 let recording = false;
@@ -47,6 +50,13 @@ let storageTimer = null;
 let noticeTimer = null;
 let takeStartedAt = 0;
 let lastPeak = 0;
+let waveformSamples = null;
+let waveformFrame = null;
+let waveformHistory = new Float32Array(600);
+let waveformCount = 0;
+let lastWaveformSample = 0;
+let lastRulerSecond = -1;
+let waveformElapsedSeconds = 0;
 
 const requestResult = (request) => new Promise((resolve, reject) => {
   request.addEventListener('success', () => resolve(request.result), { once: true });
@@ -127,6 +137,66 @@ function updateMeter(peak) {
   fill.className = `meter-fill${lastPeak >= 0.999 ? ' clipping' : db >= -6 ? ' near-clip' : db >= -40 ? ' good' : ''}`;
   meter.setAttribute('aria-valuenow', String(Math.round(percent)));
   $('meterHint').textContent = lastPeak >= 0.999 ? '入力が大きすぎます' : db >= -40 ? '入力を検出中' : '小さな音を待っています';
+}
+
+function drawWaveform() {
+  const context = waveformCanvas.getContext('2d');
+  const bounds = waveformCanvas.getBoundingClientRect();
+  const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+  const width = Math.round(bounds.width * pixelRatio);
+  const height = Math.round(bounds.height * pixelRatio);
+  if (waveformCanvas.width !== width || waveformCanvas.height !== height) {
+    waveformCanvas.width = width;
+    waveformCanvas.height = height;
+  }
+  context.clearRect(0, 0, width, height);
+  context.beginPath();
+  context.lineWidth = 1;
+  context.strokeStyle = '#3b464e';
+  context.moveTo(0, height / 2);
+  context.lineTo(width, height / 2);
+  context.stroke();
+
+  const now = performance.now();
+  if (recording) waveformElapsedSeconds = (now - takeStartedAt) / 1000;
+  const elapsedSeconds = waveformElapsedSeconds;
+  if (analyserNode && waveformSamples && recording && now - lastWaveformSample >= 100) {
+    analyserNode.getFloatTimeDomainData(waveformSamples);
+    let peak = 0;
+    for (const sample of waveformSamples) peak = Math.max(peak, Math.abs(sample));
+    if (waveformCount === waveformHistory.length) {
+      waveformHistory.copyWithin(0, 1);
+      waveformHistory[waveformHistory.length - 1] = peak;
+    } else {
+      waveformHistory[waveformCount] = peak;
+      waveformCount += 1;
+    }
+    lastWaveformSample = now;
+  }
+  if (waveformCount > 0) {
+    context.beginPath();
+    context.lineWidth = Math.max(1, pixelRatio);
+    context.strokeStyle = '#55d6b2';
+    context.shadowColor = 'rgb(85 214 178 / 45%)';
+    context.shadowBlur = 5 * pixelRatio;
+    for (let index = 0; index < waveformCount; index += 1) {
+      const x = (index / waveformHistory.length) * width;
+      const amplitude = Math.min(1, waveformHistory[index] * 2.5) * height * 0.44;
+      context.moveTo(x, height / 2 - amplitude);
+      context.lineTo(x, height / 2 + amplitude);
+    }
+    context.stroke();
+    context.shadowBlur = 0;
+  }
+  const rulerSecond = Math.floor(elapsedSeconds);
+  if (rulerSecond !== lastRulerSecond) {
+    const firstMark = elapsedSeconds >= 60 ? elapsedSeconds - 60 : 0;
+    for (let index = 0; index < 5; index += 1) {
+      $('waveMark' + index).textContent = formatDuration(firstMark + index * 15);
+    }
+    lastRulerSecond = rulerSecond;
+  }
+  waveformFrame = window.requestAnimationFrame(drawWaveform);
 }
 
 async function runRequest(storeName, method, ...args) {
@@ -259,6 +329,18 @@ async function renderTakes() {
     exportButton.disabled = take.status === 'recording' || !take.chunks;
     exportButton.addEventListener('click', () => { void exportTake(take); });
     actions.append(exportButton);
+    const preparedWavUrl = pendingWavDownloads.get(take.id);
+    if (preparedWavUrl) {
+      const downloadLink = document.createElement('a');
+      downloadLink.className = 'take-action';
+      downloadLink.href = preparedWavUrl;
+      downloadLink.download = makeFilename(take);
+      downloadLink.textContent = 'ダウンロードを開始';
+      downloadLink.addEventListener('click', () => {
+        setMessage('ブラウザーにダウンロードを要求しました。保存完了はダウンロード一覧で確認してください。');
+      });
+      actions.append(downloadLink);
+    }
     row.append(info, actions);
     takeList.append(row);
   }
@@ -268,9 +350,17 @@ async function openSession(session) {
   activeSession = session;
   $('studioTitle').textContent = session.name;
   $('participantLabel').textContent = session.participant;
+  $('waveformParticipant').textContent = session.participant;
+  waveformHistory.fill(0);
+  waveformCount = 0;
+  waveformElapsedSeconds = 0;
+  lastRulerSecond = -1;
   $('timer').textContent = '00:00';
   setupView.hidden = true;
   studioView.hidden = false;
+  $('waveformState').textContent = '待機中';
+  $('waveformState').classList.remove('live');
+  if (waveformFrame === null) drawWaveform();
   errorText.textContent = '';
   setStatus('録音を始める準備ができました');
   await renderTakes();
@@ -438,6 +528,10 @@ async function createTake() {
   capturedFrames = 0;
   $('chunkCount').textContent = '0';
   lastPeak = 0;
+  waveformHistory.fill(0);
+  waveformCount = 0;
+  waveformElapsedSeconds = 0;
+  lastWaveformSample = performance.now();
   updateMeter(0);
   pendingCommits = 0;
   commitError = null;
@@ -446,6 +540,10 @@ async function createTake() {
 
   await audioContext.audioWorklet.addModule('./recorder-worklet.js');
   sourceNode = audioContext.createMediaStreamSource(mediaStream);
+  analyserNode = audioContext.createAnalyser();
+  analyserNode.fftSize = 2048;
+  analyserNode.smoothingTimeConstant = 0.65;
+  waveformSamples = new Float32Array(analyserNode.fftSize);
   recorderNode = new AudioWorkletNode(audioContext, 'perfectpodcast-local-recorder', {
     numberOfInputs: 1,
     numberOfOutputs: 1,
@@ -467,7 +565,8 @@ async function createTake() {
       });
     }
   };
-  sourceNode.connect(recorderNode);
+  sourceNode.connect(analyserNode);
+  analyserNode.connect(recorderNode);
   recorderNode.connect(silentGain).connect(audioContext.destination);
   const track = mediaStream.getAudioTracks()[0];
   track.addEventListener('ended', () => {
@@ -497,6 +596,8 @@ async function createTake() {
   recordButton.disabled = true;
   stopButton.disabled = false;
   setStatus('録音中 · 端末へ順次保存しています', 'recording');
+  $('waveformState').textContent = 'LIVE';
+  $('waveformState').classList.add('live');
 }
 
 async function stopDiagnostics() {
@@ -510,10 +611,12 @@ async function stopDiagnostics() {
   if (mediaStream) mediaStream.getTracks().forEach((track) => track.stop());
   if (audioContext.state !== 'closed') await audioContext.close();
   sourceNode = null;
+  analyserNode = null;
   recorderNode = null;
   silentGain = null;
   mediaStream = null;
   audioContext = null;
+  waveformSamples = null;
 }
 
 async function stopRecording(recoveryReason = null) {
@@ -564,6 +667,8 @@ async function stopRecording(recoveryReason = null) {
   stopButton.disabled = true;
   finalizing = false;
   setStatus(failure ? '復旧用データを保存しました。未確定の末尾は含まれません。' : '保存完了 · WAV を書き出せます', failure ? 'ready' : 'saved');
+  $('waveformState').textContent = '待機中';
+  $('waveformState').classList.remove('live');
   if (failure) errorText.textContent = `${failure} 保存済みチャンクは一覧から復旧 WAV として書き出せます。`;
   activeTake = null;
   await renderTakes();
@@ -622,27 +727,36 @@ async function exportTake(take) {
   let writable = null;
   let fileHandle = null;
   let filePromise = null;
-  if (typeof window.showSaveFilePicker === 'function') {
+  let fallbackReason = null;
+  if (typeof window.showSaveFilePicker === 'function' && window.location.protocol !== 'file:') {
     filePromise = window.showSaveFilePicker({
       suggestedName: makeFilename(take),
       types: [{ description: 'PCM 24-bit WAV', accept: { 'audio/wav': ['.wav'] } }]
     });
   } else if (totalBytes > FALLBACK_EXPORT_LIMIT) {
-    setMessage('このブラウザーはストリーム書き出しに未対応です。256 MB を超える WAV は Chrome / Edge で保存してください。', true);
+    setMessage('この実行環境では256 MBを超えるWAVを安全にダウンロードできません。HTTPSまたはlocalhostで開き、対応ブラウザーで保存してください。', true);
     return;
   }
   try {
     if (filePromise) {
       fileHandle = await filePromise;
-      writable = await fileHandle.createWritable();
-      await writable.write(makeWavHeader(take.frames));
+      try {
+        writable = await fileHandle.createWritable();
+      } catch (error) {
+        if (error.name === 'AbortError') throw error;
+        if (totalBytes > FALLBACK_EXPORT_LIMIT) {
+          throw new Error(`直接ファイル保存を開始できず、通常ダウンロードの上限 ${formatBytes(FALLBACK_EXPORT_LIMIT)} も超えています: ${error.message}`);
+        }
+        fallbackReason = error.message;
+      }
     }
     const chunks = await getTakeChunks(take.id);
     let exportedFrames = 0;
-    const blobParts = filePromise ? null : [makeWavHeader(take.frames)];
+    const blobParts = writable ? null : [makeWavHeader(take.frames)];
+    if (writable) await writable.write(makeWavHeader(take.frames));
     for (const chunk of chunks) {
       const pcm = await chunk.wav.slice(44).arrayBuffer();
-      if (filePromise) await writable.write(pcm);
+      if (writable) await writable.write(pcm);
       else blobParts.push(pcm);
       exportedFrames += chunk.frames;
     }
@@ -653,13 +767,15 @@ async function exportTake(take) {
       return;
     }
     const output = new Blob(blobParts, { type: 'audio/wav' });
-    const url = URL.createObjectURL(output);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = makeFilename(take);
-    link.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-    setMessage(`${makeFilename(take)} をダウンロードしました。`);
+    const previousUrl = pendingWavDownloads.get(take.id);
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
+    pendingWavDownloads.set(take.id, URL.createObjectURL(output));
+    await renderTakes();
+    setMessage(window.location.protocol === 'file:'
+      ? 'file://では直接ファイル保存できません。WAVを準備しました。「ダウンロードを開始」をクリックしてください。'
+      : fallbackReason
+        ? '直接ファイル保存を利用できませんでした。WAVを準備しました。「ダウンロードを開始」をクリックしてください。'
+        : 'WAVを準備しました。「ダウンロードを開始」をクリックしてください。');
   } catch (error) {
     if (writable) await writable.abort().catch(() => {});
     if (error.name !== 'AbortError') setMessage(`WAV を書き出せませんでした: ${error.message}`, true);
@@ -719,12 +835,20 @@ $('backButton').addEventListener('click', async () => {
     return;
   }
   activeSession = null;
+  if (waveformFrame !== null) {
+    window.cancelAnimationFrame(waveformFrame);
+    waveformFrame = null;
+  }
   studioView.hidden = true;
   setupView.hidden = false;
   await refreshSessionList();
   await updateStorageStatus();
 });
-window.addEventListener('beforeunload', () => { void stopDiagnosticsOnUnload(); });
+window.addEventListener('beforeunload', () => {
+  void stopDiagnosticsOnUnload();
+  for (const url of pendingWavDownloads.values()) URL.revokeObjectURL(url);
+  pendingWavDownloads.clear();
+});
 
 async function initialize() {
   try {
