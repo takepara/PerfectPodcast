@@ -1,7 +1,7 @@
 # PerfectPodcast 最小実装計画
 
 改訂日: 2026-10-03  
-状態: 計画のみ。録音コード・クラウド構築・契約・デプロイは今回実施しない。
+状態: Step 1のローカル録音に続き、Step 2の招待・2人通話プロトタイプを実装中。TURN資格発行、実ネットワーク試験、公開前検証は未完了。
 
 ## 1. 維持する要件と今回の変更
 
@@ -320,6 +320,10 @@ participantは自身の転送を表示し、hostは自分のローカル保存�
 
 成果物: URL作成、名前入力、ゲスト承認、native音声、接続状態、再接続、TURN作成許可。
 
+実装中のコードは`prototype/room-call.js`、`worker/index.js`、`wrangler.jsonc`にある。現在は同一オリジンのWebSocketシグナリングとSTUNによる直接接続までで、TURN資格の発行・制限はまだ実装していない。制限の強いNATでは接続できない可能性があり、個人招待を含め公開利用前にTURN資格の制御と費用上限を整えること。
+
+ローカル確認は`npm install`、`npm run dev`を実行し、`http://localhost:8787/recorder`を開く。単体テストは`npm test`。本番deployはCloudflareアカウント・TURN資格制御・回線試験が整うまで行わない。
+
 - マイク音声は認証完了前に送らない。偽fingerprint・古いnonce・別session署名・別participant鍵を拒否。
 - 32 kbps上限、mono/Opus選択と実bitrateを確認。録音処理を止めても通話は継続。
 - 上下256 kbps・RTT 100 ms・損失1%の試験で、2秒超の聞こえない区間0を目標にする。concealed samples等と試聴を併記し、音質合格は別判定。
@@ -382,7 +386,7 @@ participantは自身の転送を表示し、hostは自分のローカル保存�
 - 48 kHz AudioContextを実際に得られる端末に限定する。フラグメントや名前だけで接続・認証が成立するわけではない。
 - ヘッドホン必須、マイク設定の実適用確認、保存先許可、同意、退出前警告を省略しない。
 - 現在の`prototype/recorder.html`はAudioWorklet取得とPCM24 WAV生成があるが全録音をメモリー保持する。IndexedDB、招待、通話、回収は未実装。
-- 今回の変更は`PLAN.md`だけ。次の実装提案はStep 1のみ。
+- 2026-10-05: Step 2の招待・承認・署名付きDTLS fingerprint検証・2人Opus通話と揮発性シグナリングの初期実装を開始。TURN資格発行、公開利用の許可、実機／回線試験は未完了。
 
 参照資料:
 

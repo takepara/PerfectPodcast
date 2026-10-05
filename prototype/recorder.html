@@ -79,7 +79,7 @@
           </div>
           <div class="controls">
             <button id="recordButton" class="button button-record" type="button"><span aria-hidden="true">●</span> 録音開始</button>
-            <button id="stopButton" class="button button-stop" type="button" disabled><span aria-hidden="true">■</span> 停止して保存</button>
+            <button id="stopButton" class="button button-stop" type="button" disabled><span aria-hidden="true">■</span> 録音停止</button>
           </div>
           <div id="errorText" class="error-text" role="alert" aria-live="assertive"></div>
         </section>
@@ -89,14 +89,40 @@
             <span class="storage-icon" aria-hidden="true">▤</span>
             <h2 id="storageHeading">端末の保存状況</h2>
           </div>
-          <div class="storage-number"><strong id="storageAvailable">確認中</strong><span>推定空き容量</span></div>
-          <div class="storage-track"><div id="storageFill" class="storage-fill"></div></div>
-          <p id="storageDetail" class="storage-detail">ブラウザーの保存容量を確認しています。</p>
-          <div class="storage-divider"></div>
           <div class="saved-total"><span>このセッションの保存済み</span><strong id="sessionSaved">0.00 MB</strong></div>
           <div class="saved-total"><span>保存チャンク</span><strong id="chunkCount">0</strong></div>
         </aside>
       </div>
+
+      <section id="roomPanel" class="panel room-panel" aria-labelledby="roomHeading">
+        <div class="room-heading">
+          <div>
+            <h2 id="roomHeading">2人で収録</h2>
+            <p id="roomStatus" role="status">招待を作成すると、相手とOpus音声で通話できます。</p>
+          </div>
+          <span class="format-pill">Opus · mono · 最大32 kbps</span>
+        </div>
+        <div class="room-actions">
+          <button id="createRoomButton" class="button button-primary" type="button">招待リンクを作成</button>
+          <button id="joinRoomButton" class="button button-primary" type="button" hidden>この招待に参加申請</button>
+          <button id="approveGuestButton" class="button button-quiet" type="button" hidden>参加を承認</button>
+          <button id="denyGuestButton" class="button button-quiet" type="button" hidden>拒否</button>
+          <button id="leaveRoomButton" class="button button-quiet" type="button" hidden>通話を終了</button>
+        </div>
+        <label id="inviteField" class="field invite-field" hidden>
+          <span>招待リンク（招待資格を含みます。相手だけに共有してください）</span>
+          <span class="invite-input-row">
+            <input id="inviteUrl" type="url" readonly>
+            <button id="copyInviteButton" class="button button-quiet" type="button">コピー</button>
+          </span>
+        </label>
+        <p id="guestRequest" class="guest-request" hidden></p>
+        <div class="remote-audio-row">
+          <span id="callState" class="call-state">通話は未接続です</span>
+          <audio id="remoteAudio" autoplay playsinline></audio>
+          <button id="playRemoteAudioButton" class="button button-quiet" type="button" hidden>相手の音声を再生</button>
+        </div>
+      </section>
 
       <section class="panel waveform-panel" aria-labelledby="waveformHeading">
         <div class="waveform-heading">

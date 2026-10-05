@@ -1,9 +1,11 @@
+import { RoomCall } from './room-call.js';
+
 const TARGET_RATE = 48000;
 const BYTES_PER_FRAME = 3;
 const CHUNK_FRAMES = TARGET_RATE;
 const DB_NAME = 'perfectpodcast-local-v1';
 const DB_VERSION = 1;
-const FALLBACK_EXPORT_LIMIT = 256 * 1024 * 1024;
+const BLOB_DOWNLOAD_LIMIT = 256 * 1024 * 1024;
 const MAX_WAV_BYTES = 1024 * 1024 * 1024;
 const RAW_AUDIO_CONSTRAINTS = {
   channelCount: { exact: 1 },
@@ -29,8 +31,8 @@ const waveformCanvas = $('waveformCanvas');
 
 let database;
 let activeSession = null;
+let roomCall = null;
 let activeTake = null;
-const pendingWavDownloads = new Map();
 let audioContext = null;
 let mediaStream = null;
 let sourceNode = null;
@@ -46,7 +48,6 @@ let commitError = null;
 let nextSequence = 0;
 let capturedFrames = 0;
 let elapsedTimer = null;
-let storageTimer = null;
 let noticeTimer = null;
 let takeStartedAt = 0;
 let lastPeak = 0;
@@ -225,29 +226,11 @@ async function persistTake(take) {
   await done;
 }
 
-async function updateStorageStatus() {
+async function updateSessionSavedSize() {
   const saved = activeSession
     ? (await loadAll('takes')).filter((take) => take.sessionId === activeSession.id).reduce((total, take) => total + (take.bytes || 0), 0)
     : 0;
   $('sessionSaved').textContent = `${(saved / 1_000_000).toFixed(2)} MB`;
-
-  if (!navigator.storage?.estimate) {
-    $('storageAvailable').textContent = '未対応';
-    $('storageDetail').textContent = 'このブラウザーから保存容量を取得できません。';
-    return;
-  }
-  const { usage, quota } = await navigator.storage.estimate();
-  if (!Number.isFinite(usage) || !Number.isFinite(quota) || quota <= 0) {
-    $('storageAvailable').textContent = '取得不可';
-    $('storageDetail').textContent = 'ブラウザーが容量を返しませんでした。';
-    return;
-  }
-  const available = Math.max(0, quota - usage);
-  const usedPercent = Math.min(100, usage / quota * 100);
-  $('storageAvailable').textContent = formatBytes(available);
-  $('storageDetail').textContent = `使用中 ${formatBytes(usage)} / 推定上限 ${formatBytes(quota)}`;
-  $('storageFill').style.width = `${usedPercent}%`;
-  $('storageFill').classList.toggle('low', available < 250_000_000);
 }
 
 async function refreshSessionList() {
@@ -329,18 +312,6 @@ async function renderTakes() {
     exportButton.disabled = take.status === 'recording' || !take.chunks;
     exportButton.addEventListener('click', () => { void exportTake(take); });
     actions.append(exportButton);
-    const preparedWavUrl = pendingWavDownloads.get(take.id);
-    if (preparedWavUrl) {
-      const downloadLink = document.createElement('a');
-      downloadLink.className = 'take-action';
-      downloadLink.href = preparedWavUrl;
-      downloadLink.download = makeFilename(take);
-      downloadLink.textContent = 'ダウンロードを開始';
-      downloadLink.addEventListener('click', () => {
-        setMessage('ブラウザーにダウンロードを要求しました。保存完了はダウンロード一覧で確認してください。');
-      });
-      actions.append(downloadLink);
-    }
     row.append(info, actions);
     takeList.append(row);
   }
@@ -368,7 +339,7 @@ async function openSession(session) {
     .filter((take) => take.sessionId === session.id)
     .sort((left, right) => left.startedAt - right.startedAt);
   $('chunkCount').textContent = String(takes.at(-1)?.chunks || 0);
-  await updateStorageStatus();
+  await updateSessionSavedSize();
 }
 
 async function detectDevices(requestPermission = true) {
@@ -406,6 +377,21 @@ async function detectDevices(requestPermission = true) {
     button.disabled = false;
     button.textContent = 'デバイスを検出';
   }
+}
+
+async function ensureCaptureStream() {
+  if (mediaStream?.getAudioTracks().some((track) => track.readyState === 'live')) return mediaStream;
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error('マイク取得に対応していません。Chrome または Edge を使用してください。');
+  mediaStream = await navigator.mediaDevices.getUserMedia({
+    audio: { deviceId: { exact: micDevice.value }, ...RAW_AUDIO_CONSTRAINTS, sampleRate: TARGET_RATE }
+  });
+  return mediaStream;
+}
+
+async function releaseCaptureStream() {
+  if (recording) return;
+  mediaStream?.getTracks().forEach((track) => track.stop());
+  mediaStream = null;
 }
 
 function makeWavHeader(frameCount) {
@@ -485,7 +471,7 @@ async function commitChunk(samples, isFinal, startFrame) {
     await done;
     activeTake = take;
     $('chunkCount').textContent = String(take.chunks);
-    await updateStorageStatus();
+    await updateSessionSavedSize();
     await renderTakes();
   }).catch((error) => {
     commitError = error;
@@ -501,10 +487,8 @@ async function createTake() {
   if (!navigator.mediaDevices?.getUserMedia || !window.AudioWorkletNode) {
     throw new Error('AudioWorklet 録音に対応していません。Chrome または Edge を使用してください。');
   }
-  await stopDiagnostics();
-  mediaStream = await navigator.mediaDevices.getUserMedia({
-    audio: { deviceId: { exact: micDevice.value }, ...RAW_AUDIO_CONSTRAINTS, sampleRate: TARGET_RATE }
-  });
+  await stopDiagnostics({ stopCapture: !roomCall?.isActive });
+  await ensureCaptureStream();
   audioContext = new AudioContext({ sampleRate: TARGET_RATE });
   const settings = mediaStream.getAudioTracks()[0].getSettings();
   if (audioContext.sampleRate !== TARGET_RATE || (settings.sampleRate && settings.sampleRate !== TARGET_RATE)) {
@@ -592,7 +576,6 @@ async function createTake() {
   recording = true;
   takeStartedAt = performance.now();
   elapsedTimer = window.setInterval(updateTimer, 200);
-  storageTimer = window.setInterval(() => { void updateStorageStatus().catch((error) => setMessage(`保存容量を確認できませんでした: ${error.message}`, true)); }, 15000);
   recordButton.disabled = true;
   stopButton.disabled = false;
   setStatus('録音中 · 端末へ順次保存しています', 'recording');
@@ -600,21 +583,20 @@ async function createTake() {
   $('waveformState').classList.add('live');
 }
 
-async function stopDiagnostics() {
-  if (!audioContext) return;
+async function stopDiagnostics({ stopCapture = true } = {}) {
   if (sourceNode) sourceNode.disconnect();
   if (recorderNode) {
     recorderNode.port.onmessage = null;
     recorderNode.disconnect();
   }
   if (silentGain) silentGain.disconnect();
-  if (mediaStream) mediaStream.getTracks().forEach((track) => track.stop());
-  if (audioContext.state !== 'closed') await audioContext.close();
+  if (stopCapture) mediaStream?.getTracks().forEach((track) => track.stop());
+  if (audioContext && audioContext.state !== 'closed') await audioContext.close();
   sourceNode = null;
   analyserNode = null;
   recorderNode = null;
   silentGain = null;
-  mediaStream = null;
+  if (stopCapture) mediaStream = null;
   audioContext = null;
   waveformSamples = null;
 }
@@ -624,7 +606,6 @@ async function stopRecording(recoveryReason = null) {
   finalizing = true;
   recording = false;
   window.clearInterval(elapsedTimer);
-  window.clearInterval(storageTimer);
   recordButton.disabled = true;
   stopButton.disabled = true;
   setStatus(recoveryReason ? '保存済みチャンクから復旧しています…' : '末尾チャンクを保存しています…');
@@ -648,7 +629,7 @@ async function stopRecording(recoveryReason = null) {
   } catch (error) {
     failure ||= `IndexedDB への保存に失敗しました: ${error.message}`;
   }
-  await stopDiagnostics();
+  await stopDiagnostics({ stopCapture: !roomCall?.isActive });
   const status = failure ? 'recovered' : 'stopped';
   activeTake = {
     ...activeTake,
@@ -666,15 +647,15 @@ async function stopRecording(recoveryReason = null) {
   recordButton.disabled = false;
   stopButton.disabled = true;
   finalizing = false;
-  setStatus(failure ? '復旧用データを保存しました。未確定の末尾は含まれません。' : '保存完了 · WAV を書き出せます', failure ? 'ready' : 'saved');
+  setStatus(failure ? '復旧用データを保存しました。未確定の末尾は含まれません。' : '録音データ保存済み · WAVを書き出せます', failure ? 'ready' : 'saved');
   $('waveformState').textContent = '待機中';
   $('waveformState').classList.remove('live');
   if (failure) errorText.textContent = `${failure} 保存済みチャンクは一覧から復旧 WAV として書き出せます。`;
   activeTake = null;
   await renderTakes();
-  await updateStorageStatus();
+  await updateSessionSavedSize();
   await refreshSessionList();
-  if (!failure) setMessage('録音を端末に保存しました。');
+  if (!failure) setMessage('録音データ（WAVチャンク）をブラウザー内に保存しました。音声ファイルとして保存するには「WAVを保存」を押してください。');
 }
 
 async function startRecording() {
@@ -684,7 +665,7 @@ async function startRecording() {
   try {
     await createTake();
   } catch (error) {
-    await stopDiagnostics();
+    await stopDiagnostics({ stopCapture: !roomCall?.isActive });
     if (activeTake?.status === 'recording') {
       activeTake = { ...activeTake, status: 'recovered', endedAt: Date.now(), tailUnknown: true, recoveryReason: error.message };
       await persistTake(activeTake).catch((saveError) => { errorText.textContent = `${error.message} take の状態も保存できませんでした: ${saveError.message}`; });
@@ -724,61 +705,30 @@ async function exportTake(take) {
     setMessage('WAV は1 GiB以下で書き出してください。take の分割保存は次の実装段階で対応します。', true);
     return;
   }
-  let writable = null;
-  let fileHandle = null;
-  let filePromise = null;
-  let fallbackReason = null;
-  if (typeof window.showSaveFilePicker === 'function' && window.location.protocol !== 'file:') {
-    filePromise = window.showSaveFilePicker({
-      suggestedName: makeFilename(take),
-      types: [{ description: 'PCM 24-bit WAV', accept: { 'audio/wav': ['.wav'] } }]
-    });
-  } else if (totalBytes > FALLBACK_EXPORT_LIMIT) {
+  if (totalBytes > BLOB_DOWNLOAD_LIMIT) {
     setMessage('この実行環境では256 MBを超えるWAVを安全にダウンロードできません。HTTPSまたはlocalhostで開き、対応ブラウザーで保存してください。', true);
     return;
   }
   try {
-    if (filePromise) {
-      fileHandle = await filePromise;
-      try {
-        writable = await fileHandle.createWritable();
-      } catch (error) {
-        if (error.name === 'AbortError') throw error;
-        if (totalBytes > FALLBACK_EXPORT_LIMIT) {
-          throw new Error(`直接ファイル保存を開始できず、通常ダウンロードの上限 ${formatBytes(FALLBACK_EXPORT_LIMIT)} も超えています: ${error.message}`);
-        }
-        fallbackReason = error.message;
-      }
-    }
     const chunks = await getTakeChunks(take.id);
     let exportedFrames = 0;
-    const blobParts = writable ? null : [makeWavHeader(take.frames)];
-    if (writable) await writable.write(makeWavHeader(take.frames));
+    const blobParts = [makeWavHeader(take.frames)];
     for (const chunk of chunks) {
       const pcm = await chunk.wav.slice(44).arrayBuffer();
-      if (writable) await writable.write(pcm);
-      else blobParts.push(pcm);
+      blobParts.push(pcm);
       exportedFrames += chunk.frames;
     }
     if (exportedFrames !== take.frames) throw new Error('take 台帳と保存チャンクのフレーム数が一致しません。');
-    if (writable) {
-      await writable.close();
-      setMessage(`${makeFilename(take)} を保存しました。`);
-      return;
-    }
     const output = new Blob(blobParts, { type: 'audio/wav' });
-    const previousUrl = pendingWavDownloads.get(take.id);
-    if (previousUrl) URL.revokeObjectURL(previousUrl);
-    pendingWavDownloads.set(take.id, URL.createObjectURL(output));
-    await renderTakes();
-    setMessage(window.location.protocol === 'file:'
-      ? 'file://では直接ファイル保存できません。WAVを準備しました。「ダウンロードを開始」をクリックしてください。'
-      : fallbackReason
-        ? '直接ファイル保存を利用できませんでした。WAVを準備しました。「ダウンロードを開始」をクリックしてください。'
-        : 'WAVを準備しました。「ダウンロードを開始」をクリックしてください。');
+    const url = URL.createObjectURL(output);
+    const downloadLink = document.createElement('a');
+    downloadLink.href = url;
+    downloadLink.download = makeFilename(take);
+    downloadLink.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    setMessage('ブラウザーにWAVのダウンロードを要求しました。保存完了はダウンロード一覧で確認してください。');
   } catch (error) {
-    if (writable) await writable.abort().catch(() => {});
-    if (error.name !== 'AbortError') setMessage(`WAV を書き出せませんでした: ${error.message}`, true);
+    setMessage(`WAV を書き出せませんでした: ${error.message}`, true);
   }
 }
 
@@ -842,21 +792,26 @@ $('backButton').addEventListener('click', async () => {
   studioView.hidden = true;
   setupView.hidden = false;
   await refreshSessionList();
-  await updateStorageStatus();
+  await updateSessionSavedSize();
 });
 window.addEventListener('beforeunload', () => {
   void stopDiagnosticsOnUnload();
-  for (const url of pendingWavDownloads.values()) URL.revokeObjectURL(url);
-  pendingWavDownloads.clear();
 });
 
 async function initialize() {
   try {
     database = await openDatabase();
     database.addEventListener('versionchange', () => database.close());
+    roomCall = new RoomCall({
+      getSession: () => activeSession,
+      getParticipantName: () => participantNameInput.value,
+      getMicrophoneStream: ensureCaptureStream,
+      releaseMicrophone: releaseCaptureStream,
+      onError: (error) => { errorText.textContent = error.message; }
+    });
     await recoverInterruptedTakes();
     await refreshSessionList();
-    await updateStorageStatus();
+    await updateSessionSavedSize();
   } catch (error) {
     $('setupMessage').textContent = `ローカル保存を初期化できませんでした: ${error.message}`;
     setupForm.querySelector('button[type="submit"]').disabled = true;

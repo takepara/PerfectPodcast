@@ -101,17 +101,24 @@ h1 { margin-bottom: 0; font-family: Georgia, "Yu Mincho", serif; font-size: clam
 .error-text { min-height: 0; margin-top: 0; color: var(--coral-dark); font-size: 11px; line-height: 1.55; }
 .error-text:not(:empty) { margin-top: 12px; border-radius: 4px; background: #3a2027; padding: 9px 11px; }
 .storage-panel { padding: 23px; }
-.storage-number { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; margin-top: 28px; }
-.storage-number strong { font-size: 25px; font-variant-numeric: tabular-nums; letter-spacing: -.06em; }
-.storage-number span, .storage-detail { color: var(--muted); font-size: 10px; }
-.storage-track { height: 6px; overflow: hidden; margin-top: 10px; border-radius: 99px; background: #303640; }
-.storage-fill { width: 0; height: 100%; border-radius: inherit; background: var(--teal); transition: width .3s ease; }
-.storage-fill.low { background: var(--coral); }
-.storage-detail { min-height: 30px; margin: 8px 0 0; line-height: 1.5; }
-.storage-divider { height: 1px; margin: 17px 0 14px; background: var(--line); }
 .saved-total { display: flex; justify-content: space-between; gap: 6px; font-size: 10px; }
 .saved-total span { color: var(--muted); }
 .saved-total strong { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.room-panel { margin-top: 18px; padding: 21px 24px; }
+.room-heading, .room-actions, .remote-audio-row, .invite-input-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.room-heading h2 { margin: 0 0 5px; font-size: 15px; }
+.room-heading p, .guest-request { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.6; }
+.room-heading p.room-error { color: var(--coral); }
+.room-actions { justify-content: start; flex-wrap: wrap; margin-top: 17px; }
+.room-actions .button-primary { width: auto; margin: 0; }
+.invite-field { margin: 16px 0 0; }
+.invite-input-row input { flex: 1; }
+.invite-input-row .button-quiet { flex: 0 0 auto; margin: 0; }
+.guest-request { margin-top: 14px; border-left: 2px solid var(--yellow); padding: 8px 11px; color: var(--ink); }
+.remote-audio-row { justify-content: start; margin-top: 14px; border-top: 1px solid var(--line); padding-top: 13px; }
+.call-state { color: var(--muted); font-size: 10px; }
+.remote-audio-row .button-quiet { margin: 0; }
+#remoteAudio { width: min(100%, 240px); height: 30px; }
 .takes-panel { margin-top: 18px; padding: 21px 24px; }
 .takes-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 15px; }
 .count-pill { border-color: #31554f; background: var(--teal-soft); color: var(--teal); font-size: 9px; letter-spacing: .02em; }
@@ -149,9 +156,7 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
   .recent-panel { min-height: auto; }
   .storage-panel { display: grid; grid-template-columns: 1fr 1fr; column-gap: 24px; }
   .storage-panel .panel-heading { grid-column: 1 / -1; }
-  .storage-number, .storage-track, .storage-detail { grid-column: 1; }
-  .storage-divider { display: none; }
-  .saved-total { grid-column: 2; grid-row: 2; align-self: end; padding-bottom: 6px; }
+  .storage-panel .saved-total { align-self: end; padding-bottom: 6px; }
 }
 @media (max-width: 520px) {
   .shell { width: min(100% - 30px, 1120px); padding-top: 20px; }
@@ -163,6 +168,9 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
   .studio-title-row h1 { font-size: 38px; }
   .record-panel { padding: 20px; }
   .panel-topline { align-items: start; flex-direction: column; }
+  .room-panel { padding: 18px; }
+  .room-heading { align-items: start; flex-direction: column; }
+  .remote-audio-row { align-items: start; flex-direction: column; }
   .timer { margin: 32px 0 22px; font-size: 76px; }
   .storage-panel { display: block; }
   .storage-divider { display: block; }
