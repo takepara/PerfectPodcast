@@ -685,7 +685,7 @@ async function stopDiagnostics({ stopCapture = true } = {}) {
 }
 
 async function stopRecording(recoveryReason = null) {
-  if (!activeTake || finalizing) return;
+  if (!activeTake || finalizing) return !recording && !finalizing;
   finalizing = true;
   recording = false;
   roomCall?.setHostRecordingState(false);
@@ -741,15 +741,18 @@ async function stopRecording(recoveryReason = null) {
   await updateSessionSavedSize();
   await refreshSessionList();
   if (!failure) setMessage('録音データ（WAVチャンク）をブラウザー内に保存しました。音声ファイルとして保存するには「WAVを保存」を押してください。');
+  return !failure;
 }
 
 async function startRecording() {
-  if (recording || finalizing || starting || !activeSession) return;
+  if (recording) return true;
+  if (finalizing || starting || !activeSession) return false;
   starting = true;
   recordButton.disabled = true;
   try {
     await createTake();
     if (recording) roomCall?.setHostRecordingState(true);
+    return recording;
   } catch (error) {
     await stopDiagnostics({ stopCapture: !roomCall?.isActive });
     if (activeTake?.status === 'recording') {
@@ -764,6 +767,7 @@ async function startRecording() {
     setStatus('録音を開始できませんでした');
     recordButton.disabled = false;
     stopButton.disabled = true;
+    return false;
   } finally {
     starting = false;
     if (roomCall?.isActive && !recording && mediaStream) startLocalPreview(mediaStream);
@@ -776,22 +780,28 @@ function applyHostRecordingState(isRecording) {
   hostRecordingCommand = hostRecordingCommand.then(async () => {
     if (isRecording) {
       $('hostRecordingStatus').textContent = 'ホストの録音に合わせて録音を開始しています…';
-      if (!recording) await startRecording();
+      const started = recording || await startRecording();
       $('hostRecordingStatus').textContent = recording
         ? 'ホストに合わせて録音中です'
         : 'この端末では録音を開始できませんでした。下のエラーを確認してください。';
-      return;
+      return started;
     }
     if (recording) {
       $('hostRecordingStatus').textContent = 'ホストの停止に合わせて保存しています…';
-      await stopRecording();
+      const stopped = await stopRecording();
+      $('hostRecordingStatus').textContent = stopped
+        ? 'ホストに合わせて停止し、この端末に保存しました'
+        : '停止または保存を確認できませんでした。エラーを確認してください。';
+      return stopped;
     }
     $('hostRecordingStatus').textContent = previousState
       ? 'ホストに合わせて停止し、この端末に保存しました'
       : 'ホストの録音を待っています';
+    return true;
   }).catch((error) => {
     errorText.textContent = `ホストの録音状態を反映できませんでした: ${error.message}`;
     $('hostRecordingStatus').textContent = '録音状態を反映できませんでした。エラーを確認してください。';
+    return false;
   });
   return hostRecordingCommand;
 }
@@ -929,7 +939,7 @@ async function initialize() {
       getMicrophoneStream: ensureCaptureStream,
       releaseMicrophone: releaseCaptureStream,
       getRecordingState: () => recording,
-      onRecordingState: (isRecording) => { void applyHostRecordingState(isRecording); },
+      onRecordingState: applyHostRecordingState,
       onLocalStream: (stream) => {
         if (stream) {
           startLocalPreview(stream);

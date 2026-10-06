@@ -134,6 +134,7 @@ h1 { margin-bottom: 0; font-family: Georgia, "Yu Mincho", serif; font-size: clam
 .button-danger:hover:not(:disabled) { border-color: var(--coral); background: #3a2027; }
 .remote-audio-row { justify-content: start; margin-top: 14px; border-top: 1px solid var(--line); padding-top: 13px; }
 .call-state { color: var(--muted); font-size: 10px; }
+.connection-stats { flex: 1 1 auto; margin: 0; color: var(--muted); font-size: 9px; font-variant-numeric: tabular-nums; text-align: right; }
 .remote-audio-row .button-quiet { margin: 0; }
 #remoteAudio { width: min(100%, 240px); height: 30px; }
 .takes-panel { margin-top: 18px; padding: 21px 24px; }

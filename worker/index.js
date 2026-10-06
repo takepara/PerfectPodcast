@@ -2,8 +2,9 @@ const ROOM_ID_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const ALLOWED_MESSAGES = {
   host: new Set(['approved', 'denied', 'offer', 'auth-confirm', 'candidate', 'ice-restart', 'recording-state']),
-  guest: new Set(['join-request', 'answer', 'candidate', 'ice-restart-answer'])
+  guest: new Set(['join-request', 'answer', 'candidate', 'ice-restart-answer', 'recording-ack'])
 };
+const RECORDING_EVENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 export default {
   async fetch(request, env) {
@@ -62,8 +63,17 @@ export class RoomSignaling {
       this.reject(socket, '許可されていないシグナリングメッセージです。');
       return;
     }
-    if (message.type === 'recording-state' && typeof message.recording !== 'boolean') {
-      this.reject(socket, '録音状態の形式が不正です。');
+    if (message.type === 'recording-state' || message.type === 'recording-ack') {
+      if (typeof message.recording !== 'boolean' ||
+          !RECORDING_EVENT_ID_PATTERN.test(message.eventId || '') ||
+          !Number.isSafeInteger(message.sequence) || message.sequence < 1 ||
+          (message.type === 'recording-ack' && typeof message.accepted !== 'boolean')) {
+        this.reject(socket, '録音状態または確認応答の形式が不正です。');
+        return;
+      }
+    }
+    if (message.type === 'recording-ack' && role !== 'guest') {
+      this.reject(socket, '録音確認応答を送信できるのはゲストだけです。');
       return;
     }
     const recipientRole = role === 'host' ? 'guest' : 'host';

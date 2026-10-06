@@ -51,8 +51,24 @@ test('only the host can relay valid recording-state messages', async () => {
     signaling.peers.set(host, 'host');
     signaling.peers.set(guest, 'guest');
 
-    await signaling.onMessage(host, { data: JSON.stringify({ type: 'recording-state', recording: true }) });
-    assert.deepEqual(guest.messages, [{ type: 'recording-state', recording: true }]);
+    const recordingState = {
+      type: 'recording-state',
+      recording: true,
+      eventId: '123e4567-e89b-42d3-a456-426614174000',
+      sequence: 1
+    };
+    await signaling.onMessage(host, { data: JSON.stringify(recordingState) });
+    assert.deepEqual(guest.messages, [recordingState]);
+
+    const recordingAck = {
+      type: 'recording-ack',
+      recording: true,
+      eventId: recordingState.eventId,
+      sequence: recordingState.sequence,
+      accepted: true
+    };
+    await signaling.onMessage(guest, { data: JSON.stringify(recordingAck) });
+    assert.deepEqual(host.messages, [recordingAck]);
 
     await signaling.onMessage(guest, { data: JSON.stringify({ type: 'recording-state', recording: false }) });
     assert.equal(guest.readyState, 3);
@@ -78,9 +94,83 @@ test('rejects malformed host recording-state messages', async () => {
     signaling.peers.set(host, 'host');
     signaling.peers.set(guest, 'guest');
 
-    await signaling.onMessage(host, { data: JSON.stringify({ type: 'recording-state', recording: 'yes' }) });
+    await signaling.onMessage(host, { data: JSON.stringify({
+      type: 'recording-state',
+      recording: 'yes',
+      eventId: '123e4567-e89b-42d3-a456-426614174000',
+      sequence: 1
+    }) });
     assert.equal(host.readyState, 3);
     assert.equal(guest.messages.length, 0);
+  } finally {
+    if (originalWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = originalWebSocket;
+  }
+});
+
+test('only the guest can acknowledge a valid recording event', async () => {
+  const originalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = { OPEN: 1 };
+  const makeSocket = () => ({
+    readyState: 1,
+    messages: [],
+    send(message) { this.messages.push(JSON.parse(message)); },
+    close() { this.readyState = 3; }
+  });
+  try {
+    const host = makeSocket();
+    const guest = makeSocket();
+    const signaling = new RoomSignaling({});
+    signaling.peers.set(host, 'host');
+    signaling.peers.set(guest, 'guest');
+    const ack = {
+      type: 'recording-ack',
+      recording: true,
+      eventId: '123e4567-e89b-42d3-a456-426614174000',
+      sequence: 1,
+      accepted: true
+    };
+
+    await signaling.onMessage(host, { data: JSON.stringify(ack) });
+    assert.equal(host.readyState, 3);
+    assert.equal(guest.messages.length, 0);
+
+    const anotherHost = makeSocket();
+    const anotherGuest = makeSocket();
+    const secondSignaling = new RoomSignaling({});
+    secondSignaling.peers.set(anotherHost, 'host');
+    secondSignaling.peers.set(anotherGuest, 'guest');
+    await secondSignaling.onMessage(anotherGuest, { data: JSON.stringify(ack) });
+    assert.deepEqual(anotherHost.messages, [ack]);
+  } finally {
+    if (originalWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = originalWebSocket;
+  }
+});
+
+test('rejects malformed recording acknowledgements', async () => {
+  const originalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = { OPEN: 1 };
+  const guest = {
+    readyState: 1,
+    messages: [],
+    send(message) { this.messages.push(JSON.parse(message)); },
+    close() { this.readyState = 3; }
+  };
+  try {
+    const host = { readyState: 1, messages: [], send(message) { this.messages.push(message); }, close() {} };
+    const signaling = new RoomSignaling({});
+    signaling.peers.set(host, 'host');
+    signaling.peers.set(guest, 'guest');
+    await signaling.onMessage(guest, { data: JSON.stringify({
+      type: 'recording-ack',
+      recording: true,
+      eventId: 'invalid',
+      sequence: 1,
+      accepted: true
+    }) });
+    assert.equal(guest.readyState, 3);
+    assert.equal(host.messages.some((message) => JSON.parse(message).type === 'recording-ack'), false);
   } finally {
     if (originalWebSocket === undefined) delete globalThis.WebSocket;
     else globalThis.WebSocket = originalWebSocket;
