@@ -104,7 +104,7 @@
           <div>
             <span id="roomRoleLabel" class="room-role-label">ホスト操作</span>
             <h2 id="roomHeading">ゲストを招待</h2>
-            <p id="roomInstructions">招待リンクを共有し、参加申請が届いたら相手を確認して承認してください。</p>
+            <p id="roomInstructions">招待リンクを共有し、参加申請が届いたら相手を確認して承認してください。ゲスト音源は録音中にこの端末のブラウザー内へ保存されます。</p>
           </div>
           <span class="format-pill">Opus · mono · 最大32 kbps</span>
         </div>
@@ -112,8 +112,24 @@
         <div class="room-actions">
           <button id="createRoomButton" class="button button-primary" type="button">招待リンクを作成</button>
           <button id="joinRoomButton" class="button button-primary" type="button" hidden>ホストに参加申請</button>
+          <button id="checkReadinessButton" class="button button-quiet" type="button" hidden>録音準備を再確認</button>
+          <button id="retryTransferButton" class="button button-quiet" type="button" hidden>転送を再試行</button>
           <button id="leaveRoomButton" class="button button-quiet" type="button" hidden>通話を終了</button>
         </div>
+        <p id="localStorageNotice" class="room-status">ホスト・ゲストそれぞれの録音は、その端末のブラウザー内（IndexedDB）に保存され、ゲスト音源もホスト側へ転送・保存されます。ブラウザーの保存容量には上限があり、サイトデータ削除で消えるため、必要な音源は「WAVを保存」から書き出してください。</p>
+        <section id="transferProgressCard" class="transfer-progress" hidden aria-labelledby="transferProgressHeading">
+          <h3 id="transferProgressHeading">ゲスト音源の受信状況</h3>
+          <p id="transferProgressDescription">ゲストの録音がこの端末に届き、保存されているかを表示します。</p>
+          <progress id="transferProgressBar" max="1" value="0" aria-label="音源の受信済み割合"></progress>
+          <p id="transferProgressText" role="status">通話接続後に保存状況を表示します。</p>
+          <details id="transferDiagnostics" class="transfer-diagnostics">
+            <summary>転送の詳しい状況</summary>
+            <p id="transferProgressDetails">詳細を読み込んでいます。</p>
+            <canvas id="transferGraph" width="600" height="132" aria-hidden="true"></canvas>
+            <p id="transferGraphSummary">送出・保存確認速度と1.152 Mbpsの録音データ生成基準を表示します。</p>
+            <p class="transfer-graph-legend"><span>送出速度</span><span>保存確認速度</span><span>録音データ生成基準</span></p>
+          </details>
+        </section>
         <label id="inviteField" class="field invite-field" hidden>
           <span>ゲストに共有する招待リンク（招待資格を含むため、相手だけに共有してください）</span>
           <span class="invite-input-row">
@@ -121,6 +137,22 @@
             <button id="copyInviteButton" class="button button-quiet" type="button">リンクをコピー</button>
           </span>
         </label>
+        <details id="turnPermitDetails" class="field turn-permit-field" hidden>
+          <summary>TURN中継の詳細設定（管理者向け・通常は不要）</summary>
+          <p>TURN中継を使う場合のみ、管理者がこの部屋専用に発行した許可証を設定してください。未設定ならSTUN直接接続を試します。</p>
+          <label class="field">
+            <span>許可証発行用の部屋ID</span>
+            <input id="turnPermitRoomId" type="text" readonly>
+          </label>
+          <label class="field">
+            <span>許可証発行用のホスト公開鍵（秘密鍵ではありません）</span>
+            <input id="turnPermitHostKey" type="text" readonly>
+          </label>
+          <label class="field">
+            <span>管理者発行のTURN room permit（ゲストには共有しない）</span>
+            <textarea id="turnPermitInput" rows="2" autocomplete="off" spellcheck="false"></textarea>
+          </label>
+        </details>
         <section id="guestRequestCard" class="guest-request-card" hidden aria-labelledby="guestRequestTitle">
           <div class="guest-request-copy">
             <span class="request-step">ゲストから参加申請</span>
@@ -134,6 +166,7 @@
         </section>
         <div class="remote-audio-row">
           <span id="callState" class="call-state">通話は未接続です</span>
+          <span id="recordingReadiness" class="call-state">録音準備は未確認です</span>
           <p id="connectionStats" class="connection-stats" role="status" hidden>接続統計を取得していません</p>
           <audio id="remoteAudio" autoplay playsinline></audio>
           <button id="playRemoteAudioButton" class="button button-quiet" type="button" hidden>音声の再生を許可</button>
@@ -161,24 +194,27 @@
           </div>
         </div>
 
-        <div class="waveform-track remote-waveform-track">
-          <div class="waveform-heading">
-            <div class="waveform-track-title">
-              <span class="track-indicator remote-track-indicator" aria-hidden="true"></span>
-              <div>
-                <h3 id="remoteWaveformTitle">相手のトラック</h3>
-                <p id="remoteWaveformParticipant">ゲスト</p>
+        <div id="remoteWaveformTracks" class="remote-waveform-tracks"></div>
+        <template id="remoteWaveformTemplate">
+          <div class="waveform-track remote-waveform-track">
+            <div class="waveform-heading">
+              <div class="waveform-track-title">
+                <span class="track-indicator remote-track-indicator" aria-hidden="true"></span>
+                <div>
+                  <h3 class="remote-waveform-title"></h3>
+                  <p class="remote-waveform-participant"></p>
+                </div>
               </div>
+              <span class="waveform-state remote-waveform-state">音声待ち</span>
             </div>
-            <span id="remoteWaveformState" class="waveform-state">未接続</span>
+            <div class="waveform-timeline">
+              <span>00:00</span><span>00:15</span><span>00:30</span><span>00:45</span><span>01:00</span>
+            </div>
+            <div class="waveform-canvas-wrap">
+              <canvas class="remote-waveform-canvas" aria-label="相手のマイク入力の波形"></canvas>
+            </div>
           </div>
-          <div class="waveform-timeline">
-            <span id="remoteWaveMark0">00:00</span><span id="remoteWaveMark1">00:15</span><span id="remoteWaveMark2">00:30</span><span id="remoteWaveMark3">00:45</span><span id="remoteWaveMark4">01:00</span>
-          </div>
-          <div class="waveform-canvas-wrap">
-            <canvas id="remoteWaveformCanvas" aria-label="相手のマイク入力の波形"></canvas>
-          </div>
-        </div>
+        </template>
       </section>
 
       <section class="panel takes-panel" aria-labelledby="takesHeading">

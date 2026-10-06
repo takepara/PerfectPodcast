@@ -49,8 +49,22 @@ h1 { margin-bottom: 0; font-family: Georgia, "Yu Mincho", serif; font-size: clam
 .panel-heading h2, .takes-heading h2 { margin: 0; font-size: 17px; letter-spacing: -.035em; }
 .storage-icon { display: grid; width: 37px; height: 37px; flex: 0 0 37px; place-items: center; border-radius: 5px; background: var(--teal-soft); color: var(--teal); font-size: 15px; }
 .field { display: grid; gap: 8px; margin-bottom: 17px; color: #b3bbc5; font-size: 11px; font-weight: 800; }
-.field input, .field select { width: 100%; min-width: 0; border: 1px solid var(--line); border-radius: 4px; outline: 0; background: #11151a; color: var(--ink); padding: 12px 13px; font-size: 13px; }
-.field input:focus, .field select:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgb(85 214 178 / 14%); }
+.field input, .field select, .field textarea { width: 100%; min-width: 0; border: 1px solid var(--line); border-radius: 4px; outline: 0; background: #11151a; color: var(--ink); padding: 12px 13px; font-size: 13px; }
+.field input:focus, .field select:focus, .field textarea:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgb(85 214 178 / 14%); }
+.turn-permit-field > p { margin: 0 0 14px; color: #b3bbc5; font-size: 12px; line-height: 1.6; }
+.transfer-progress { display: grid; gap: 8px; margin: 14px 0; padding: 14px; border: 1px solid var(--line); border-radius: 4px; background: #11151a; }
+.transfer-progress h3, .transfer-progress p { margin: 0; }
+.transfer-progress h3 { font-size: 12px; }
+.transfer-progress p { color: #b3bbc5; font-size: 12px; line-height: 1.6; }
+.transfer-progress.transfer-error #transferProgressText { color: #ff8792; }
+.transfer-diagnostics { display: grid; gap: 8px; color: #b3bbc5; font-size: 11px; }
+.transfer-diagnostics summary { width: fit-content; cursor: pointer; color: var(--teal); font-weight: 800; }
+.transfer-progress progress { width: 100%; height: 8px; accent-color: var(--teal); }
+.transfer-progress canvas { display: block; width: 100%; height: auto; border-radius: 3px; background: #0b0e12; }
+.transfer-graph-legend { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 10px !important; }
+.transfer-graph-legend span::before { display: inline-block; width: 12px; height: 2px; margin: 0 5px 3px 0; background: #59d6b2; content: ""; }
+.transfer-graph-legend span:nth-child(2)::before { background: #82aaff; }
+.transfer-graph-legend span:nth-child(3)::before { height: 0; border-top: 2px dashed #e9b85b; background: transparent; }
 .device-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 9px; align-items: end; }
 .button { display: inline-flex; min-height: 44px; align-items: center; justify-content: center; gap: 9px; border: 0; border-radius: 4px; padding: 12px 16px; font-size: 12px; font-weight: 850; transition: transform .15s, background .15s, border-color .15s; }
 .button:hover:not(:disabled) { transform: translateY(-1px); }
@@ -154,6 +168,9 @@ h1 { margin-bottom: 0; font-family: Georgia, "Yu Mincho", serif; font-size: clam
 a.take-action { display: inline-flex; align-items: center; justify-content: center; cursor: pointer; text-decoration: none; }
 .waveform-panel { margin-top: 18px; overflow: hidden; padding: 17px 20px 15px; }
 .waveform-track + .waveform-track { margin-top: 22px; border-top: 1px solid var(--line); padding-top: 17px; }
+.remote-waveform-tracks:empty { display: none; }
+.remote-waveform-tracks:not(:empty) { margin-top: 22px; border-top: 1px solid var(--line); padding-top: 17px; }
+.remote-waveform-tracks .waveform-track + .waveform-track { margin-top: 22px; border-top: 1px solid var(--line); padding-top: 17px; }
 .waveform-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .waveform-track-title { display: flex; align-items: center; gap: 11px; }
 .track-indicator { width: 3px; height: 32px; border-radius: 2px; background: var(--teal); box-shadow: 0 0 12px rgb(85 214 178 / 35%); }
@@ -165,7 +182,7 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
 .waveform-state.remote-live { border-color: rgb(255 89 107 / 35%); background: #3a2027; color: #ff8792; }
 .waveform-timeline { display: flex; justify-content: space-between; margin: 18px 0 5px 43px; color: #69727f; font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .waveform-canvas-wrap { height: 100px; overflow: hidden; border: 1px solid #2b333c; border-radius: 3px; background-color: #11161b; background-image: linear-gradient(rgb(109 126 139 / 9%) 1px, transparent 1px), linear-gradient(90deg, rgb(109 126 139 / 9%) 1px, transparent 1px); background-size: 100% 25%, 10% 100%; }
-#waveformCanvas, #remoteWaveformCanvas { display: block; width: 100%; height: 100%; }
+#waveformCanvas, .remote-waveform-canvas { display: block; width: 100%; height: 100%; }
 .notice { position: fixed; z-index: 5; right: 22px; bottom: 22px; max-width: min(390px, calc(100vw - 44px)); transform: translateY(16px); border: 1px solid var(--line); border-radius: 5px; background: #242a33; padding: 12px 16px; color: var(--ink); box-shadow: var(--shadow); font-size: 11px; line-height: 1.5; opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; }
 .notice.show { transform: translateY(0); opacity: 1; }
 .notice.error { background: #49252d; }

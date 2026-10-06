@@ -1,16 +1,22 @@
 import { RoomCall } from './room-call.js';
 import { MAX_SESSION_FRAMES, remainingSessionFrames } from './recording-limits.js';
-import { writePcm24Wav } from './wav-export.js';
+import { RecordingTransfer } from './recording-transfer.js';
+import { canQueueRecordingCommit } from './recording-commit-queue.js';
+import { verifyIncomingStoredChunk, verifyIncomingStoredTake } from './recording-storage.js';
+import { reconcileTransferInventory } from './transfer-inventory.js';
+import { createPcm24Wav, writePcm24Wav } from './wav-export.js';
+import { splitTransferBacklog, summarizeTransferChunks } from './transfer-progress.js';
+import { monitorRecordingTrack } from './recording-track-monitor.js';
 
 const TARGET_RATE = 48000;
 const BYTES_PER_FRAME = 3;
 const CHUNK_FRAMES = TARGET_RATE;
 const DB_NAME = 'perfectpodcast-local-v1';
-const DB_VERSION = 1;
+const DB_VERSION = 3;
 const BLOB_DOWNLOAD_LIMIT = 256 * 1024 * 1024;
 const MAX_WAV_BYTES = 1024 * 1024 * 1024;
 const RAW_AUDIO_CONSTRAINTS = {
-  channelCount: { exact: 1 },
+  channelCount: { ideal: 1 },
   echoCancellation: false,
   noiseSuppression: false,
   autoGainControl: false
@@ -51,6 +57,7 @@ let previewStartedAt = 0;
 let recording = false;
 let finalizing = false;
 let starting = false;
+let sessionLimitReached = false;
 let pendingCommits = 0;
 let commitChain = Promise.resolve();
 let commitError = null;
@@ -70,6 +77,12 @@ let lastRulerSecond = -1;
 let waveformElapsedSeconds = 0;
 let hostRecordingCommand = Promise.resolve();
 let lastHostRecordingState = null;
+const receivedTransferFrames = new Map();
+let previousTransferProgress = null;
+let transferProgressTimer = null;
+let transferProgressCache = null;
+let transferGraphSamples = [];
+let cleanupRecordingTrackMonitor = null;
 
 const requestResult = (request) => new Promise((resolve, reject) => {
   request.addEventListener('success', () => resolve(request.result), { once: true });
@@ -102,6 +115,15 @@ function openDatabase() {
         const chunks = db.createObjectStore('chunks', { keyPath: ['takeId', 'sequence'] });
         chunks.createIndex('takeId', 'takeId', { unique: false });
       }
+      const takes = request.transaction.objectStore('takes');
+      if (!takes.indexNames.contains('transferGeneration')) {
+        takes.createIndex('transferGeneration', 'transferGeneration', { unique: false });
+      }
+      const chunks = request.transaction.objectStore('chunks');
+      if (chunks.indexNames.contains('transferState')) chunks.deleteIndex('transferState');
+      if (!chunks.indexNames.contains('transferGeneration')) {
+        chunks.createIndex('transferGeneration', 'transferGeneration', { unique: false });
+      }
     });
     request.addEventListener('success', () => resolve(request.result), { once: true });
     request.addEventListener('error', () => reject(request.error || new Error('ローカル録音データベースを開けませんでした。')), { once: true });
@@ -127,6 +149,17 @@ function formatDuration(seconds) {
 function setStatus(text, kind = 'ready') {
   $('statusText').textContent = text;
   $('statusDot').className = `status-dot${kind === 'recording' ? ' live' : kind === 'saved' ? ' saved' : ''}`;
+}
+
+function updateRecordButtonAvailability() {
+  recordButton.disabled = sessionLimitReached || recording || starting || finalizing ||
+    Boolean(roomCall?.isActive && !roomCall.isGuest && !roomCall.canStartRecording);
+}
+
+function clearRecordingTrackMonitor() {
+  const cleanup = cleanupRecordingTrackMonitor;
+  cleanupRecordingTrackMonitor = null;
+  cleanup?.();
 }
 
 function setMessage(message, isError = false) {
@@ -319,6 +352,684 @@ async function persistTake(take) {
   await done;
 }
 
+async function findIndexValue(storeName, indexName, range, predicate = () => true) {
+  const transaction = database.transaction(storeName, 'readonly');
+  const done = transactionComplete(transaction);
+  try {
+    const value = await new Promise((resolve, reject) => {
+      const request = transaction.objectStore(storeName).index(indexName).openCursor(range);
+      request.addEventListener('error', () => reject(request.error || new Error('IndexedDB cursor failed')), { once: true });
+      request.addEventListener('success', () => {
+        const cursor = request.result;
+        if (!cursor) {
+          resolve(null);
+        } else if (predicate(cursor.value)) {
+          resolve(cursor.value);
+        } else {
+          cursor.continue();
+        }
+      });
+    });
+    await done;
+    return value;
+  } catch (error) {
+    await done.catch(() => {});
+    throw error;
+  }
+}
+
+async function findIndexValues(storeName, indexName, range, predicate = () => true, project = (value) => value) {
+  const transaction = database.transaction(storeName, 'readonly');
+  const done = transactionComplete(transaction);
+  try {
+    const values = await new Promise((resolve, reject) => {
+      const result = [];
+      const request = transaction.objectStore(storeName).index(indexName).openCursor(range);
+      request.addEventListener('error', () => reject(request.error || new Error('IndexedDB cursor failed')), { once: true });
+      request.addEventListener('success', () => {
+        const cursor = request.result;
+        if (!cursor) {
+          resolve(result);
+          return;
+        }
+        if (predicate(cursor.value)) result.push(project(cursor.value));
+        cursor.continue();
+      });
+    });
+    await done;
+    return values;
+  } catch (error) {
+    await done.catch(() => {});
+    throw error;
+  }
+}
+
+async function getNextTransferChunk(generation) {
+  const chunk = await findIndexValue(
+    'chunks',
+    'transferGeneration',
+    IDBKeyRange.only(generation),
+    (item) => !item.remote && item.hostStored !== true
+  );
+  if (!chunk) return null;
+  const take = await runRequest('takes', 'get', chunk.takeId);
+  return take ? { take, chunk } : null;
+}
+
+async function prepareTransferChunk(takeId, sequence, sha256) {
+  const transaction = database.transaction('chunks', 'readwrite');
+  const done = transactionComplete(transaction);
+  const store = transaction.objectStore('chunks');
+  const request = store.get([takeId, sequence]);
+  request.addEventListener('success', () => {
+    const chunk = request.result;
+    if (!chunk || (chunk.sha256 && chunk.sha256 !== sha256)) {
+      transaction.abort();
+      return;
+    }
+    store.put({ ...chunk, sha256, hostStored: chunk.hostStored === true });
+  }, { once: true });
+  await done;
+}
+
+async function markTransferChunkStored(takeId, sequence, sha256) {
+  const transaction = database.transaction('chunks', 'readwrite');
+  const done = transactionComplete(transaction);
+  const store = transaction.objectStore('chunks');
+  const request = store.get([takeId, sequence]);
+  let newlyStoredChunk = null;
+  request.addEventListener('success', () => {
+    const chunk = request.result;
+    if (!chunk) {
+      transaction.abort();
+      return;
+    }
+    if (chunk.sha256 && chunk.sha256 !== sha256) {
+      transaction.abort();
+      return;
+    }
+    if (!chunk.hostStored) newlyStoredChunk = chunk;
+    store.put({ ...chunk, hostStored: true, sha256 });
+  }, { once: true });
+  await done;
+  if (newlyStoredChunk?.transferGeneration) {
+    const chunkBytes = newlyStoredChunk.byteLength ?? newlyStoredChunk.wav?.size ?? 0;
+    updateTransferProgressCache(newlyStoredChunk.transferGeneration, 'guest', (progress) => ({
+      hostStoredBytes: progress.hostStoredBytes + chunkBytes,
+      hostStoredFrames: progress.hostStoredFrames + newlyStoredChunk.frames,
+      pendingBytes: Math.max(0, progress.pendingBytes - chunkBytes),
+      pendingFrames: Math.max(0, progress.pendingFrames - newlyStoredChunk.frames)
+    }));
+  }
+}
+
+async function loadTakeChunks(takeId) {
+  return findIndexValues(
+    'chunks',
+    'takeId',
+    IDBKeyRange.only(takeId),
+    () => true,
+    (chunk) => ({
+      takeId: chunk.takeId,
+      sourceTakeId: chunk.sourceTakeId,
+      transferGeneration: chunk.transferGeneration,
+      sequence: chunk.sequence,
+      startFrame: chunk.startFrame,
+      frames: chunk.frames,
+      byteLength: chunk.byteLength,
+      wav: chunk.wav,
+      sha256: chunk.sha256,
+      remote: chunk.remote,
+      hostStored: chunk.hostStored
+    })
+  );
+}
+
+async function getTransferInventory(generation) {
+  if (!generation) throw new Error('転送inventoryの接続世代がありません。');
+  transferProgressCache = null;
+  const range = IDBKeyRange.only(generation);
+  if (roomCall?.localRole === 'guest') {
+    const chunks = await findIndexValues('chunks', 'transferGeneration', range, (chunk) =>
+      chunk.transferGeneration === generation && !chunk.remote && Boolean(chunk.sha256),
+    (chunk) => ({ kind: 'chunk', takeId: chunk.takeId, sequence: chunk.sequence, sha256: chunk.sha256 }));
+    const takes = await findIndexValues('takes', 'transferGeneration', IDBKeyRange.only(generation), (take) =>
+      !take.remote && take.status !== 'recording' && take.frames > 0 && take.chunks > 0,
+    (take) => ({ kind: 'manifest', takeId: take.id }));
+    return [...chunks, ...takes];
+  }
+  if (roomCall?.localRole !== 'host') throw new Error('この端末は転送inventoryのホストではありません。');
+  const takes = await findIndexValues('takes', 'transferGeneration', IDBKeyRange.only(generation), (take) =>
+    take.remote && take.transferGeneration === generation);
+  if (!takes.length) return [];
+  const takesById = new Map(takes.map((take) => [take.id, take]));
+  const chunkRows = await findIndexValues(
+    'chunks',
+    'transferGeneration',
+    IDBKeyRange.only(generation),
+    (chunk) => chunk.remote && takesById.has(chunk.takeId),
+    (chunk) => ({
+      takeId: chunk.takeId,
+      sourceTakeId: chunk.sourceTakeId,
+      sequence: chunk.sequence,
+      startFrame: chunk.startFrame,
+      frames: chunk.frames,
+      sha256: chunk.sha256
+    })
+  );
+  const grouped = new Map();
+  for (const chunk of chunkRows) {
+    const chunks = grouped.get(chunk.takeId) || [];
+    chunks.push(chunk);
+    grouped.set(chunk.takeId, chunks);
+  }
+  const inventory = [];
+  for (const take of takes) {
+    const chunks = (grouped.get(take.id) || []).sort((left, right) => left.sequence - right.sequence);
+    const savedChunks = await loadTakeChunks(take.id);
+    const savedChunksBySequence = new Map(savedChunks.map((chunk) => [chunk.sequence, chunk]));
+    if (take.hostStored) {
+      try {
+        await verifyIncomingStoredTake(take, savedChunks);
+      } catch (error) {
+        roomCall.setStatus(`IndexedDB内の受信音源を検証できず、該当takeを再回収します: ${error.message}`, true);
+        continue;
+      }
+    } else {
+      for (const chunk of chunks) {
+        if (!Number.isSafeInteger(chunk.sequence) || chunk.sequence < 0 ||
+            !Number.isSafeInteger(chunk.startFrame) || chunk.startFrame < 0 ||
+            !Number.isSafeInteger(chunk.frames) || chunk.frames < 1 ||
+            !/^[0-9a-f]{64}$/u.test(chunk.sha256 || '') || chunk.sourceTakeId !== take.sourceTakeId) {
+          roomCall.setStatus('ホストの部分take台帳に不正な行があり、該当チャンクを再回収します。', true);
+          continue;
+        }
+        try {
+          const storedChunk = savedChunksBySequence.get(chunk.sequence);
+          await verifyIncomingStoredChunk(take, storedChunk, chunk.sequence, chunk.startFrame);
+          if (storedChunk.sha256 !== chunk.sha256 || storedChunk.frames !== chunk.frames) {
+            throw new Error('チャンク台帳とWAVの内容が一致しません。');
+          }
+        } catch (error) {
+          roomCall.setStatus(`IndexedDB内のチャンクを再検証できず、再回収します: ${error.message}`, true);
+          continue;
+        }
+        inventory.push({
+          kind: 'chunk',
+          takeId: take.sourceTakeId,
+          sequence: chunk.sequence,
+          sha256: chunk.sha256
+        });
+      }
+      continue;
+    }
+    inventory.push(...chunks.map((chunk) => ({
+      kind: 'chunk',
+      takeId: take.sourceTakeId,
+      sequence: chunk.sequence,
+      sha256: chunk.sha256
+    })));
+    inventory.push({ kind: 'manifest', takeId: take.sourceTakeId });
+  }
+  return inventory;
+}
+
+async function reconcileGuestTransferInventory(generation, hostItems) {
+  const localItems = await getTransferInventory(generation);
+  const reconciled = reconcileTransferInventory(localItems, hostItems);
+  const chunkStates = new Map(reconciled.chunks.map((item) =>
+    [`${item.takeId}:${item.sequence}`, item.hostStored]));
+  const manifestStates = new Map(reconciled.manifests.map((item) =>
+    [item.takeId, item.hostStored]));
+  const transaction = database.transaction(['chunks', 'takes'], 'readwrite');
+  const done = transactionComplete(transaction);
+  const chunkCursor = transaction.objectStore('chunks').index('transferGeneration')
+    .openCursor(IDBKeyRange.only(generation));
+  chunkCursor.addEventListener('error', () => transaction.abort(), { once: true });
+  chunkCursor.addEventListener('success', () => {
+    const cursor = chunkCursor.result;
+    if (!cursor) return;
+    const chunk = cursor.value;
+    const stored = chunkStates.get(`${chunk.takeId}:${chunk.sequence}`) === true;
+    if (chunk.hostStored !== stored) cursor.update({ ...chunk, hostStored: stored });
+    cursor.continue();
+  });
+  const takeCursor = transaction.objectStore('takes').index('transferGeneration')
+    .openCursor(IDBKeyRange.only(generation));
+  takeCursor.addEventListener('error', () => transaction.abort(), { once: true });
+  takeCursor.addEventListener('success', () => {
+    const cursor = takeCursor.result;
+    if (!cursor) return;
+    const take = cursor.value;
+    if (!take.remote && manifestStates.has(take.id)) {
+      const stored = manifestStates.get(take.id) === true;
+      if (take.hostStored !== stored) cursor.update({ ...take, hostStored: stored });
+    }
+    cursor.continue();
+  });
+  await done;
+  transferProgressCache = null;
+}
+
+async function getNextTransferManifest(generation) {
+  return findIndexValue('takes', 'transferGeneration', IDBKeyRange.only(generation), (take) =>
+    take.status !== 'recording' && take.hostStored !== true && take.frames > 0 && take.chunks > 0
+  );
+}
+
+async function hasPendingTransfer(generation) {
+  if (!generation) return false;
+  const pendingChunk = await findIndexValue(
+    'chunks',
+    'transferGeneration',
+    IDBKeyRange.only(generation),
+    (chunk) => !chunk.remote && chunk.hostStored !== true
+  );
+  return Boolean(pendingChunk) || Boolean(await findIndexValue(
+      'takes',
+      'transferGeneration',
+      IDBKeyRange.only(generation),
+      (take) => take.hostStored !== true
+  ));
+}
+
+async function getTransferProgress(generation) {
+  if (!generation || !roomCall?.localRole) return null;
+  const role = roomCall.localRole;
+  if (transferProgressCache?.generation === generation && transferProgressCache.role === role) {
+    return {
+      ...transferProgressCache,
+      pending: role === 'guest'
+        ? await hasPendingTransfer(generation)
+        : transferProgressCache.totalTakes > transferProgressCache.completeTakes
+    };
+  }
+  const range = IDBKeyRange.only(generation);
+  const chunks = await findIndexValues(
+    'chunks',
+    'transferGeneration',
+    range,
+    (chunk) => chunk.transferGeneration === generation &&
+      (role === 'guest' ? !chunk.remote : chunk.remote),
+    (chunk) => ({
+      bytes: chunk.byteLength ?? chunk.wav?.size,
+      frames: chunk.frames,
+      hostStored: chunk.hostStored === true
+    })
+  );
+  const takes = role === 'host'
+    ? await findIndexValues(
+      'takes',
+      'transferGeneration',
+      IDBKeyRange.only(generation),
+      (take) => Boolean(take.sourceTakeId),
+      (take) => ({ hostStored: take.hostStored === true })
+    )
+    : [];
+  transferProgressCache = {
+    generation,
+    role,
+    ...summarizeTransferChunks(chunks),
+    completeTakes: takes.filter((take) => take.hostStored).length,
+    totalTakes: takes.length
+  };
+  return {
+    ...transferProgressCache,
+    pending: role === 'guest'
+      ? await hasPendingTransfer(generation)
+      : transferProgressCache.totalTakes > transferProgressCache.completeTakes
+  };
+}
+
+function updateTransferProgressCache(generation, role, update) {
+  if (transferProgressCache?.generation !== generation || transferProgressCache.role !== role) return;
+  Object.assign(transferProgressCache, update(transferProgressCache));
+}
+
+function formatTransferMegabytes(bytes) {
+  return `${(bytes / 1_000_000).toFixed(2)} MB`;
+}
+
+function drawTransferGraph(now) {
+  const canvas = $('transferGraph');
+  const context = canvas.getContext?.('2d');
+  if (!context) return;
+  const width = canvas.width;
+  const height = canvas.height;
+  const left = 38;
+  const right = width - 8;
+  const top = 8;
+  const bottom = height - 20;
+  const maxMbps = Math.max(1.5, ...transferGraphSamples.flatMap((sample) =>
+    [sample.sendMbps, sample.ackMbps].filter(Number.isFinite)));
+  const y = (value) => bottom - Math.min(maxMbps, value) / maxMbps * (bottom - top);
+  context.clearRect(0, 0, width, height);
+  context.font = '10px sans-serif';
+  context.fillStyle = '#aeb8c2';
+  context.strokeStyle = '#303a44';
+  context.lineWidth = 1;
+  context.setLineDash([]);
+  for (const value of [0, maxMbps / 2, maxMbps]) {
+    const lineY = y(value);
+    context.beginPath();
+    context.moveTo(left, lineY);
+    context.lineTo(right, lineY);
+    context.stroke();
+    context.fillText(value.toFixed(1), 2, lineY + 3);
+  }
+  context.fillText('60秒前', left, height - 4);
+  context.fillText('現在', right - 25, height - 4);
+
+  context.strokeStyle = '#e9b85b';
+  context.setLineDash([4, 4]);
+  context.beginPath();
+  context.moveTo(left, y(1.152));
+  context.lineTo(right, y(1.152));
+  context.stroke();
+  context.setLineDash([]);
+
+  for (const [key, color] of [['sendMbps', '#59d6b2'], ['ackMbps', '#82aaff']]) {
+    context.strokeStyle = color;
+    context.lineWidth = 2;
+    context.beginPath();
+    let started = false;
+    for (const sample of transferGraphSamples) {
+      if (!Number.isFinite(sample[key])) {
+        started = false;
+        continue;
+      }
+      const x = left + Math.max(0, sample.at - (now - 60_000)) / 60_000 * (right - left);
+      const pointY = y(sample[key]);
+      if (started) context.lineTo(x, pointY);
+      else context.moveTo(x, pointY);
+      started = true;
+    }
+    context.stroke();
+  }
+}
+
+function updateTransferGraph(now, sendMbps, ackBytesPerSecond) {
+  const ackMbps = Number.isFinite(ackBytesPerSecond)
+    ? ackBytesPerSecond * 8 / 1_000_000
+    : null;
+  transferGraphSamples.push({
+    at: now,
+    sendMbps: Number.isFinite(sendMbps) ? sendMbps : null,
+    ackMbps
+  });
+  transferGraphSamples = transferGraphSamples.filter((sample) => now - sample.at <= 60_000).slice(-61);
+  drawTransferGraph(now);
+  const sample = transferGraphSamples.at(-1);
+  const sendText = sample.sendMbps === null ? '—' : `${sample.sendMbps.toFixed(2)} Mbps`;
+  const ackText = sample.ackMbps === null ? '—' : `${sample.ackMbps.toFixed(2)} Mbps`;
+  $('transferGraphSummary').textContent =
+    `直近60秒: DataChannel送出 ${sendText} · ACK確定 ${ackText} · マスター生成基準 1.152 Mbps`;
+}
+
+async function updateTransferProgress() {
+  const card = $('transferProgressCard');
+  const text = $('transferProgressText');
+  const details = $('transferProgressDetails');
+  const diagnostics = $('transferDiagnostics');
+  const bar = $('transferProgressBar');
+  const generation = roomCall?.authFields?.generation;
+  if (!roomCall?.localRole || !generation) {
+    card.hidden = true;
+    card.classList.remove('transfer-error');
+    diagnostics.open = false;
+    previousTransferProgress = null;
+    transferGraphSamples = [];
+    return;
+  }
+  card.hidden = false;
+  const progress = await getTransferProgress(generation);
+  if (!progress) return;
+  if (card.classList.contains('transfer-error')) {
+    card.classList.remove('transfer-error');
+    diagnostics.open = false;
+  }
+  const now = performance.now();
+  const previous = previousTransferProgress?.generation === generation
+    ? previousTransferProgress
+    : null;
+  const confirmed = progress.role === 'guest' ? progress.hostStoredBytes : progress.bytes;
+  let rate = previous?.rate ?? null;
+  let rateAt = previous?.rateAt ?? now;
+  if (previous && now > previous.at && confirmed > previous.confirmed) {
+    const sampleRate = (confirmed - previous.confirmed) / ((now - previous.at) / 1000);
+    rate = rate === null ? sampleRate : rate * 0.6 + sampleRate * 0.4;
+    rateAt = now;
+  } else if (now - rateAt > 10_000) {
+    rate = null;
+  }
+  previousTransferProgress = { generation, at: now, confirmed, rate, rateAt };
+
+  if (progress.role === 'guest') {
+    const sending = roomCall.recordingTransfer.getSendProgress();
+    const backlog = splitTransferBacklog(progress.pendingBytes, sending);
+    const sendMbps = roomCall.transferSendMbps;
+    roomCall.reportTransferProgress({
+      localBytes: progress.bytes,
+      hostStoredBytes: progress.hostStoredBytes,
+      pendingBytes: progress.pendingBytes,
+      totalFrames: progress.frames,
+      hostStoredFrames: progress.hostStoredFrames,
+      pendingFrames: progress.pendingFrames,
+      ...backlog,
+      sendState: sending.state,
+      bufferedBytes: sending.bufferedBytes,
+      sendMbps
+    });
+    updateTransferGraph(now, sendMbps, rate);
+    const pendingSeconds = progress.pendingFrames / TARGET_RATE;
+    const estimatedSeconds = rate > 0 ? progress.pendingBytes / rate : null;
+    const totalStored = progress.bytes > 0
+      ? Math.min(1, progress.hostStoredBytes / progress.bytes)
+      : 0;
+    bar.value = totalStored;
+    let state = 'ホストに保存済み';
+    if (progress.pendingBytes > 0) {
+      state = estimatedSeconds === null
+        ? `ホストへの転送待ち ${formatTransferMegabytes(progress.pendingBytes)}`
+        : `ホストへ転送中・残り約${Math.ceil(estimatedSeconds)}秒`;
+    } else if (recording) {
+      state = '録音中・現在の分はホストに保存済み';
+    } else if (progress.pending) {
+      state = '録音終了分の保存確認中';
+    }
+    text.textContent =
+      `この端末に保存済み ${formatTransferMegabytes(progress.bytes)} · ホストに保存済み ${formatTransferMegabytes(progress.hostStoredBytes)} · ${state}`;
+    details.textContent =
+      `未送信 ${formatTransferMegabytes(backlog.unsubmittedBytes)} · 送信中 ${formatTransferMegabytes(backlog.sendingBytes)} · 保存確認待ち ${formatTransferMegabytes(backlog.awaitingAckBytes)} · 未転送音声 ${pendingSeconds.toFixed(1)} 秒 · 保存確認速度 ${rate > 0 ? `${(rate * 8 / 1_000_000).toFixed(2)} Mbps` : '—'}`;
+    return;
+  }
+
+  const audioSeconds = progress.frames / TARGET_RATE;
+  const saveRate = rate > 0 ? `${(rate * 8 / 1_000_000).toFixed(2)} Mbps` : '—';
+  const guestProgress = roomCall.remoteTransferProgress;
+  const guestIsFresh = guestProgress && now - guestProgress.receivedAt <= 6_000;
+  const guestTotalBytes = guestIsFresh ? guestProgress.localBytes : 0;
+  bar.value = guestTotalBytes > 0 ? Math.min(1, progress.bytes / guestTotalBytes) : 0;
+  let state = 'ゲストの録音データを待っています';
+  if (recording) state = 'ゲスト録音中・受信した音声を保存しています';
+  else if (progress.pending) state = '録音終了分の保存確認中';
+  else if (progress.bytes > 0) state = '受信・保存済み';
+  const totalLabel = guestIsFresh
+    ? ` / ゲスト録音済み ${formatTransferMegabytes(guestTotalBytes)}`
+    : '';
+  updateTransferGraph(now, guestIsFresh ? guestProgress.sendMbps : null, rate);
+  text.textContent =
+    `この端末に保存済み ${formatTransferMegabytes(progress.bytes)}${totalLabel} · 音声 ${audioSeconds.toFixed(1)} 秒 · ${state}`;
+  details.textContent = guestIsFresh
+    ? `ゲスト端末の未送信 ${formatTransferMegabytes(guestProgress.unsubmittedBytes)} · 送信中 ${formatTransferMegabytes(guestProgress.sendingBytes)} · 保存確認待ち ${formatTransferMegabytes(guestProgress.awaitingAckBytes)} · 送出速度 ${guestProgress.sendMbps === null ? '—' : `${guestProgress.sendMbps.toFixed(2)} Mbps`} · 保存確認速度 ${saveRate} · manifest ${progress.completeTakes}/${progress.totalTakes}`
+    : `ゲスト端末の送信状況は未受信または更新停止中です · 保存確認速度 ${saveRate} · manifest ${progress.completeTakes}/${progress.totalTakes}`;
+}
+
+async function markTransferManifestStored(takeId) {
+  const transaction = database.transaction('takes', 'readwrite');
+  const done = transactionComplete(transaction);
+  const store = transaction.objectStore('takes');
+  const request = store.get(takeId);
+  request.addEventListener('success', () => {
+    const take = request.result;
+    if (!take) {
+      transaction.abort();
+      return;
+    }
+    store.put({ ...take, hostStored: true });
+  }, { once: true });
+  await done;
+  await renderTakes();
+}
+
+function incomingTakeId(generation, takeId) {
+  return `remote-${generation}-${takeId}`;
+}
+
+async function storeIncomingTransferChunk(metadata, wav, sha256) {
+  if (roomCall?.localRole !== 'host' || !activeSession ||
+      metadata.generation !== roomCall.authFields?.generation) {
+    throw new Error('受信したtakeのセッションまたは接続が一致しません。');
+  }
+  const takeId = incomingTakeId(metadata.generation, metadata.takeId);
+  const existingTake = await runRequest('takes', 'get', takeId);
+  const existingChunk = await runRequest('chunks', 'get', [takeId, metadata.sequence]);
+  if (existingChunk) {
+    if (!existingTake || existingChunk.sha256 !== sha256 ||
+        existingChunk.startFrame !== metadata.startFrame || existingChunk.frames !== metadata.frames) {
+      throw new Error('同じチャンク番号に異なる音源hashが届きました。');
+    }
+    try {
+      await verifyIncomingStoredChunk(existingTake, existingChunk, metadata.sequence, metadata.startFrame);
+    } catch {
+      const repairedChunk = {
+        ...existingChunk,
+        byteLength: wav.size,
+        wav,
+        committedAt: Date.now()
+      };
+      await verifyIncomingStoredChunk(existingTake, repairedChunk, metadata.sequence, metadata.startFrame);
+      const transaction = database.transaction('chunks', 'readwrite');
+      const done = transactionComplete(transaction);
+      transaction.objectStore('chunks').put(repairedChunk);
+      await done;
+    }
+    return;
+  }
+  let totalReceivedFrames = receivedTransferFrames.get(metadata.generation);
+  if (!existingTake || existingTake.status === 'recording') {
+    if (totalReceivedFrames === undefined) {
+      totalReceivedFrames = (await loadAll('takes'))
+        .filter((item) => item.remote && item.transferGeneration === metadata.generation)
+        .reduce((total, item) => total + item.frames, 0);
+    }
+    if (totalReceivedFrames + metadata.frames > MAX_SESSION_FRAMES) {
+      throw new Error('この参加者の受信音源が2時間上限を超えました。');
+    }
+  }
+  const take = existingTake || {
+    id: takeId,
+    sessionId: activeSession.id,
+    sourceTakeId: metadata.takeId,
+    transferGeneration: metadata.generation,
+    participant: metadata.participant,
+    number: metadata.takeNumber,
+    startedAt: metadata.startedAt,
+    endedAt: null,
+    status: 'recording',
+    frames: 0,
+    chunks: 0,
+    bytes: 0,
+    tailUnknown: false,
+    remote: true,
+    hostStored: false,
+    sessionName: activeSession.name
+  };
+  const takeStillRecording = take.status === 'recording' &&
+    metadata.sequence === take.chunks && metadata.startFrame === take.frames;
+  const validChunkPosition = takeStillRecording ||
+    ['recording', 'stopped', 'recovered'].includes(take.status) &&
+      metadata.sequence < take.chunks && metadata.startFrame + metadata.frames <= take.frames;
+  if (take.sessionId !== activeSession.id || take.sourceTakeId !== metadata.takeId ||
+      take.transferGeneration !== metadata.generation || take.participant !== metadata.participant ||
+      take.number !== metadata.takeNumber || take.startedAt !== metadata.startedAt ||
+      !validChunkPosition) {
+    throw new Error('受信チャンクが既存takeの順序またはメタデータと一致しません。');
+  }
+  const chunk = {
+    takeId,
+    sourceTakeId: metadata.takeId,
+    transferGeneration: metadata.generation,
+    sequence: metadata.sequence,
+    startFrame: metadata.startFrame,
+    frames: metadata.frames,
+    byteLength: wav.size,
+    wav,
+    sha256,
+    committedAt: Date.now(),
+    remote: true,
+    hostStored: true
+  };
+  await verifyIncomingStoredChunk(take, chunk, metadata.sequence, metadata.startFrame);
+  const nextTake = takeStillRecording
+    ? {
+      ...take,
+      frames: take.frames + metadata.frames,
+      chunks: take.chunks + 1,
+      bytes: take.bytes + wav.size
+    }
+    : take;
+  const stores = takeStillRecording ? ['chunks', 'takes'] : ['chunks'];
+  const transaction = database.transaction(stores, 'readwrite');
+  const done = transactionComplete(transaction);
+  transaction.objectStore('chunks').put(chunk);
+  if (takeStillRecording) transaction.objectStore('takes').put(nextTake);
+  await done;
+  if (takeStillRecording) {
+    receivedTransferFrames.set(metadata.generation, totalReceivedFrames + metadata.frames);
+  }
+  updateTransferProgressCache(metadata.generation, 'host', (progress) => ({
+    bytes: progress.bytes + wav.size,
+    frames: progress.frames + metadata.frames,
+    hostStoredBytes: progress.hostStoredBytes + wav.size,
+    hostStoredFrames: progress.hostStoredFrames + metadata.frames,
+    totalTakes: progress.totalTakes + (existingTake ? 0 : 1)
+  }));
+  await updateSessionSavedSize();
+  await renderTakes();
+}
+
+async function storeIncomingTransferManifest(manifest) {
+  if (roomCall?.localRole !== 'host' || !activeSession ||
+      manifest.generation !== roomCall.authFields?.generation) {
+    throw new Error('受信したmanifestのセッションまたは接続が一致しません。');
+  }
+  const takeId = incomingTakeId(manifest.generation, manifest.takeId);
+  const take = await runRequest('takes', 'get', takeId);
+  if (!take || take.frames !== manifest.frames || take.chunks !== manifest.chunks ||
+      take.sourceTakeId !== manifest.takeId || take.participant !== manifest.participant ||
+      take.startedAt !== manifest.startedAt || take.number !== manifest.takeNumber) {
+    throw new Error('manifestとホスト保存済みチャンクの内容が一致しません。');
+  }
+  const savedChunks = await loadTakeChunks(takeId);
+  await verifyIncomingStoredTake(take, savedChunks);
+  if (take.hostStored) {
+    return;
+  }
+  const nextTake = {
+    ...take,
+    status: manifest.status,
+    endedAt: manifest.startedAt + (manifest.frames / TARGET_RATE) * 1000,
+    tailUnknown: manifest.tailUnknown,
+    hostStored: true
+  };
+  await persistTake(nextTake);
+  updateTransferProgressCache(manifest.generation, 'host', (progress) => ({
+    completeTakes: progress.completeTakes + 1
+  }));
+  await renderTakes();
+}
+
 async function updateSessionSavedSize() {
   const saved = activeSession
     ? (await loadAll('takes')).filter((take) => take.sessionId === activeSession.id).reduce((total, take) => total + (take.bytes || 0), 0)
@@ -359,7 +1070,7 @@ async function refreshSessionList() {
 }
 
 function takeStatusLabel(take) {
-  if (take.status === 'recording') return ['録音中断', 'recording'];
+  if (take.status === 'recording') return [take.remote ? '受信中' : '録音中断', 'recording'];
   if (take.status === 'recovered') return ['復旧データ', 'recovered'];
   return ['保存完了', ''];
 }
@@ -383,7 +1094,7 @@ async function renderTakes() {
     const title = document.createElement('p');
     title.className = 'take-title';
     const label = document.createElement('span');
-    label.textContent = `Take ${String(take.number).padStart(2, '0')}`;
+    label.textContent = `${take.remote ? `${take.participant} · ` : ''}Take ${String(take.number).padStart(2, '0')}`;
     const [status, badgeClass] = takeStatusLabel(take);
     const badge = document.createElement('span');
     badge.className = `take-badge${badgeClass ? ` ${badgeClass}` : ''}`;
@@ -393,8 +1104,13 @@ async function renderTakes() {
     meta.className = 'take-meta';
     const duration = (take.frames || 0) / TARGET_RATE;
     const quality = take.status === 'recovered' ? ' · 保存済みチャンクから復旧' : '';
+    const transfer = take.transferGeneration && !take.remote
+      ? take.hostStored
+        ? ' · ホスト端末に保存済み'
+        : ' · ホスト端末への保存確認待ち'
+      : '';
     const bytes = take.bytes ? ` · ${formatBytes(take.bytes)}` : '';
-    meta.textContent = `${new Date(take.startedAt).toLocaleString('ja-JP')} · ${formatDuration(duration)}${bytes}${quality}`;
+    meta.textContent = `${new Date(take.startedAt).toLocaleString('ja-JP')} · ${formatDuration(duration)}${bytes}${quality}${transfer}`;
     info.append(title, meta);
     const actions = document.createElement('div');
     actions.className = 'take-actions';
@@ -432,9 +1148,11 @@ async function openSession(session) {
   const takes = (await loadAll('takes'))
     .filter((take) => take.sessionId === session.id)
     .sort((left, right) => left.startedAt - right.startedAt);
-  const savedFrames = takes.reduce((total, take) => total + (take.frames || 0), 0);
-  recordButton.disabled = savedFrames >= MAX_SESSION_FRAMES;
-  if (recordButton.disabled) setStatus('このセッションは2時間の録音上限に達しています');
+  const savedFrames = takes.filter((take) => !take.remote)
+    .reduce((total, take) => total + (take.frames || 0), 0);
+  sessionLimitReached = savedFrames >= MAX_SESSION_FRAMES;
+  updateRecordButtonAvailability();
+  if (sessionLimitReached) setStatus('このセッションは2時間の録音上限に達しています');
   $('chunkCount').textContent = String(takes.at(-1)?.chunks || 0);
   await updateSessionSavedSize();
 }
@@ -485,27 +1203,35 @@ async function ensureCaptureStream() {
   return mediaStream;
 }
 
+async function checkRecordingReadiness() {
+  const stream = mediaStream || await ensureCaptureStream();
+  const track = stream.getAudioTracks()[0];
+  if (!track || track.readyState !== 'live' || track.muted) {
+    throw new Error('有効なマイク入力がありません。');
+  }
+  if (!window.AudioContext) throw new Error('AudioContextを利用できません。');
+  const context = new AudioContext({ sampleRate: TARGET_RATE });
+  try {
+    if (context.sampleRate !== TARGET_RATE) throw new Error('48 kHzのAudioContextを作成できません。');
+    await context.audioWorklet.addModule('./recorder-worklet.js');
+  } finally {
+    if (context.state !== 'closed') await context.close();
+  }
+
+  const probeId = `readiness-${crypto.randomUUID()}`;
+  const transaction = database.transaction('sessions', 'readwrite');
+  const done = transactionComplete(transaction);
+  const sessions = transaction.objectStore('sessions');
+  sessions.put({ id: probeId });
+  sessions.delete(probeId);
+  await done;
+  return true;
+}
+
 async function releaseCaptureStream() {
   if (recording) return;
   mediaStream?.getTracks().forEach((track) => track.stop());
   mediaStream = null;
-}
-
-function createPcm24Wav(samples) {
-  const data = new ArrayBuffer(samples.length * BYTES_PER_FRAME);
-  const view = new DataView(data);
-  let offset = 0;
-  for (const sample of samples) {
-    const clamped = Math.max(-1, Math.min(1, sample));
-    const value = clamped < 0
-      ? Math.round(clamped * 8388608)
-      : Math.min(8388607, Math.round(clamped * 8388607));
-    view.setUint8(offset, value & 0xff);
-    view.setUint8(offset + 1, (value >> 8) & 0xff);
-    view.setUint8(offset + 2, (value >> 16) & 0xff);
-    offset += BYTES_PER_FRAME;
-  }
-  return new Blob([makeWavHeader(samples.length), data], { type: 'audio/wav' });
 }
 
 async function commitChunk(samples, isFinal, startFrame) {
@@ -513,11 +1239,8 @@ async function commitChunk(samples, isFinal, startFrame) {
   if (startFrame !== capturedFrames) {
     throw new Error(`録音フレームが不連続です（期待 ${capturedFrames} / 取得 ${startFrame}）。不明区間を正常音声として扱わず録音を停止しました。`);
   }
-  if (!isFinal && pendingCommits > 0) {
-    throw new Error('チャンク保存が1秒以上遅れています。未確定データを増やさないため録音を停止しました。');
-  }
-  if (pendingCommits >= 2) {
-    throw new Error('保存待ちが2チャンクに達しました。データ欠落を防ぐため録音を停止しました。');
+  if (!canQueueRecordingCommit(pendingCommits, isFinal)) {
+    throw new Error('IndexedDBへの保存待ちが2チャンクに達しました。データ欠落を防ぐため録音を停止しました。');
   }
   const sequence = nextSequence++;
   capturedFrames += samples.length;
@@ -529,6 +1252,9 @@ async function commitChunk(samples, isFinal, startFrame) {
     frames: samples.length,
     byteLength: wav.size,
     wav,
+    transferGeneration: activeTake.transferGeneration,
+    hostStored: activeTake.transferGeneration ? false : null,
+    final: isFinal,
     committedAt: Date.now()
   };
   pendingCommits += 1;
@@ -543,9 +1269,18 @@ async function commitChunk(samples, isFinal, startFrame) {
     transaction.objectStore('takes').put(take);
     await done;
     activeTake = take;
+    if (chunk.transferGeneration) {
+      updateTransferProgressCache(chunk.transferGeneration, 'guest', (progress) => ({
+        bytes: progress.bytes + wav.size,
+        frames: progress.frames + samples.length,
+        pendingBytes: progress.pendingBytes + wav.size,
+        pendingFrames: progress.pendingFrames + samples.length
+      }));
+    }
     $('chunkCount').textContent = String(take.chunks);
     await updateSessionSavedSize();
     await renderTakes();
+    roomCall?.notifyChunkCommitted(chunk, take);
   }).catch((error) => {
     commitError = error;
     throw error;
@@ -555,7 +1290,7 @@ async function commitChunk(samples, isFinal, startFrame) {
   await commitChain;
 }
 
-async function createTake() {
+async function createTake({ scheduledStartAt = null, event = null } = {}) {
   errorText.textContent = '';
   if (!navigator.mediaDevices?.getUserMedia || !window.AudioWorkletNode) {
     throw new Error('AudioWorklet 録音に対応していません。Chrome または Edge を使用してください。');
@@ -564,22 +1299,29 @@ async function createTake() {
   await ensureCaptureStream();
   stopLocalPreview();
   audioContext = new AudioContext({ sampleRate: TARGET_RATE });
-  const settings = mediaStream.getAudioTracks()[0].getSettings();
-  if (audioContext.sampleRate !== TARGET_RATE || (settings.sampleRate && settings.sampleRate !== TARGET_RATE)) {
-    throw new Error(`この端末の入力は ${settings.sampleRate || audioContext.sampleRate} Hz です。Step 1 は 48,000 Hz のみ対応します。`);
+  if (audioContext.sampleRate !== TARGET_RATE) {
+    throw new Error(`この端末のAudioContextは ${audioContext.sampleRate} Hzです。48,000 Hzが必要です。`);
   }
-  const sessionTakes = (await loadAll('takes')).filter((take) => take.sessionId === activeSession.id);
+  const sessionTakes = (await loadAll('takes'))
+    .filter((take) => take.sessionId === activeSession.id && !take.remote);
   const savedFrames = sessionTakes.reduce((total, take) => total + (take.frames || 0), 0);
   takeFrameLimit = remainingSessionFrames(savedFrames);
   if (takeFrameLimit === 0) {
+    sessionLimitReached = true;
+    updateRecordButtonAvailability();
     throw new Error('このセッションは2時間の録音上限に達しています。新しいセッションを作成してください。');
   }
+  sessionLimitReached = false;
   activeTake = {
     id: crypto.randomUUID(),
     sessionId: activeSession.id,
     number: sessionTakes.length + 1,
     status: 'recording',
-    startedAt: Date.now(),
+    transferGeneration: roomCall?.localRole === 'guest' ? roomCall.authFields?.generation : null,
+    hostStored: roomCall?.localRole === 'guest' ? false : null,
+    startedAt: scheduledStartAt === null
+      ? Date.now()
+      : Date.now() + (scheduledStartAt - performance.now()),
     endedAt: null,
     frames: 0,
     chunks: 0,
@@ -616,6 +1358,20 @@ async function createTake() {
   silentGain = audioContext.createGain();
   silentGain.gain.value = 0;
   recorderNode.port.onmessage = ({ data }) => {
+    if (data.type === 'started') {
+      if (data.event) {
+        const timestamp = audioContext?.getOutputTimestamp?.();
+        const observedAt = timestamp && Number.isFinite(timestamp.performanceTime) &&
+          Number.isFinite(timestamp.contextTime)
+          ? timestamp.performanceTime + (data.contextTime - timestamp.contextTime) * 1000
+          : performance.now() + (data.contextTime - (audioContext?.currentTime ?? data.contextTime)) * 1000;
+        roomCall?.reportRecordingStarted(data.event, observedAt, data.frame);
+      }
+      setStatus('録音中 · 端末へ順次保存しています', 'recording');
+      $('waveformState').textContent = 'LIVE';
+      $('waveformState').classList.add('live');
+      return;
+    }
     if (data.type === 'level') {
       updateMeter(data.peak);
       return;
@@ -641,18 +1397,28 @@ async function createTake() {
   analyserNode.connect(recorderNode);
   recorderNode.connect(silentGain).connect(audioContext.destination);
   const track = mediaStream.getAudioTracks()[0];
-  track.addEventListener('ended', () => {
-    if (recording) {
+  if (!track) throw new Error('有効なマイク入力がありません。');
+  clearRecordingTrackMonitor();
+  const trackMonitor = monitorRecordingTrack(track, {
+    isRecording: () => recording,
+    onMuted: () => {
+      setStatus('マイク入力が一時停止しています。復帰を待っています…');
+      $('meterHint').textContent = '入力一時停止 · 復帰待ち';
+    },
+    onUnmuted: () => {
+      setStatus('録音中 · 端末へ順次保存しています', 'recording');
+      $('meterHint').textContent = '入力を検出中';
+    },
+    onEnded: () => {
       void stopRecording('マイク入力が終了しました。保存済みチャンクを復旧データとして残しました。')
         .catch((error) => setMessage(`録音を停止できませんでした: ${error.message}`, true));
-    }
-  }, { once: true });
-  track.addEventListener('mute', () => {
-    if (recording) {
-      void stopRecording('マイク入力が一時停止しました。保存済みチャンクを復旧データとして残しました。')
+    },
+    onMuteTimeout: () => {
+      void stopRecording('マイク入力の一時停止が5秒以上続いたため録音を停止しました。保存済みチャンクを復旧データとして残しました。')
         .catch((error) => setMessage(`録音を停止できませんでした: ${error.message}`, true));
     }
-  }, { once: true });
+  });
+  cleanupRecordingTrackMonitor = trackMonitor.cleanup;
   audioContext.addEventListener('statechange', () => {
     if (recording && audioContext?.state === 'closed') {
       void stopRecording('AudioContext が閉じられました。保存済みチャンクを復旧データとして残しました。')
@@ -660,18 +1426,34 @@ async function createTake() {
     }
   });
   await audioContext.resume();
-  recorderNode.port.postMessage({ type: 'start', maximumFrames: takeFrameLimit });
+  if (track.readyState !== 'live') throw new Error('録音開始前にマイク入力が終了しました。デバイスを確認して再試行してください。');
+  if (scheduledStartAt !== null && scheduledStartAt < performance.now() + 250) {
+    throw new Error('同期開始の準備が間に合いませんでした。録音準備を確認して再試行してください。');
+  }
+  const startAt = scheduledStartAt === null
+    ? null
+    : audioContextTimeAtPerformanceTime(scheduledStartAt);
+  recorderNode.port.postMessage({
+    type: 'start',
+    maximumFrames: takeFrameLimit,
+    startAt,
+    eventId: event?.eventId,
+    sequence: event?.sequence
+  });
   recording = true;
-  takeStartedAt = performance.now();
+  trackMonitor.checkCurrentMute();
+  takeStartedAt = scheduledStartAt ?? performance.now();
   elapsedTimer = window.setInterval(updateTimer, 200);
   recordButton.disabled = true;
   stopButton.disabled = false;
-  setStatus('録音中 · 端末へ順次保存しています', 'recording');
-  $('waveformState').textContent = 'LIVE';
-  $('waveformState').classList.add('live');
+  const scheduled = scheduledStartAt !== null;
+  setStatus(scheduled ? '録音開始を予約しました · 端末へ順次保存します' : '録音中 · 端末へ順次保存しています', scheduled ? 'ready' : 'recording');
+  $('waveformState').textContent = scheduled ? '準備中' : 'LIVE';
+  $('waveformState').classList.toggle('live', !scheduled);
 }
 
 async function stopDiagnostics({ stopCapture = true } = {}) {
+  clearRecordingTrackMonitor();
   if (sourceNode) sourceNode.disconnect();
   if (recorderNode) {
     recorderNode.port.onmessage = null;
@@ -733,8 +1515,8 @@ async function stopRecording(recoveryReason = null) {
   } catch (error) {
     failure ||= `take の完了状態を保存できませんでした: ${error.message}`;
   }
+  if (activeTake.transferGeneration) roomCall?.notifyTakeFinalized(activeTake);
   $('timer').textContent = formatDuration(activeTake.frames / TARGET_RATE);
-  recordButton.disabled = false;
   stopButton.disabled = true;
   finalizing = false;
   takeFrameLimit = 0;
@@ -745,24 +1527,56 @@ async function stopRecording(recoveryReason = null) {
   activeTake = null;
   await renderTakes();
   const sessionFrames = (await loadAll('takes'))
-    .filter((take) => take.sessionId === activeSession.id)
+    .filter((take) => take.sessionId === activeSession.id && !take.remote)
     .reduce((total, take) => total + (take.frames || 0), 0);
-  recordButton.disabled = sessionFrames >= MAX_SESSION_FRAMES;
-  if (recordButton.disabled) setStatus('このセッションは2時間の録音上限に達しています');
+  sessionLimitReached = sessionFrames >= MAX_SESSION_FRAMES;
+  updateRecordButtonAvailability();
+  if (sessionLimitReached) setStatus('このセッションは2時間の録音上限に達しています');
   await updateSessionSavedSize();
   await refreshSessionList();
   if (!failure) setMessage('録音データ（WAVチャンク）をブラウザー内に保存しました。音声ファイルとして保存するには「WAVを保存」を押してください。');
   return !failure;
 }
 
-async function startRecording() {
+function audioContextTimeAtPerformanceTime(targetTime) {
+  const timestamp = audioContext?.getOutputTimestamp?.();
+  if (timestamp && Number.isFinite(timestamp.contextTime) && Number.isFinite(timestamp.performanceTime)) {
+    return timestamp.contextTime + (targetTime - timestamp.performanceTime) / 1000;
+  }
+  return audioContext.currentTime + (targetTime - performance.now()) / 1000;
+}
+
+async function startRecording(remoteSchedule = null) {
   if (recording) return true;
   if (finalizing || starting || !activeSession) return false;
+  if (roomCall?.isActive && !roomCall.isGuest && !roomCall.canStartRecording) {
+    errorText.textContent = '通話接続と双方の録音準備が完了してから録音を開始してください。';
+    return false;
+  }
   starting = true;
   recordButton.disabled = true;
   try {
-    await createTake();
-    if (recording) roomCall?.setHostRecordingState(true);
+    let schedule = remoteSchedule;
+    if (roomCall?.isPeerReadyForRecording && !roomCall.isGuest && !schedule) {
+      const clockOffsetMs = await roomCall.synchronizeClock();
+      schedule = {
+        startAt: performance.now() + 5000,
+        clockOffsetMs,
+        event: { eventId: crypto.randomUUID(), sequence: roomCall.recordingSequence + 1 }
+      };
+    }
+    await createTake({
+      scheduledStartAt: schedule?.startAt ?? null,
+      event: schedule?.event ?? null
+    });
+    if (recording && schedule) {
+      if (!roomCall.isGuest) roomCall.setHostRecordingState(
+        true,
+        schedule.startAt,
+        schedule.clockOffsetMs,
+        schedule.event.eventId
+      );
+    }
     return recording;
   } catch (error) {
     await stopDiagnostics({ stopCapture: !roomCall?.isActive });
@@ -781,17 +1595,18 @@ async function startRecording() {
     return false;
   } finally {
     starting = false;
+    updateRecordButtonAvailability();
     if (roomCall?.isActive && !recording && mediaStream) startLocalPreview(mediaStream);
   }
 }
 
-function applyHostRecordingState(isRecording) {
+function applyHostRecordingState(isRecording, schedule = null) {
   const previousState = lastHostRecordingState;
   lastHostRecordingState = isRecording;
   hostRecordingCommand = hostRecordingCommand.then(async () => {
     if (isRecording) {
       $('hostRecordingStatus').textContent = 'ホストの録音に合わせて録音を開始しています…';
-      const started = recording || await startRecording();
+      const started = recording || await startRecording(schedule);
       $('hostRecordingStatus').textContent = recording
         ? 'ホストに合わせて録音中です'
         : 'この端末では録音を開始できませんでした。下のエラーを確認してください。';
@@ -819,9 +1634,12 @@ function applyHostRecordingState(isRecording) {
 
 function makeFilename(take, extension = 'wav') {
   const safeName = activeSession.name.trim().replace(/[^\p{L}\p{N}_-]+/gu, '_').slice(0, 60) || 'recording';
+  const participant = take.remote
+    ? `_${take.participant.trim().replace(/[^\p{L}\p{N}_-]+/gu, '_').slice(0, 60)}`
+    : '';
   const date = new Date(take.startedAt).toISOString().slice(0, 10);
   const recoveryTag = take.status === 'recovered' ? '_recovered' : '';
-  return `${safeName}_take-${String(take.number).padStart(2, '0')}${recoveryTag}_${date}.${extension}`;
+  return `${safeName}${participant}_take-${String(take.number).padStart(2, '0')}${recoveryTag}_${date}.${extension}`;
 }
 
 async function getTakeChunks(takeId) {
@@ -961,6 +1779,7 @@ $('backButton').addEventListener('click', async () => {
   await updateSessionSavedSize();
 });
 window.addEventListener('beforeunload', () => {
+  if (transferProgressTimer !== null) window.clearInterval(transferProgressTimer);
   void stopDiagnosticsOnUnload();
 });
 
@@ -974,7 +1793,19 @@ async function initialize() {
       getMicrophoneStream: ensureCaptureStream,
       releaseMicrophone: releaseCaptureStream,
       getRecordingState: () => recording,
+      checkReadiness: checkRecordingReadiness,
+      onReadinessState: () => updateRecordButtonAvailability(),
       onRecordingState: applyHostRecordingState,
+      getNextTransferChunk,
+      prepareTransferChunk,
+      markTransferChunkStored: markTransferChunkStored,
+      getNextTransferManifest,
+      hasPendingTransfer,
+      markTransferManifestStored,
+      getTransferInventory,
+      reconcileTransferInventory: reconcileGuestTransferInventory,
+      storeIncomingTransferChunk,
+      storeIncomingTransferManifest,
       onLocalStream: (stream) => {
         if (stream) {
           startLocalPreview(stream);
@@ -988,6 +1819,16 @@ async function initialize() {
     await recoverInterruptedTakes();
     await refreshSessionList();
     await updateSessionSavedSize();
+    transferProgressTimer = window.setInterval(() => {
+      void updateTransferProgress().catch((error) => {
+        const card = $('transferProgressCard');
+        card.hidden = false;
+        card.classList.add('transfer-error');
+        $('transferProgressText').textContent = '音源の進捗を更新できません。通話の接続を確認してください。詳しいエラーは下に表示しています。';
+        $('transferProgressDetails').textContent = `エラーの詳細: ${error.message}`;
+        $('transferDiagnostics').open = true;
+      });
+    }, 1000);
   } catch (error) {
     $('setupMessage').textContent = `ローカル保存を初期化できませんでした: ${error.message}`;
     setupForm.querySelector('button[type="submit"]').disabled = true;

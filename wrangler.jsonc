@@ -16,6 +16,16 @@
       }
     ]
   },
+  "ratelimits": [
+    {
+      "name": "SIGNAL_RATE_LIMITER",
+      "namespace_id": "1001",
+      "simple": {
+        "limit": 20,
+        "period": 60
+      }
+    }
+  ],
   "migrations": [
     {
       "tag": "v1",

@@ -8,6 +8,7 @@ class LocalRecorderProcessor extends AudioWorkletProcessor {
     this.frames = 0;
     this.totalFrames = 0;
     this.maximumFrames = MAX_SESSION_FRAMES;
+    this.startAt = null;
     this.buffer = new Float32Array(SAMPLE_RATE_TARGET);
     this.chunkStartFrame = 0;
     this.levelFrames = 0;
@@ -17,7 +18,11 @@ class LocalRecorderProcessor extends AudioWorkletProcessor {
         this.maximumFrames = Number.isSafeInteger(data.maximumFrames) && data.maximumFrames > 0
           ? Math.min(data.maximumFrames, MAX_SESSION_FRAMES)
           : MAX_SESSION_FRAMES;
-        this.recording = true;
+        this.startAt = Number.isFinite(data.startAt) ? data.startAt : null;
+        this.event = typeof data.eventId === 'string' && Number.isSafeInteger(data.sequence)
+          ? { eventId: data.eventId, sequence: data.sequence }
+          : null;
+        this.recording = this.startAt === null;
       } else if (data.type === 'stop') {
         this.recording = false;
         this.flush(true);
@@ -43,6 +48,18 @@ class LocalRecorderProcessor extends AudioWorkletProcessor {
     if (input) {
       for (let index = 0; index < input.length; index += 1) {
         this.levelPeak = Math.max(this.levelPeak, Math.abs(input[index]));
+        if (!this.recording && this.startAt !== null &&
+            currentTime + index / sampleRate >= this.startAt) {
+          this.recording = true;
+          const contextTime = currentTime + index / sampleRate;
+          this.startAt = null;
+          this.port.postMessage({
+            type: 'started',
+            frame: this.totalFrames,
+            contextTime,
+            event: this.event
+          });
+        }
         if (this.recording && this.totalFrames < this.maximumFrames) {
           this.buffer[this.frames] = input[index];
           this.frames += 1;

@@ -34,6 +34,26 @@ export function makeWavHeader(frameCount) {
   return buffer;
 }
 
+export function createPcm24Wav(samples) {
+  if (!(samples instanceof Float32Array) || samples.length === 0) {
+    throw new TypeError('PCM24 WAVのサンプルが不正です。');
+  }
+  const data = new ArrayBuffer(samples.length * BYTES_PER_FRAME);
+  const view = new DataView(data);
+  let offset = 0;
+  for (const sample of samples) {
+    const clamped = Math.max(-1, Math.min(1, sample));
+    const value = clamped < 0
+      ? Math.round(clamped * 8_388_608)
+      : Math.min(8_388_607, Math.round(clamped * 8_388_607));
+    view.setUint8(offset, value & 0xff);
+    view.setUint8(offset + 1, (value >> 8) & 0xff);
+    view.setUint8(offset + 2, (value >> 16) & 0xff);
+    offset += BYTES_PER_FRAME;
+  }
+  return new Blob([makeWavHeader(samples.length), data], { type: 'audio/wav' });
+}
+
 function validateChunkHeader(chunk, sequence, startFrame) {
   if (!Number.isSafeInteger(chunk.sequence) || chunk.sequence !== sequence ||
       !Number.isSafeInteger(chunk.startFrame) || chunk.startFrame !== startFrame ||

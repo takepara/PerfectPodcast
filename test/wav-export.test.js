@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { makeWavHeader, writePcm24Wav } from '../prototype/wav-export.js';
+import { createPcm24Wav, makeWavHeader, writePcm24Wav } from '../prototype/wav-export.js';
 
 function makeChunk(sequence, startFrame, values) {
   const frames = values.length / 3;
@@ -55,4 +55,15 @@ test('writes a 44-byte PCM24 mono 48 kHz RIFF header', () => {
   assert.equal(header.getUint16(32, true), 3);
   assert.equal(header.getUint16(34, true), 24);
   assert.throws(() => makeWavHeader(0), RangeError);
+});
+
+test('encodes live Float32 samples into a complete PCM24 WAV chunk', async () => {
+  const wav = createPcm24Wav(new Float32Array([-1, 0, 1]));
+  assert.equal(wav.type, 'audio/wav');
+  assert.equal(wav.size, 53);
+  assert.deepEqual(
+    [...new Uint8Array(await wav.slice(44).arrayBuffer())],
+    [0, 0, 128, 0, 0, 0, 255, 255, 127]
+  );
+  assert.throws(() => createPcm24Wav([]), /サンプルが不正/u);
 });
