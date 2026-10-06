@@ -1,3 +1,5 @@
+import { calculateIntervalStats } from './connection-stats.js';
+
 const $ = (id) => document.getElementById(id);
 const ROOM_ID_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const MAX_SIGNAL_RETRIES = 3;
@@ -945,24 +947,40 @@ export class RoomCall {
       const outbound = reportList.find((report) =>
         report.type === 'outbound-rtp' && (report.kind === 'audio' || report.mediaType === 'audio') && !report.isRemote
       );
-      const now = performance.now();
-      let bitrate = null;
-      if (outbound && this.previousStats && now > this.previousStats.at &&
-          outbound.bytesSent >= this.previousStats.bytesSent) {
-        bitrate = (outbound.bytesSent - this.previousStats.bytesSent) * 8 * 1000 / (now - this.previousStats.at);
-      }
-      if (outbound) this.previousStats = { at: now, bytesSent: outbound.bytesSent };
+      const currentStats = {
+        timestamp: outbound?.timestamp ?? inbound?.timestamp ?? performance.now(),
+        outboundId: outbound?.id ?? null,
+        inboundId: inbound?.id ?? null,
+        bytesSent: outbound?.bytesSent,
+        packetsReceived: inbound?.packetsReceived,
+        packetsLost: inbound?.packetsLost,
+        concealedSamples: inbound?.concealedSamples
+      };
+      const previous = this.previousStats;
+      const sameReports = previous &&
+        (!outbound || !previous.outboundId || previous.outboundId === outbound.id) &&
+        (!inbound || !previous.inboundId || previous.inboundId === inbound.id);
+      const intervalStats = calculateIntervalStats(
+        sameReports ? previous : null,
+        currentStats,
+        sameReports ? currentStats.timestamp - previous.timestamp : 0
+      );
+      this.previousStats = outbound || inbound ? currentStats : null;
 
       const parts = [];
       if (pair?.currentRoundTripTime !== undefined) {
         parts.push(`RTT ${Math.round(pair.currentRoundTripTime * 1000)} ms`);
       }
       if (inbound?.jitter !== undefined) parts.push(`jitter ${Math.round(inbound.jitter * 1000)} ms`);
-      if (inbound?.packetsLost !== undefined && inbound?.packetsReceived !== undefined) {
-        const total = Math.max(0, inbound.packetsLost) + inbound.packetsReceived;
-        if (total > 0) parts.push(`損失 ${(Math.max(0, inbound.packetsLost) * 100 / total).toFixed(1)}%`);
+      if (intervalStats.packetLossPercent !== null) {
+        parts.push(`損失 ${intervalStats.packetLossPercent.toFixed(1)}%`);
       }
-      if (bitrate !== null) parts.push(`送信 ${Math.round(bitrate / 1000)} kbps`);
+      if (intervalStats.concealedSamples !== null) {
+        parts.push(`補間 ${intervalStats.concealedSamples} samples`);
+      }
+      if (intervalStats.bitrateKbps !== null) {
+        parts.push(`送信 ${Math.round(intervalStats.bitrateKbps)} kbps`);
+      }
       if (pair) {
         const local = reports.get(pair.localCandidateId)?.candidateType;
         const remote = reports.get(pair.remoteCandidateId)?.candidateType;

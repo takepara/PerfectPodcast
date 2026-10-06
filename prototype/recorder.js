@@ -1,4 +1,6 @@
 import { RoomCall } from './room-call.js';
+import { MAX_SESSION_FRAMES, remainingSessionFrames } from './recording-limits.js';
+import { writePcm24Wav } from './wav-export.js';
 
 const TARGET_RATE = 48000;
 const BYTES_PER_FRAME = 3;
@@ -54,6 +56,7 @@ let commitChain = Promise.resolve();
 let commitError = null;
 let nextSequence = 0;
 let capturedFrames = 0;
+let takeFrameLimit = 0;
 let elapsedTimer = null;
 let noticeTimer = null;
 let takeStartedAt = 0;
@@ -135,7 +138,16 @@ function setMessage(message, isError = false) {
 
 function updateTimer() {
   if (!recording) return;
-  $('timer').textContent = formatDuration((performance.now() - takeStartedAt) / 1000);
+  const elapsed = performance.now() - takeStartedAt;
+  $('timer').textContent = formatDuration(elapsed / 1000);
+  if (elapsed >= takeFrameLimit / TARGET_RATE * 1000) {
+    void stopRecording().then((saved) => setMessage(
+      saved
+        ? 'このセッションの2時間上限に達したため、録音を停止して保存しました。'
+        : 'このセッションの2時間上限に達したため録音を停止しました。保存状態を確認してください。',
+      !saved
+    ));
+  }
 }
 
 function updateMeter(peak) {
@@ -420,6 +432,9 @@ async function openSession(session) {
   const takes = (await loadAll('takes'))
     .filter((take) => take.sessionId === session.id)
     .sort((left, right) => left.startedAt - right.startedAt);
+  const savedFrames = takes.reduce((total, take) => total + (take.frames || 0), 0);
+  recordButton.disabled = savedFrames >= MAX_SESSION_FRAMES;
+  if (recordButton.disabled) setStatus('このセッションは2時間の録音上限に達しています');
   $('chunkCount').textContent = String(takes.at(-1)?.chunks || 0);
   await updateSessionSavedSize();
 }
@@ -474,30 +489,6 @@ async function releaseCaptureStream() {
   if (recording) return;
   mediaStream?.getTracks().forEach((track) => track.stop());
   mediaStream = null;
-}
-
-function makeWavHeader(frameCount) {
-  const dataBytes = frameCount * BYTES_PER_FRAME;
-  if (dataBytes > 0xffffffff - 36) throw new Error('このtakeは通常 WAV のサイズ上限を超えています。分割書き出しは次の実装段階で対応します。');
-  const buffer = new ArrayBuffer(44);
-  const view = new DataView(buffer);
-  const text = (offset, value) => {
-    for (let index = 0; index < value.length; index += 1) view.setUint8(offset + index, value.charCodeAt(index));
-  };
-  text(0, 'RIFF');
-  view.setUint32(4, 36 + dataBytes, true);
-  text(8, 'WAVE');
-  text(12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, TARGET_RATE, true);
-  view.setUint32(28, TARGET_RATE * BYTES_PER_FRAME, true);
-  view.setUint16(32, BYTES_PER_FRAME, true);
-  view.setUint16(34, 24, true);
-  text(36, 'data');
-  view.setUint32(40, dataBytes, true);
-  return buffer;
 }
 
 function createPcm24Wav(samples) {
@@ -578,6 +569,11 @@ async function createTake() {
     throw new Error(`この端末の入力は ${settings.sampleRate || audioContext.sampleRate} Hz です。Step 1 は 48,000 Hz のみ対応します。`);
   }
   const sessionTakes = (await loadAll('takes')).filter((take) => take.sessionId === activeSession.id);
+  const savedFrames = sessionTakes.reduce((total, take) => total + (take.frames || 0), 0);
+  takeFrameLimit = remainingSessionFrames(savedFrames);
+  if (takeFrameLimit === 0) {
+    throw new Error('このセッションは2時間の録音上限に達しています。新しいセッションを作成してください。');
+  }
   activeTake = {
     id: crypto.randomUUID(),
     sessionId: activeSession.id,
@@ -630,6 +626,15 @@ async function createTake() {
         errorText.textContent = error.message || `チャンクを保存できませんでした: ${error}`;
         void stopRecording(errorText.textContent);
       });
+      return;
+    }
+    if (data.type === 'limit-reached' && recording) {
+      void stopRecording().then((saved) => setMessage(
+        saved
+          ? 'このセッションの2時間上限に達したため、録音を停止して保存しました。'
+          : 'このセッションの2時間上限に達したため録音を停止しました。保存状態を確認してください。',
+        !saved
+      ));
     }
   };
   sourceNode.connect(analyserNode);
@@ -655,7 +660,7 @@ async function createTake() {
     }
   });
   await audioContext.resume();
-  recorderNode.port.postMessage({ type: 'start' });
+  recorderNode.port.postMessage({ type: 'start', maximumFrames: takeFrameLimit });
   recording = true;
   takeStartedAt = performance.now();
   elapsedTimer = window.setInterval(updateTimer, 200);
@@ -732,12 +737,18 @@ async function stopRecording(recoveryReason = null) {
   recordButton.disabled = false;
   stopButton.disabled = true;
   finalizing = false;
+  takeFrameLimit = 0;
   setStatus(failure ? '復旧用データを保存しました。未確定の末尾は含まれません。' : '録音データ保存済み · WAVを書き出せます', failure ? 'ready' : 'saved');
   $('waveformState').textContent = '待機中';
   $('waveformState').classList.remove('live');
   if (failure) errorText.textContent = `${failure} 保存済みチャンクは一覧から復旧 WAV として書き出せます。`;
   activeTake = null;
   await renderTakes();
+  const sessionFrames = (await loadAll('takes'))
+    .filter((take) => take.sessionId === activeSession.id)
+    .reduce((total, take) => total + (take.frames || 0), 0);
+  recordButton.disabled = sessionFrames >= MAX_SESSION_FRAMES;
+  if (recordButton.disabled) setStatus('このセッションは2時間の録音上限に達しています');
   await updateSessionSavedSize();
   await refreshSessionList();
   if (!failure) setMessage('録音データ（WAVチャンク）をブラウザー内に保存しました。音声ファイルとして保存するには「WAVを保存」を押してください。');
@@ -824,24 +835,44 @@ async function getTakeChunks(takeId) {
 
 async function exportTake(take) {
   const totalBytes = 44 + take.frames * BYTES_PER_FRAME;
-  if (!take.frames || totalBytes > MAX_WAV_BYTES) {
-    setMessage('WAV は1 GiB以下で書き出してください。take の分割保存は次の実装段階で対応します。', true);
-    return;
-  }
-  if (totalBytes > BLOB_DOWNLOAD_LIMIT) {
-    setMessage('この実行環境では256 MBを超えるWAVを安全にダウンロードできません。HTTPSまたはlocalhostで開き、対応ブラウザーで保存してください。', true);
+  if (!Number.isSafeInteger(take.frames) || take.frames <= 0 || totalBytes > MAX_WAV_BYTES) {
+    setMessage('WAV は1 GiB以下で書き出してください。', true);
     return;
   }
   try {
+    const fileHandle = typeof window.showSaveFilePicker === 'function'
+      ? await window.showSaveFilePicker({
+          suggestedName: makeFilename(take),
+          types: [{ description: 'WAV audio', accept: { 'audio/wav': ['.wav'] } }]
+        })
+      : null;
     const chunks = await getTakeChunks(take.id);
-    let exportedFrames = 0;
-    const blobParts = [makeWavHeader(take.frames)];
-    for (const chunk of chunks) {
-      const pcm = await chunk.wav.slice(44).arrayBuffer();
-      blobParts.push(pcm);
-      exportedFrames += chunk.frames;
+    if (fileHandle) {
+      const writable = await fileHandle.createWritable();
+      try {
+        await writePcm24Wav(take, chunks, writable);
+        await writable.close();
+      } catch (error) {
+        try {
+          await writable.abort(error);
+        } catch (abortError) {
+          throw new AggregateError([error, abortError], 'WAVの書き込みと中断処理の両方に失敗しました。');
+        }
+        throw error;
+      }
+      setMessage('PCM24 WAVを保存先へ書き出しました。');
+      return;
     }
-    if (exportedFrames !== take.frames) throw new Error('take 台帳と保存チャンクのフレーム数が一致しません。');
+    if (totalBytes > BLOB_DOWNLOAD_LIMIT) {
+      setMessage('このブラウザーでは256 MBを超えるWAVを安全に保存できません。対応するChromeまたはEdgeで保存先を選択してください。', true);
+      return;
+    }
+    const blobParts = [];
+    await writePcm24Wav(take, chunks, {
+      async write(data) {
+        blobParts.push(data);
+      }
+    });
     const output = new Blob(blobParts, { type: 'audio/wav' });
     const url = URL.createObjectURL(output);
     const downloadLink = document.createElement('a');
@@ -851,6 +882,10 @@ async function exportTake(take) {
     window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
     setMessage('ブラウザーにWAVのダウンロードを要求しました。保存完了はダウンロード一覧で確認してください。');
   } catch (error) {
+    if (error.name === 'AbortError') {
+      setMessage('WAVの保存をキャンセルしました。');
+      return;
+    }
     setMessage(`WAV を書き出せませんでした: ${error.message}`, true);
   }
 }
