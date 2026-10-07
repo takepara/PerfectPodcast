@@ -1,4 +1,4 @@
-const MAX_PENDING_COMMITS = 2;
+const MAX_PENDING_COMMITS = 60;
 
 export function canQueueRecordingCommit(pendingCommits, isFinal) {
   if (!Number.isSafeInteger(pendingCommits) || pendingCommits < 0 || typeof isFinal !== 'boolean') {

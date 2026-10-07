@@ -499,6 +499,60 @@ test('ignores readiness from another generation and stale readiness sequences', 
   assert.equal(call.updates, 1);
 });
 
+test('processes readiness only after an earlier asynchronous auth message completes', async () => {
+  const call = Object.create(RoomCall.prototype);
+  let releaseAuthentication;
+  const processed = [];
+  Object.assign(call, {
+    incomingMessageChain: Promise.resolve(),
+    async processMessage(message) {
+      processed.push(`${message}:start`);
+      if (message === 'auth-confirm') {
+        await new Promise((resolve) => { releaseAuthentication = resolve; });
+      }
+      processed.push(`${message}:end`);
+    }
+  });
+
+  const authMessage = call.handleMessage('auth-confirm');
+  const readinessMessage = call.handleMessage('ready-state');
+  await Promise.resolve();
+  assert.deepEqual(processed, ['auth-confirm:start']);
+
+  releaseAuthentication();
+  await Promise.all([authMessage, readinessMessage]);
+  assert.deepEqual(processed, [
+    'auth-confirm:start',
+    'auth-confirm:end',
+    'ready-state:start',
+    'ready-state:end'
+  ]);
+});
+
+test('resets remote waveform history to the local recording start time', () => {
+  const waveform = {
+    history: new Float32Array(600).fill(0.5),
+    historyCount: 12,
+    sampledAt: 10,
+    startedAt: 5,
+    rulerSecond: 10
+  };
+  const call = Object.create(RoomCall.prototype);
+  call.remoteWaveforms = new Map([['track', waveform]]);
+
+  call.beginRecordingWaveform(100);
+  assert.equal(call.waveformRecordingStartedAt, 100);
+  assert.equal(waveform.history.some((sample) => sample !== 0), false);
+  assert.equal(waveform.historyCount, 0);
+  assert.equal(waveform.sampledAt, 100);
+  assert.equal(waveform.startedAt, 100);
+  assert.equal(waveform.rulerSecond, -1);
+
+  call.endRecordingWaveform();
+  assert.equal(call.waveformRecordingStartedAt, null);
+  assert.equal(waveform.historyCount, 0);
+});
+
 test('host recording requires both readiness checks and an active peer connection', () => {
   const originalWebSocket = globalThis.WebSocket;
   globalThis.WebSocket = { OPEN: 1 };
@@ -606,6 +660,60 @@ test('confirms both actual recording starts after converting the guest clock', (
   } finally {
     if (originalWindow === undefined) delete globalThis.window;
     else globalThis.window = originalWindow;
+  }
+});
+
+test('does not stop recording when a peer start confirmation is late', () => {
+  const originalWindow = globalThis.window;
+  const originalWebSocket = globalThis.WebSocket;
+  let timeoutCallback;
+  let stopCount = 0;
+  let status = '';
+  globalThis.window = {
+    setTimeout(callback) {
+      timeoutCallback = callback;
+      return 1;
+    },
+    clearTimeout() {}
+  };
+  globalThis.WebSocket = { OPEN: 1 };
+  try {
+    const call = Object.create(RoomCall.prototype);
+    Object.assign(call, {
+      localRole: 'host',
+      connected: true,
+      localReady: true,
+      remoteReady: true,
+      socket: { readyState: 1 },
+      peerConnection: { connectionState: 'connected' },
+      authFields: { generation: '0123456789abcdefghij_-' },
+      recordingSequence: 0,
+      pendingRecordingCommands: new Map(),
+      pendingStartEvents: new Map(),
+      getRecordingState: () => true,
+      onRecordingState: () => { stopCount += 1; },
+      cancelPendingTurnCredentials() {},
+      clearPendingStartEvents() {},
+      sendRecordingCommand() {},
+      setStatus(message) { status = message; }
+    });
+
+    call.setHostRecordingState(
+      true,
+      performance.now() + 5000,
+      0,
+      '123e4567-e89b-42d3-a456-426614174000'
+    );
+    timeoutCallback();
+
+    assert.equal(stopCount, 0);
+    assert.match(status, /録音は継続/u);
+    assert.equal(call.pendingStartEvents.size, 0);
+  } finally {
+    if (originalWindow === undefined) delete globalThis.window;
+    else globalThis.window = originalWindow;
+    if (originalWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = originalWebSocket;
   }
 });
 

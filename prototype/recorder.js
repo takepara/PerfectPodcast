@@ -1,12 +1,13 @@
 import { RoomCall } from './room-call.js';
 import { MAX_SESSION_FRAMES, remainingSessionFrames } from './recording-limits.js';
-import { RecordingTransfer } from './recording-transfer.js';
+import { RecordingTransfer, takeWithTransferParticipant } from './recording-transfer.js';
 import { canQueueRecordingCommit } from './recording-commit-queue.js';
 import { verifyIncomingStoredChunk, verifyIncomingStoredTake } from './recording-storage.js';
 import { reconcileTransferInventory } from './transfer-inventory.js';
 import { createPcm24Wav, writePcm24Wav } from './wav-export.js';
 import { splitTransferBacklog, summarizeTransferChunks } from './transfer-progress.js';
 import { monitorRecordingTrack } from './recording-track-monitor.js';
+import { makeRecordingFilename } from './recording-filename.js';
 
 const TARGET_RATE = 48000;
 const BYTES_PER_FRAME = 3;
@@ -32,6 +33,7 @@ const sessionList = $('sessionList');
 const takeList = $('takeList');
 const recordButton = $('recordButton');
 const stopButton = $('stopButton');
+const recordingPreparation = $('recordingPreparation');
 const errorText = $('errorText');
 const notice = $('notice');
 const meter = document.querySelector('[role="meter"]');
@@ -65,6 +67,9 @@ let nextSequence = 0;
 let capturedFrames = 0;
 let takeFrameLimit = 0;
 let elapsedTimer = null;
+let preparationTimer = null;
+let scheduledRecordingStartAt = null;
+let takeRefreshTimer = null;
 let noticeTimer = null;
 let takeStartedAt = 0;
 let lastPeak = 0;
@@ -149,6 +154,31 @@ function formatDuration(seconds) {
 function setStatus(text, kind = 'ready') {
   $('statusText').textContent = text;
   $('statusDot').className = `status-dot${kind === 'recording' ? ' live' : kind === 'saved' ? ' saved' : ''}`;
+}
+
+function updateRecordingPreparation() {
+  let message = '';
+  if (scheduledRecordingStartAt !== null) {
+    const seconds = Math.ceil((scheduledRecordingStartAt - performance.now()) / 1000);
+    message = seconds > 0
+      ? `録音開始まであと ${seconds} 秒です。録音中の表示に切り替わるまで話し始めずにお待ちください。`
+      : '録音開始を確認しています。録音中の表示に切り替わるまでお待ちください。';
+  } else if (starting) {
+    message = '録音準備中です。開始時刻と録音環境を確認しています。録音中の表示に切り替わるまで話し始めずにお待ちください。';
+  }
+  if (!message) {
+    recordingPreparation.hidden = true;
+    window.clearInterval(preparationTimer);
+    preparationTimer = null;
+    if (recording && !finalizing) setStatus('録音中 · 端末へ順次保存しています', 'recording');
+    return;
+  }
+  recordingPreparation.hidden = false;
+  recordingPreparation.textContent = message;
+  if ($('statusText').textContent !== message) setStatus(message);
+  if (preparationTimer === null) {
+    preparationTimer = window.setInterval(updateRecordingPreparation, 200);
+  }
 }
 
 function updateRecordButtonAvailability() {
@@ -412,8 +442,17 @@ async function getNextTransferChunk(generation) {
     (item) => !item.remote && item.hostStored !== true
   );
   if (!chunk) return null;
-  const take = await runRequest('takes', 'get', chunk.takeId);
-  return take ? { take, chunk } : null;
+  const storedTake = await runRequest('takes', 'get', chunk.takeId);
+  if (!storedTake) return null;
+  const take = await ensureTransferParticipant(storedTake);
+  return { take, chunk };
+}
+
+async function ensureTransferParticipant(take) {
+  const updatedTake = takeWithTransferParticipant(take, activeSession?.participant);
+  if (take.participant === updatedTake.participant) return take;
+  await persistTake(updatedTake);
+  return updatedTake;
 }
 
 async function prepareTransferChunk(takeId, sequence, sha256) {
@@ -612,9 +651,10 @@ async function reconcileGuestTransferInventory(generation, hostItems) {
 }
 
 async function getNextTransferManifest(generation) {
-  return findIndexValue('takes', 'transferGeneration', IDBKeyRange.only(generation), (take) =>
+  const take = await findIndexValue('takes', 'transferGeneration', IDBKeyRange.only(generation), (take) =>
     take.status !== 'recording' && take.hostStored !== true && take.frames > 0 && take.chunks > 0
   );
+  return take ? ensureTransferParticipant(take) : null;
 }
 
 async function hasPendingTransfer(generation) {
@@ -995,8 +1035,7 @@ async function storeIncomingTransferChunk(metadata, wav, sha256) {
     hostStoredFrames: progress.hostStoredFrames + metadata.frames,
     totalTakes: progress.totalTakes + (existingTake ? 0 : 1)
   }));
-  await updateSessionSavedSize();
-  await renderTakes();
+  scheduleTakeRefresh();
 }
 
 async function storeIncomingTransferManifest(manifest) {
@@ -1035,6 +1074,19 @@ async function updateSessionSavedSize() {
     ? (await loadAll('takes')).filter((take) => take.sessionId === activeSession.id).reduce((total, take) => total + (take.bytes || 0), 0)
     : 0;
   $('sessionSaved').textContent = `${(saved / 1_000_000).toFixed(2)} MB`;
+}
+
+function scheduleTakeRefresh() {
+  if (takeRefreshTimer !== null) return;
+  takeRefreshTimer = window.setTimeout(() => {
+    takeRefreshTimer = null;
+    void (async () => {
+      await renderTakes();
+      await updateSessionSavedSize();
+    })().catch((error) => {
+      errorText.textContent = `録音一覧を更新できませんでした: ${error.message}`;
+    });
+  }, 2000);
 }
 
 async function refreshSessionList() {
@@ -1114,13 +1166,16 @@ async function renderTakes() {
     info.append(title, meta);
     const actions = document.createElement('div');
     actions.className = 'take-actions';
-    const exportButton = document.createElement('button');
-    exportButton.className = 'take-action';
-    exportButton.type = 'button';
-    exportButton.textContent = take.status === 'recovered' ? '復旧 WAV を保存' : 'WAV を保存';
-    exportButton.disabled = take.status === 'recording' || !take.chunks;
-    exportButton.addEventListener('click', () => { void exportTake(take); });
-    actions.append(exportButton);
+    if (roomCall?.isGuest !== true) {
+      const exportButton = document.createElement('button');
+      exportButton.className = 'take-action';
+      exportButton.type = 'button';
+      exportButton.textContent = take.status === 'recovered' ? '復旧 WAV を保存' : 'WAV を保存';
+      exportButton.disabled = take.status === 'recording' || !take.chunks ||
+        (take.remote && take.hostStored !== true);
+      exportButton.addEventListener('click', () => { void exportTake(take); });
+      actions.append(exportButton);
+    }
     row.append(info, actions);
     takeList.append(row);
   }
@@ -1240,7 +1295,7 @@ async function commitChunk(samples, isFinal, startFrame) {
     throw new Error(`録音フレームが不連続です（期待 ${capturedFrames} / 取得 ${startFrame}）。不明区間を正常音声として扱わず録音を停止しました。`);
   }
   if (!canQueueRecordingCommit(pendingCommits, isFinal)) {
-    throw new Error('IndexedDBへの保存待ちが2チャンクに達しました。データ欠落を防ぐため録音を停止しました。');
+    throw new Error('IndexedDBへの保存待ちが60秒分に達しました。データ欠落を防ぐため録音を停止しました。');
   }
   const sequence = nextSequence++;
   capturedFrames += samples.length;
@@ -1269,18 +1324,6 @@ async function commitChunk(samples, isFinal, startFrame) {
     transaction.objectStore('takes').put(take);
     await done;
     activeTake = take;
-    if (chunk.transferGeneration) {
-      updateTransferProgressCache(chunk.transferGeneration, 'guest', (progress) => ({
-        bytes: progress.bytes + wav.size,
-        frames: progress.frames + samples.length,
-        pendingBytes: progress.pendingBytes + wav.size,
-        pendingFrames: progress.pendingFrames + samples.length
-      }));
-    }
-    $('chunkCount').textContent = String(take.chunks);
-    await updateSessionSavedSize();
-    await renderTakes();
-    roomCall?.notifyChunkCommitted(chunk, take);
   }).catch((error) => {
     commitError = error;
     throw error;
@@ -1288,6 +1331,19 @@ async function commitChunk(samples, isFinal, startFrame) {
     pendingCommits -= 1;
   });
   await commitChain;
+  const take = activeTake;
+  if (!take) throw new Error('保存済み録音takeが見つかりません。');
+  if (chunk.transferGeneration) {
+    updateTransferProgressCache(chunk.transferGeneration, 'guest', (progress) => ({
+      bytes: progress.bytes + wav.size,
+      frames: progress.frames + samples.length,
+      pendingBytes: progress.pendingBytes + wav.size,
+      pendingFrames: progress.pendingFrames + samples.length
+    }));
+  }
+  $('chunkCount').textContent = String(take.chunks);
+  scheduleTakeRefresh();
+  roomCall?.notifyChunkCommitted(chunk, take);
 }
 
 async function createTake({ scheduledStartAt = null, event = null } = {}) {
@@ -1316,6 +1372,7 @@ async function createTake({ scheduledStartAt = null, event = null } = {}) {
     id: crypto.randomUUID(),
     sessionId: activeSession.id,
     number: sessionTakes.length + 1,
+    participant: activeSession.participant,
     status: 'recording',
     transferGeneration: roomCall?.localRole === 'guest' ? roomCall.authFields?.generation : null,
     hostStored: roomCall?.localRole === 'guest' ? false : null,
@@ -1359,15 +1416,25 @@ async function createTake({ scheduledStartAt = null, event = null } = {}) {
   silentGain.gain.value = 0;
   recorderNode.port.onmessage = ({ data }) => {
     if (data.type === 'started') {
+      const timestamp = audioContext?.getOutputTimestamp?.();
+      const observedAt = timestamp && Number.isFinite(timestamp.performanceTime) &&
+        Number.isFinite(timestamp.contextTime)
+        ? timestamp.performanceTime + (data.contextTime - timestamp.contextTime) * 1000
+        : performance.now() + (data.contextTime - (audioContext?.currentTime ?? data.contextTime)) * 1000;
       if (data.event) {
-        const timestamp = audioContext?.getOutputTimestamp?.();
-        const observedAt = timestamp && Number.isFinite(timestamp.performanceTime) &&
-          Number.isFinite(timestamp.contextTime)
-          ? timestamp.performanceTime + (data.contextTime - timestamp.contextTime) * 1000
-          : performance.now() + (data.contextTime - (audioContext?.currentTime ?? data.contextTime)) * 1000;
         roomCall?.reportRecordingStarted(data.event, observedAt, data.frame);
       }
+      takeStartedAt = observedAt;
+      waveformHistory.fill(0);
+      waveformCount = 0;
+      waveformElapsedSeconds = 0;
+      lastWaveformSample = observedAt;
+      lastRulerSecond = -1;
+      roomCall?.beginRecordingWaveform(observedAt);
+      scheduledRecordingStartAt = null;
+      updateRecordingPreparation();
       setStatus('録音中 · 端末へ順次保存しています', 'recording');
+      if (roomCall?.isGuest) $('hostRecordingStatus').textContent = 'ホストに合わせて録音中です';
       $('waveformState').textContent = 'LIVE';
       $('waveformState').classList.add('live');
       return;
@@ -1414,8 +1481,8 @@ async function createTake({ scheduledStartAt = null, event = null } = {}) {
         .catch((error) => setMessage(`録音を停止できませんでした: ${error.message}`, true));
     },
     onMuteTimeout: () => {
-      void stopRecording('マイク入力の一時停止が5秒以上続いたため録音を停止しました。保存済みチャンクを復旧データとして残しました。')
-        .catch((error) => setMessage(`録音を停止できませんでした: ${error.message}`, true));
+      setStatus('マイク入力が一時停止中です · 録音を継続しています');
+      setMessage('マイク入力の一時停止が続いています。入力が復帰するまで録音を継続します。', true);
     }
   });
   cleanupRecordingTrackMonitor = trackMonitor.cleanup;
@@ -1450,6 +1517,7 @@ async function createTake({ scheduledStartAt = null, event = null } = {}) {
   setStatus(scheduled ? '録音開始を予約しました · 端末へ順次保存します' : '録音中 · 端末へ順次保存しています', scheduled ? 'ready' : 'recording');
   $('waveformState').textContent = scheduled ? '準備中' : 'LIVE';
   $('waveformState').classList.toggle('live', !scheduled);
+  if (!scheduled) updateRecordingPreparation();
 }
 
 async function stopDiagnostics({ stopCapture = true } = {}) {
@@ -1475,8 +1543,13 @@ async function stopRecording(recoveryReason = null) {
   if (!activeTake || finalizing) return !recording && !finalizing;
   finalizing = true;
   recording = false;
+  scheduledRecordingStartAt = null;
+  updateRecordingPreparation();
+  roomCall?.endRecordingWaveform();
   roomCall?.setHostRecordingState(false);
   window.clearInterval(elapsedTimer);
+  window.clearTimeout(takeRefreshTimer);
+  takeRefreshTimer = null;
   recordButton.disabled = true;
   stopButton.disabled = true;
   setStatus(recoveryReason ? '保存済みチャンクから復旧しています…' : '末尾チャンクを保存しています…');
@@ -1554,6 +1627,8 @@ async function startRecording(remoteSchedule = null) {
     return false;
   }
   starting = true;
+  scheduledRecordingStartAt = remoteSchedule?.startAt ?? null;
+  updateRecordingPreparation();
   recordButton.disabled = true;
   try {
     let schedule = remoteSchedule;
@@ -1564,6 +1639,8 @@ async function startRecording(remoteSchedule = null) {
         clockOffsetMs,
         event: { eventId: crypto.randomUUID(), sequence: roomCall.recordingSequence + 1 }
       };
+      scheduledRecordingStartAt = schedule.startAt;
+      updateRecordingPreparation();
     }
     await createTake({
       scheduledStartAt: schedule?.startAt ?? null,
@@ -1592,9 +1669,11 @@ async function startRecording(remoteSchedule = null) {
     setStatus('録音を開始できませんでした');
     recordButton.disabled = false;
     stopButton.disabled = true;
+    scheduledRecordingStartAt = null;
     return false;
   } finally {
     starting = false;
+    updateRecordingPreparation();
     updateRecordButtonAvailability();
     if (roomCall?.isActive && !recording && mediaStream) startLocalPreview(mediaStream);
   }
@@ -1608,7 +1687,9 @@ function applyHostRecordingState(isRecording, schedule = null) {
       $('hostRecordingStatus').textContent = 'ホストの録音に合わせて録音を開始しています…';
       const started = recording || await startRecording(schedule);
       $('hostRecordingStatus').textContent = recording
-        ? 'ホストに合わせて録音中です'
+        ? scheduledRecordingStartAt !== null
+          ? 'ホストの録音開始を待っています。開始表示が切り替わるまでお待ちください。'
+          : 'ホストに合わせて録音中です'
         : 'この端末では録音を開始できませんでした。下のエラーを確認してください。';
       return started;
     }
@@ -1632,16 +1713,6 @@ function applyHostRecordingState(isRecording, schedule = null) {
   return hostRecordingCommand;
 }
 
-function makeFilename(take, extension = 'wav') {
-  const safeName = activeSession.name.trim().replace(/[^\p{L}\p{N}_-]+/gu, '_').slice(0, 60) || 'recording';
-  const participant = take.remote
-    ? `_${take.participant.trim().replace(/[^\p{L}\p{N}_-]+/gu, '_').slice(0, 60)}`
-    : '';
-  const date = new Date(take.startedAt).toISOString().slice(0, 10);
-  const recoveryTag = take.status === 'recovered' ? '_recovered' : '';
-  return `${safeName}${participant}_take-${String(take.number).padStart(2, '0')}${recoveryTag}_${date}.${extension}`;
-}
-
 async function getTakeChunks(takeId) {
   const transaction = database.transaction('chunks', 'readonly');
   const done = transactionComplete(transaction);
@@ -1660,7 +1731,7 @@ async function exportTake(take) {
   try {
     const fileHandle = typeof window.showSaveFilePicker === 'function'
       ? await window.showSaveFilePicker({
-          suggestedName: makeFilename(take),
+          suggestedName: makeRecordingFilename(activeSession, take),
           types: [{ description: 'WAV audio', accept: { 'audio/wav': ['.wav'] } }]
         })
       : null;
@@ -1695,7 +1766,7 @@ async function exportTake(take) {
     const url = URL.createObjectURL(output);
     const downloadLink = document.createElement('a');
     downloadLink.href = url;
-    downloadLink.download = makeFilename(take);
+    downloadLink.download = makeRecordingFilename(activeSession, take);
     downloadLink.click();
     window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
     setMessage('ブラウザーにWAVのダウンロードを要求しました。保存完了はダウンロード一覧で確認してください。');

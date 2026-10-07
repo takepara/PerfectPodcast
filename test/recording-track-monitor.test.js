@@ -39,7 +39,7 @@ test('does not stop for a transient microphone mute that recovers', async () => 
   monitor.cleanup();
 });
 
-test('stops after microphone mute persists through the grace period', async () => {
+test('reports a microphone mute that persists through the grace period', async () => {
   const track = new FakeTrack();
   const { state, callbacks } = createCallbacks();
   const monitor = monitorRecordingTrack(track, callbacks, 20);
@@ -49,6 +49,7 @@ test('stops after microphone mute persists through the grace period', async () =
   await delay(30);
 
   assert.equal(state.timeout, 1);
+  assert.equal(state.recording, true);
   monitor.cleanup();
 });
 

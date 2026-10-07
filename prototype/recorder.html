@@ -72,6 +72,7 @@
           </div>
           <h2 id="recordHeading" class="visually-hidden">録音操作</h2>
           <div id="timer" class="timer" aria-live="off">00:00</div>
+          <p id="recordingPreparation" class="recording-preparation" role="status" aria-live="polite" hidden></p>
           <div class="meter-block">
             <div class="meter-label"><span>入力レベル</span><span id="meterHint">マイク待機中</span></div>
             <div class="meter" role="meter" aria-label="マイク入力レベル" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
@@ -116,7 +117,7 @@
           <button id="retryTransferButton" class="button button-quiet" type="button" hidden>転送を再試行</button>
           <button id="leaveRoomButton" class="button button-quiet" type="button" hidden>通話を終了</button>
         </div>
-        <p id="localStorageNotice" class="room-status">ホスト・ゲストそれぞれの録音は、その端末のブラウザー内（IndexedDB）に保存され、ゲスト音源もホスト側へ転送・保存されます。ブラウザーの保存容量には上限があり、サイトデータ削除で消えるため、必要な音源は「WAVを保存」から書き出してください。</p>
+        <p id="localStorageNotice" class="room-status">ホスト・ゲストそれぞれの録音は、その端末のブラウザー内（IndexedDB）に保存され、ゲスト音源もホスト側へ転送・保存されます。ブラウザーの保存容量には上限があり、サイトデータ削除で消えるため、必要な音源はホスト端末の録音一覧から「WAVを保存」で書き出してください。</p>
         <section id="transferProgressCard" class="transfer-progress" hidden aria-labelledby="transferProgressHeading">
           <h3 id="transferProgressHeading">ゲスト音源の受信状況</h3>
           <p id="transferProgressDescription">ゲストの録音がこの端末に届き、保存されているかを表示します。</p>

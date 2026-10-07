@@ -106,6 +106,7 @@ h1 { margin-bottom: 0; font-family: Georgia, "Yu Mincho", serif; font-size: clam
 @keyframes pulse { 50% { box-shadow: 0 0 0 2px rgb(255 89 107 / 8%); } }
 .format-pill { border-color: var(--line); background: #14181e; color: #abb3bd; font-size: 9px; letter-spacing: 0; white-space: nowrap; }
 .timer { margin: 30px 0 25px; font-size: clamp(62px, 10vw, 108px); font-variant-numeric: tabular-nums; font-weight: 450; letter-spacing: -.085em; line-height: .9; }
+.recording-preparation { margin: -10px 0 20px; border: 1px solid rgb(255 199 89 / 40%); border-radius: 4px; background: rgb(255 199 89 / 9%); padding: 11px 13px; color: #ffd889; font-size: 13px; font-weight: 750; line-height: 1.5; }
 .meter-block { width: min(100%, 470px); margin-bottom: 25px; }
 .meter-label { display: flex; justify-content: space-between; margin-bottom: 8px; color: var(--muted); font-size: 10px; font-weight: 750; }
 .meter { height: 9px; overflow: hidden; border-radius: 2px; background: #303640; }

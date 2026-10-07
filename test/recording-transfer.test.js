@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { RecordingTransfer } from '../prototype/recording-transfer.js';
+import { RecordingTransfer, takeWithTransferParticipant } from '../prototype/recording-transfer.js';
 import { makeWavHeader } from '../prototype/wav-export.js';
 
 class FakeDataChannel extends EventTarget {
@@ -17,6 +17,12 @@ class FakeDataChannel extends EventTarget {
     this.peer.dispatchEvent(event);
   }
 }
+
+test('restores missing legacy transfer participant from its session', () => {
+  const take = { id: 'take-id', status: 'stopped' };
+  assert.deepEqual(takeWithTransferParticipant(take, 'Guest'), { ...take, participant: 'Guest' });
+  assert.throws(() => takeWithTransferParticipant(take, ''), /参加者名/u);
+});
 
 test('transfers a verified WAV chunk and waits for the host manifest ACK', async () => {
   const originalWindow = globalThis.window;
@@ -84,6 +90,7 @@ test('transfers a verified WAV chunk and waits for the host manifest ACK', async
     assert.equal(manifestStored, true);
     assert.equal(received.length, 1);
     assert.equal(received[0].metadata.sequence, 0);
+    assert.equal(received[0].metadata.participant, take.participant);
     assert.equal(received[0].receivedWav.size, wav.size);
   } finally {
     host.close();

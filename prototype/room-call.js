@@ -214,6 +214,7 @@ export class RoomCall {
     this.connected = false;
     this.localReady = false;
     this.remoteReady = false;
+    this.incomingMessageChain = Promise.resolve();
     this.readySequence = 0;
     this.remoteReadySequence = 0;
     this.readinessCheckInProgress = false;
@@ -233,6 +234,7 @@ export class RoomCall {
     this.remoteTransferProgress = null;
     this.socketReady = null;
     this.remoteWaveforms = new Map();
+    this.waveformRecordingStartedAt = null;
     this.invitation = this.readInvitation();
     this.bindControls();
   }
@@ -667,8 +669,7 @@ export class RoomCall {
       pendingStart.timer = window.setTimeout(() => {
         if (this.pendingStartEvents.get(command.eventId) !== pendingStart) return;
         this.pendingStartEvents.delete(command.eventId);
-        this.setStatus('参加者の実開始確認が届きませんでした。双方の録音状態を確認してください。', true);
-        if (this.getRecordingState()) void this.onRecordingState?.(false);
+        this.setStatus('参加者の実開始確認が届きませんでした。録音は継続しています。双方の録音状態を確認してください。', true);
       }, Math.max(0, startAt - performance.now()) + 5000);
       this.pendingStartEvents.set(command.eventId, pendingStart);
     }
@@ -902,10 +903,12 @@ export class RoomCall {
       silentGain: null,
       samples: null,
       history: new Float32Array(600),
-      historyCount: 0,
+      historyCount: this.waveformRecordingStartedAt === null
+        ? 0
+        : Math.min(600, Math.floor(Math.max(0, performance.now() - this.waveformRecordingStartedAt) / 100)),
       animationFrame: null,
-      sampledAt: 0,
-      startedAt: performance.now(),
+      sampledAt: this.waveformRecordingStartedAt ?? 0,
+      startedAt: this.waveformRecordingStartedAt ?? performance.now(),
       rulerSecond: -1
     };
     element.querySelector('.remote-waveform-title').textContent =
@@ -936,6 +939,30 @@ export class RoomCall {
     } catch (error) {
       this.stopRemoteWaveform(track.id);
       throw error;
+    }
+  }
+
+  beginRecordingWaveform(startedAt) {
+    if (!Number.isFinite(startedAt)) throw new Error('波形の録音開始時刻が不正です。');
+    this.waveformRecordingStartedAt = startedAt;
+    for (const waveform of this.remoteWaveforms.values()) {
+      waveform.history.fill(0);
+      waveform.historyCount = 0;
+      waveform.sampledAt = startedAt;
+      waveform.startedAt = startedAt;
+      waveform.rulerSecond = -1;
+    }
+  }
+
+  endRecordingWaveform() {
+    this.waveformRecordingStartedAt = null;
+    const startedAt = performance.now();
+    for (const waveform of this.remoteWaveforms.values()) {
+      waveform.history.fill(0);
+      waveform.historyCount = 0;
+      waveform.sampledAt = startedAt;
+      waveform.startedAt = startedAt;
+      waveform.rulerSecond = -1;
     }
   }
 
@@ -1130,6 +1157,7 @@ export class RoomCall {
     return new Promise((resolve, reject) => {
       const socket = new WebSocket(signalingUrl(roomId));
       this.socket = socket;
+      this.incomingMessageChain = Promise.resolve();
       let settled = false;
       const timeout = window.setTimeout(() => {
         if (settled) return;
@@ -1192,7 +1220,12 @@ export class RoomCall {
     this.socket.send(JSON.stringify(message));
   }
 
-  async handleMessage(message) {
+  handleMessage(message) {
+    this.incomingMessageChain = this.incomingMessageChain.then(() => this.processMessage(message));
+    return this.incomingMessageChain;
+  }
+
+  async processMessage(message) {
     try {
       if (message.type === 'rejected') {
         this.setStatus(message.message || '部屋に参加できません。', true);

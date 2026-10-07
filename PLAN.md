@@ -1,7 +1,7 @@
 # PerfectPodcast 最小実装計画
 
-改訂日: 2026-10-06
-状態: ローカル録音・復旧とStep 2の招待/署名認証/2人Opus通話の初期実装済み。双方の録音準備確認、clock offset計測、AudioWorkletの予定時刻開始、event ID付き実開始確認、2時間上限、区間接続統計、stream WAV書き出し、録音中DataChannel回収、ホストIndexedDBへの逐次保存・再検証と再接続inventory突合を実装。60秒の転送速度グラフ、未送信／送信中／ACK待ち量のゲスト表示とホスト通知も実装したが、Cloudflare資格・費用上限設定、relay実機検証、2時間公開前検証は未完了。
+改訂日: 2026-10-07
+状態: 録音・復旧、2人Opus通話、同期開始、録音中転送、ホスト側検証・ACK、再接続時inventory突合、転送状況UIの主要コードは実装済み。2026-10-07に`npm test`は60件成功。ただし2時間・実回線・数値合格基準は未検証で、公開可能な状態ではない。TURN発行コードは存在するが、TURNの資格設定・permit発行・運用・実機試験は一旦保留し、設定・有効化しない。Rate Limitingの本番namespaceも未確認。
 
 ## 1. 維持する要件と今回の変更
 
@@ -28,30 +28,30 @@
 
 ### 2.1 通信方式
 
-**P2P native WebRTC / Opus mono + managed STUN/TURN** を採用候補とする。
+**P2P native WebRTC / Opus mono + STUNによる直接接続**を現時点の検証対象とする。managed TURNは一旦保留し、制限回線の接続保証・公開利用は行わない。
 
 - マイクトラックを`RTCPeerConnection.addTrack()`へ直接渡す。AudioWorklet、PCM16変換、WASMエンコーダーを通話の必須経路にしない。
 - 同じ入力をWeb Audioへ分岐し、マスターだけAudioWorklet→Worker→PCM24 WAV→IndexedDBへ保存する。
-- Opusを`setCodecPreferences()`で優先し、実際に選ばれたcodecを`getStats()`で確認する。利用可能codec情報を独自に書き換えない。
+- Opusを`setCodecPreferences()`で優先する。現コードは優先設定までで、実際に選ばれたcodecを`getStats()`で確認する診断・実機検証は未完了。利用可能codec情報を独自に書き換えない。
 - Opusの送信上限は初期32 kbps。音声のみ、mono。実帯域はヘッダー等を含めて測定する。
 - ブラウザーの輻輳制御・ジッターバッファー・損失隠蔽を利用する。FEC/DTXは交渉された提供範囲に任せ、SDP書き換え・独自FEC・自作帯域推定は行わない。
 - 任意のユーザー操作で「低帯域モード」24 kbps上限へ変更できるようにする。初版では統計から頻繁にbitrateを変更する独自制御を作らない。
 - bitrate設定失敗は警告し、ブラウザー既定値で継続する。Opusが選べない場合は検証対象外として開始不可にする。
-- ICEで直接UDP／TURN UDPの利用を試し、制限回線にはTURN TCP/TLS 443も候補を提示する。TCP/TLSは接続救済であり低遅延の保証ではない。
-- perfect negotiationパターンでoffer衝突を処理する。ホストの権限とpolite/impoliteの交渉役割を混同しない。
+- 現状はSTUNによる直接ICE接続を試す。TURN UDP/TCP/TLS 443は保留中で、資格を設定・発行しない。STUNで接続できない回線は未対応として記録する。
+- 現状はホストだけがofferを開始する1ホスト＋1ゲスト構成。perfect negotiationによるoffer衝突処理は未実装で、役割・交渉方式を広げる場合に再検討する。
 
 ### 2.2 再接続・診断
 
-- 2秒ごとにRTT、packet loss、jitter、concealed samples、実bitrate、ICE候補種別を取得可能な範囲で端末内表示する。DataChannel実送出速度も同じ統計pollerで取得する。
-- `disconnected`が5秒継続、または`failed`ならICE restart。30秒以内に回復しなければ手動「再接続」を提示する。再試行は回数・間隔を制限する。
+- 2秒ごとにRTT、packet loss、jitter、concealed samples、送信bitrate、ICE候補種別とDataChannel送出速度を取得可能な範囲で端末内表示する。区間統計のコードはあるが、実ネットワークでの値・codecは未検証。
+- 現状は`disconnected`時に約5秒後、`failed`時にICE restartを行い、最大3回で打ち切る。30秒回復目標の測定と手動「再接続」操作は未実装。
 - 再接続でマイク取得・録音Worker・IndexedDBを再初期化しない。通話断と録音停止を別状態にする。
-- マスター転送で通話を圧迫しないよう、下記7.1の簡単な段階式送信制御を使う。輻輳制御を独自実装するのではなく、アプリが送り込む量を制限する。
+- 通話優先の転送制御は下記7.1を目標とする。現状は固定pacingとbuffer上限であり、RTT・損失・ホスト保存遅延に応じた段階制御は未実装。
 - 再生はユーザーの参加操作に紐付けて開始し、autoplay拒否時は「音声を再生」ボタンを出す。
 - 音声処理・レベル表示・DB書込に問題があっても、native通話の経路を不必要に巻き込まない。
 
 ### 2.3 マイク処理の割り切り
 
-- 初版はヘッドホン必須。マスターのAEC／ノイズ抑制／AGCを無効化要求し、実設定を診断表示する。
+- 初版はヘッドホン必須。マスターのAEC／ノイズ抑制／AGCは無効化を要求する。実設定の診断表示は未実装・未検証。
 - 同じcaptureを共有するため、内蔵AECを通話側だけに適用できると仮定しない。スピーカー対応・別マイクcapture・独自DSPは後回し。
 - 通話muteは送信側encodingの`active`等で制御し、録音元トラックの`enabled`を変更しない。
 - 録音停止・通話終了・マイク解放を別操作にする。通話終了で録音中のcaptureを止めない。
@@ -65,12 +65,12 @@
 | --- | --- | --- |
 | アプリ | HTML/CSS/JavaScript ES Modules | 現プロトタイプを起点にする |
 | 静的配信 | Cloudflare Workers Static Assets | アプリ資産のみ。音源受付なし |
-| 録音 | AudioWorklet + Dedicated Worker | Float32は作業メモリーだけ。保存はPCM24 WAV |
+| 録音 | AudioWorklet + recorder.jsメインスレッド + IndexedDB | 現状Dedicated Workerは未導入。Float32は作業メモリーだけ。保存はPCM24 WAV |
 | 参加者DB | IndexedDB + `idb` | WAVチャンク、manifest、ローカル鍵・転送状態 |
 | 通話 | native RTCPeerConnection / Opus | 通話音声をマスター保存しない |
 | マスター回収 | reliable RTCDataChannel | 録音中から保存確定チャンクをparticipant→hostへ転送 |
 | 接続調整 | Workers + DB保存API未使用のDurable Object | 接続中WebSocketの一時メモリーだけ |
-| NAT越え | Cloudflare managed STUN/TURNを候補 | 通信中継のみ。長期secretはWorker側設定 |
+| NAT越え | STUNによる直接接続を検証。TURNは保留 | TURN資格・provider secretを設定せず、relayを有効化しない |
 | ホスト保存 | IndexedDB | ゲスト音源のWAVチャンク、manifest、回収台帳。必要時にWAVを書き出す |
 | 検証 | Vitest、Playwright、ffprobe、DAW | テスト出力も端末内 |
 
@@ -112,18 +112,15 @@ URLハッシュはフラグメントであり、一意性はランダムIDの極
 
 ### 4.3 TURN資格の乱用対策
 
-ホスト署名だけではサービス利用権を証明できない。誰でも自分の鍵で署名できるため、無制限なTURN資格発行APIを公開しない。
+**状態: 保留。** Workerの短命資格発行、Ed25519 room permit検証、鍵／permit発行CLI、ホストUIは実装済みだが、現時点では運用設定・有効化・provider接続を行わない。保留中は`TURN_PERMIT_PUBLIC_KEY`、`TURN_API_TOKEN`、`TURN_KEY_ID`等の設定、鍵／permitの生成・配布、TURN発行要求、relay試験を行わない。既存環境でこれらが設定済みかは未確認のため、本番環境があれば別途無効状態を確認する。
 
-- 管理者がEd25519鍵をオフライン生成し、公開鍵を`TURN_PERMIT_PUBLIC_KEY`としてWorkerへ設定する。秘密鍵はWorker・ブラウザー・リポジトリへ置かない。
-- `scripts/create-turn-permit.js`で、部屋ID・ホスト公開鍵hash・発行／失効時刻・guest上限1人を含む短命な部屋許可を署名する。許可はホストUIへ入力し、招待リンクとは別に管理する。
-- Workerは参加要求をホストが承認した後だけ、署名・部屋ID・ホスト公開鍵hash・期限・guest上限を検証してTURN資格を発行する。TURN secretはWorkerに留め、実TURN資格は両Peerへ送る。
-- まず`node scripts/create-turn-permit-keypair.js <private-key-file>`を実行し、出力公開鍵を`npx wrangler secret put TURN_PERMIT_PUBLIC_KEY`で設定する。秘密鍵ファイルはアクセス制限されたリポジトリ外へ保存する。部屋作成後、画面の部屋IDとホスト公開鍵で`TURN_PERMIT_PRIVATE_KEY_PATH=/secure/path.pem node scripts/create-turn-permit.js <room-id> <host-public-key>`を実行し、出力permitをホストUIに貼り付ける。TURN API token/key IDはそれぞれ`TURN_API_TOKEN`／`TURN_KEY_ID`として設定する。
-- TURN資格はWorker内メモリーに短時間だけcacheし、Durable Object storageへは保存しない。`SIGNAL_RATE_LIMITER`はCloudflare Rate Limiting bindingで接続元IPごとに20シグナリング接続／60秒を上限にする。bindingはCloudflare locationごとの近似制限であり、世界共通のhard capではない。`namespace_id`はCloudflareアカウント内で一意な値へ変更する。
-- TURN permit公開鍵、API token、key ID、rate limit bindingが未設定／不正ならTURN発行は失敗し、STUN直接接続だけを試す。TTLは初期3時間、設定可能範囲3〜48時間。STUN接続の成功はTURN relay成功を意味しない。統計のICE candidate typeが`relay`か実機で確認する。
-- シグナリング接続rate limitは短時間の乱用抑制であり、Cloudflare locationごとの近似制限で、アカウント全体の日次費用上限・hard capではない。P2PでTURNだけを使う場合、現行公開料金はTURN outbound $0.05/real-time GB。Cloudflare側の利用上限・通知・停止手順を確認できるまでTURNを公開有効化しない。IP変更・Worker再起動後にpermit再利用を完全防止する永続台帳は作らない。
-- 課金アラートは強制停止ではない。事業者側の上限・資格発行停止手順・既発行資格の残存時間を確認する。
+再開する場合は別途承認を得て、次を全て確認してから行う。コードの存在は費用上限や乱用防止の成立を意味しない。
 
-全ユーザーへの自由公開・課金・アカウント管理は後続。個人用の作成許可でも乱用上限を成立させられない場合は、TURN導入を止めて別サービスを比較する。
+- Ed25519 permitを部屋ID・ホスト公開鍵hash・期限・guest上限1人へ束縛し、秘密鍵をWorker・ブラウザー・リポジトリへ置かない。
+- `SIGNAL_RATE_LIMITER`の本番bindingとCloudflareアカウント内で一意な`namespace_id`を確認する。現リポジトリ設定の`namespace_id: "1001"`は本番値として確認されていない。
+- Rate Limitingはlocationごとの近似制限であり、アカウント全体の費用hard capではない。利用上限、通知、資格発行停止手順、既発行資格の残存時間を確認する。
+- STUN接続成功をTURN成功と見なさず、実機でICE candidate typeが`relay`であることを確認する。
+- 資格TTL・再利用制御・providerログ保持・費用見積もりを再確認する。確認が揃わなければTURNを再開しない。
 
 ---
 
@@ -133,28 +130,27 @@ URLハッシュはフラグメントであり、一意性はランダムIDの極
 
 - AudioContextへ48 kHzを要求し、実`sampleRate`が48 kHzなら録音可能。ブラウザーがnative入力をAudioContextへresampleするため、入力track固有のsample rateは録音開始条件にしない。自前リサンプラーは導入しない。
 - 実デバイスのchannel countなどを診断する。ファイルがPCM24でもADCの実効24-bit精度は保証しない。
-- AudioWorkletの入力をコピーし、取得位置・capture frame番号とともにWorkerへ渡す。WorkletはDB・hash・HTTP処理をしない。
-- Workerでclamp・丸め、-8,388,608〜8,388,607のsigned PCM24 little-endianへ変換する。初版はディザなし、自動正規化なし。
+- **現状:** AudioWorkletからFloat32 chunkをメインスレッドへ渡し、`recorder.js`でPCM24 little-endianへ変換してIndexedDBへ保存する。Dedicated Workerへの分離とcapture位置・単調時刻の付与は未実装。
+- **継続要件:** WorkletはDB・hash・HTTP処理をしない。clamp・丸めで-8,388,608〜8,388,607へ変換し、初版はディザなし・自動正規化なし。メインスレッド処理によるUI／録音への影響を実機で測る。
 - 1秒ごとに独立WAVとしてIndexedDBへ保存。音源・採番・frame位置を同一transactionで確定する。
 - 初期48 kHz / mono: PCM tag 1、24 bits、blockAlign 3、byteRate 144,000。ヘッダー、data、paddingを検証する。
 
 ### 5.2 欠落検出とキュー上限
 
-- 取得、Worker受領、DB commitの各フレーム範囲を照合する。capture番号と48 kHz出力番号を混同しない。
-- `currentFrame`等の取得位置と単調時刻、trackの`mute/ended`、AudioContextの状態変化を記録する。
-- Worklet→Worker→DBの未確定キューは音声2秒相当を上限にする。上限到達／quota失敗時は録音ゲートを閉じ、保存可能な分を確定してエラー表示する。無制限にメモリーを増やさない。
-- 容量、保存遅延、末尾frameを小さな状態としてUIへ通知する。VU meterは低頻度更新にし、サンプルごとのUI操作をしない。
-- 無音を欠落と判定しない。ブラウザーが入力取得前に失ったサンプルまで全て検出できるとは保証せず、疑わしい時間不連続は「不明区間」と記録する。
-- 正常録音、既知の欠落あり、末尾不明を別statusにする。欠落を無音で埋めて正常扱いしない。
+- **実装済み:** AudioWorkletが出す連続frame番号とcommit位置を照合し、不一致で停止する。通常チャンクの保存待ちは最大2件とし、最終チャンクは必ずqueueへ入れる。trackの`mute/ended`とAudioContextの`closed`を監視する。
+- **未実装:** AudioWorkletの連続番号はアプリが処理したsample数であり、入力capture位置・`currentFrame`・単調時刻との照合ではない。ブラウザー内の入力時間不連続を検出し、既知gapを記録する仕組みは未完了。
+- **未実装:** IndexedDBの`persist()`許可・使用量／残量見積もりはない。read/write probeは録音準備時の書き込み可能性確認に限られ、quota不足を事前に保証・予測しない。
+- **未実装:** 録音品質`normal / gaps / tailUnknown`の状態分離。現在は正常停止／復旧状態と`tailUnknown`が中心で、一時mute復帰区間や既知gapをtakeに記録しない。
+- 無音を欠落と判定しない。ブラウザーが入力取得前に失ったサンプルまで完全検出できるとは保証せず、疑わしい時間不連続は「不明区間」として記録する。
+- 未確定音声は最大2秒相当を目標とし、上限到達・quota失敗時は録音ゲートを閉じ、保存可能な分を確定してエラー表示する。steady-state working buffer、commit遅延、quota時の実挙動は実測未完了。
 
 ### 5.3 クラッシュ復旧
 
-- 起動時に未正常停止の録音を一覧表示する。
-- commit済みWAVのhash・frame範囲を読み、**復旧manifest**を生成する。元の録音状態・正常manifestを上書きしない。
-- 復旧manifestには`recovered`、最後のcommit frame、既知gap、`tailUnknown`を付ける。クラッシュ後に存在しない末尾は推定生成しない。
-- 保存済み音源だけのPCM24 WAVを復旧書き出し・ホスト転送可能にする。
+- **実装済み:** 起動時に`recording`状態のtakeを`recovered`・`tailUnknown`として表示可能にし、commit済みchunkからWAV出力・転送できる。WAV書き出し時にchunk順序、ヘッダー、frame連続性を検証する。
+- **未実装:** ローカルchunkのSHA-256を用いた起動時再検証と、既存takeを上書きしない独立した復旧manifest生成。現在はtake状態を更新する方式で、末尾frame・既知gapの完全な復旧台帳はない。
+- クラッシュ後に存在しない末尾は推定生成しない。未commit分、サイトデータ削除、端末故障の保全は保証しない。
 - 再録音は新takeとして開始する。初版で複雑な途中再開・segment連結を作らない。
-- IndexedDBのpersist許可・残量を確認する。サイトデータ削除・端末故障・未commit分は復旧不可と説明する。
+- IndexedDBのpersist許可・残量確認は未実装。必要な音源はWAVとして別途保存し、サイトデータ削除・端末故障・未commit分のリスクを説明する。
 
 ---
 
@@ -165,7 +161,7 @@ URLハッシュはフラグメントであり、一意性はランダムIDの極
 録音状態: `waiting → ready → recording → stopped`  
 回収状態: `idle / transferring / waitingConnection / draining / hostStored / exporting / exportReady`
 
-録音と回収は並行する別の状態機械にする。別軸として録音品質`normal / gaps / tailUnknown`、接続`connected / reconnecting / offline`を持つ。転送完了は録音が正常だったという意味ではない。
+録音と回収は並行する別の状態機械にする。別軸として録音品質`normal / gaps / tailUnknown`、接続`connected / reconnecting / offline`を持つ。品質状態の分離は未実装。転送完了は録音が正常だったという意味ではない。
 
 ### 開始
 
@@ -190,6 +186,8 @@ URLハッシュはフラグメントであり、一意性はランダムIDの極
 ## 7. 録音中の逐次回収・早期退出とブラウザー内保存
 
 ### 7.1 一つの接続・一つずつの転送
+
+**実装状況:** 認証済みPeerConnection上のreliable ordered DataChannel、1チャンクずつの送受信、16 KiB以下のmessage、64 KiB送信buffer上限、ホスト保存後ACK、hash／manifest検証、inventory突合・再送は実装済み。送信間隔は65 ms固定で、約2 Mbps相当のpacing。RTT・損失・ホスト保存遅延に応じた上限の増減・停止は未実装で、2時間・実回線での通話保護も未検証。
 
 - 初版は2人通話のRTCPeerConnectionをcontrolとDataChannel回収にも利用する。controlとマスター用は別DataChannelとし、接続・証明書・認証の追加は避ける。ただし共通回線・SCTPを共有するため、別channelだけで通話／control優先を保証しない。
 - **録音中は1秒WAVのDB commit直後から未回収順に転送**する。録音処理は転送やホストACKを待たない。ホストは受信WAVチャンクをIndexedDBへ保存してからACKする。送信hash等の仕事で保存が遅れる場合は転送を先に抑制する。
@@ -245,7 +243,7 @@ participantは自身の転送を表示し、hostは自分のローカル保存�
 - ACK確定速度は、新しくホスト保存確認済みになったWAVバイト量の差分×8／時間差。ディスク・検証速度も反映するので、単なるネットワーク速度と区別する。
 - 通話はRTPの`bytesSent/bytesReceived`差分をkbps表示。「Opus上限32 kbps」は設定値として分け、実測値と混同しない。RTTは取得元（通話RTCP／ICE候補ペア）を明記し、利用可能な方だけ表示する。
 - 損失率は通話RTP統計の区間差分で算出し、DataChannelの損失率とは呼ばない。負の差分・counterリセット・接続世代変更はその区間を無効として処理する。
-- ローカル残量・buffer・表示は最大1秒間隔、`getStats()`は初期2秒間隔、ゲスト→ホスト状況通知は2秒間隔・最新状態だけとする。既存の5秒速度制御判定は同じ統計を集約して利用し、別pollerを増やさない。
+- ローカル残量・buffer・表示は最大1秒間隔、`getStats()`は2秒間隔、ゲスト→ホスト状況通知は2秒間隔・最新状態だけとする。現状は統計取得まで実装済みだが、計画にある5秒集約の速度制御判定・pacing変更は未実装。
 - 速度は瞬時区間値と直近10秒平均を区別し、残り時間は平均ACK速度から計算する。録音中の残り時間は「今停止した場合」の推定であり、録音を続けながらbacklogを解消する時間とは別物。
 - 未取得は`— / 未対応`、切断・古い通知は「更新停止」と最終更新時刻を表示する。取得不能を0 Mbps／損失0%／良好として扱わない。
 - 履歴はメモリーの固定長リングbuffer（60秒）だけ。チャンク配列の全読込、毎秒DB全件集計、サーバーへの統計保存を行わない。
@@ -255,7 +253,7 @@ participantは自身の転送を表示し、hostは自分のローカル保存�
 - 通話品質とマスター回収状況を別バッジにする。「通話は良好／回収が遅れています」が同時に表示できるようにする。
 - 回収状態は「転送中」「通話優先で速度制限中」「接続待ち」「ホスト保存確認待ち」「ホスト保存エラー」「退出可能」をテキストとアイコンで表示する。
 - 回収ACK速度が生成速度未満の状態が10秒継続、または未回収音声が5秒を超える場合、終了待ちが増える注意を表示する。ホスト不在、保存容量不足、録音異常は理由と操作を明示する。閾値は検証で調整する。
-- 操作は「転送を一時停止／再開」「詳細」「再接続」「ローカルWAVを保存」。転送停止で録音・通話を止めない。通話保護による自動停止を手動再開で無条件に解除しない。
+- 現状の操作は転送状況の表示・詳細表示と転送再試行。転送一時停止／再開と手動通話再接続は未実装で、初版必須機能には含めない。転送停止で録音・通話を止めない。
 - 色だけに依存せず、高コントラスト・数値の単位・グラフのテキスト要約を提供する。数値の毎秒変化を読み上げず、状態変化・エラー・退出可能だけを控えめに通知する。
 
 ### 7.2 IndexedDBと台帳の不一致を復旧可能にする
@@ -290,11 +288,11 @@ participantは自身の転送を表示し、hostは自分のローカル保存�
 
 | 問題 | 初版で入れる対策 | 後回しにするもの |
 | --- | --- | --- |
-| 保存後hashだけでは欠落を検知できない | capture frame照合、2秒キュー上限、入力状態診断、gap表示 | ADC内部欠落の完全保証 |
-| クラッシュでfinalizeできない | commit済みWAVから復旧manifest、末尾不明表示 | 自動take連結・失った音の推定 |
+| 保存後hashだけでは欠落を検知できない | 2件の保存待ち上限、Worklet出力frame連続性、track状態監視は実装済み。capture位置・gap状態の記録は未実装 | ADC内部欠落の完全保証 |
+| クラッシュでfinalizeできない | interrupted takeの復旧表示・WAV出力は実装済み。独立復旧manifest、ローカルhash突合は未実装 | 自動take連結・失った音の推定 |
 | 開始／停止の不達 | READY/START/STOP/ACK、event ID、実開始確認、各端末停止 | 分散合意、途中参加、pause |
 | 偽ホスト・署名中継 | Web Crypto署名とnonce・DTLS fingerprint binding、participant鍵pin | アカウント、ホスト移譲、鍵ローテーション |
-| TURN資格乱用 | 個人用部屋作成許可、短命資格、発行制限、platform制限・停止手順 | 自由公開・課金システム |
+| TURN資格乱用 | TURNは一旦保留。permit／短命資格のコードはあるが、資格・secret設定、発行、relay試験を行わない | 保留解除時に費用hard cap・停止手順・provider設定を再評価 |
 | ファイルとDBが不一致 | 書込→検証→台帳→ACK、起動時突合 | 独自ファイルシステム・常駐アプリ |
 | 録音中転送が通話を圧迫する | 1チャンクcredit、小buffer、pacing、悪化時半減／停止 | 独自輻輳制御、複数人帯域分配 |
 | 終了後に退出待ちが長い | 録音中の逐次回収、残量／待ち時間表示、ホスト保存ACKで退出 | 録音中の完成WAV生成 |
@@ -312,6 +310,10 @@ participantは自身の転送を表示し、hostは自分のローカル保存�
 
 成果物: 録音、停止、1秒WAV保存、一覧、正常／復旧WAV出力、残量表示。
 
+**実装状況:** PCM24/48 kHz/mono、1秒WAV chunk、IndexedDB保存、2時間上限、interrupted take表示、chunk順序・frame・WAV形式を検証する書き出しを実装済み。専用Worker、local chunk hash、独立復旧manifest、storage quota/persist確認は未実装。
+
+**検証状況:** `npm test`は60件成功。ffprobe／DAW確認、2時間合成入力、frame欠落0、未flush 0、32 MiB、commit遅延p95、強制終了復旧率は未測定。
+
 - PCM24/48 kHz/monoをffprobe・DAWで確認。出力PCMと保存チャンクのPCM hash一致。
 - 2時間の合成入力で取得→保存のframe欠落0。通常終了で未flush frame 0。
 - 録音パイプラインの未確定音声は最大2秒、steady-state working buffer目標32 MiB以内。UI・ブラウザー全体のメモリーとは別測定。
@@ -320,25 +322,28 @@ participantは自身の転送を表示し、hostは自分のローカル保存�
 
 ### Step 2: 招待・認証・2人Opus通話
 
-成果物: URL作成、名前入力、ゲスト承認、native音声、接続状態、再接続、TURN作成許可。
+成果物: URL作成、名前入力、ゲスト承認、native音声、接続状態、限定的な自動再接続。TURN作成・利用は保留。
 
-実装中のコードは`prototype/room-call.js`、`worker/index.js`、`wrangler.jsonc`にある。現在は同一オリジンのWebSocketシグナリングとSTUNによる直接接続までで、TURN資格の発行・制限はまだ実装していない。制限の強いNATでは接続できない可能性があり、個人招待を含め公開利用前にTURN資格の制御と費用上限を整えること。
+**実装状況:** 招待、承認、署名・DTLS fingerprint認証、2人Opus、READY、ICE restart、接続統計を実装済み。Opus優先設定はあるが、選択codecと実回線品質の確認は未完了。ICE restartは最大3回で、計画上の30秒復帰基準と手動再接続UIは未検証／未実装。
 
-ローカル確認は`npm install`、`npm run dev`を実行し、`http://localhost:8787/recorder`を開く。単体テストは`npm test`。本番deployはCloudflareアカウント・TURN資格制御・回線試験が整うまで行わない。
+**TURNは一旦保留:** permit検証・短命資格発行コードは存在するが、資格・secret・rate-limit本番namespaceを設定せず、permit発行・TURN資格要求・relay試験を行わない。現在の対象はSTUN直接接続だけ。TURN対応がないと接続できない回線があるため、一般公開・接続保証はしない。再開には別途承認が必要。
+
+ローカル確認は`npm install`、`npm run dev`を実行し、`http://localhost:8787/recorder`を開く。単体テストは`npm test`。本番deployは保留。TURNを含む公開範囲と運用条件を再判断し、別途承認するまで行わない。
 
 収録画面では「自分のトラック」とリモート参加者のトラックを分けて表示する。リモート波形は参加者の音声トラック接続後に参加者ごとに生成し、退出・切断時に除去する。波形は受信した通話音声から描画し、マスター録音には混ぜない。初版はホスト1人＋ゲスト1人まで。
 
 - マイク音声は認証完了前に送らない。偽fingerprint・古いnonce・別session署名・別participant鍵を拒否。
-- 32 kbps上限、mono/Opus選択と実bitrateを確認。録音処理を止めても通話は継続。
+- 32 kbps上限、実選択codecがmono/Opusであることと実bitrateを確認。録音処理を止めても通話は継続。
 - 上下256 kbps・RTT 100 ms・損失1%の試験で、2秒超の聞こえない区間0を目標にする。concealed samples等と試聴を併記し、音質合格は別判定。
-- 回線復帰後30秒以内の再接続を目標。未達でも録音継続／ローカル停止が可能。
-- TURN UDP・TLS 443を試す。資格発行の無許可要求と上限超過を拒否。
+- 回線復帰後30秒以内の再接続を目標。未達でも録音継続／ローカル停止が可能で、手動再接続手段を示す。
+- TURNのUDP/TLS 443試験、資格発行の拒否試験は保留解除後に別途行う。このStepの合格条件には含めず、TURN未対応の制約を明記する。
 
 ### Step 3: 開始／停止・録音中回収・早期退出
 
 成果物: READY/START/STOP、実開始確認、逐次WAV回収、pacing、manifest突合、ディスク検証後ACK、退出可能表示。
 
-- 転送状況カード、未送信／確認待ち内訳、回収進捗バー、実測送出・ACK速度、60秒グラフ、ネットワーク詳細を7.1.2に従って追加する。
+**実装状況:** READY/START/STOP、予定時刻・実開始確認、録音中の逐次回収、ホスト保存後ACK、manifest/inventory突合、転送状況カード、60秒グラフは実装済み。pacingは約2 Mbps相当の固定65 ms間隔で、回線状態連動の速度調整は未実装。実機挙動・数値合格基準は未検証。
+
 - 人為的なACK遅延・再送・接続断・counterリセット・統計未対応で、残量の二重計上、誤った0表示、早すぎる退出可能表示がないことを検証する。
 - 低速回線では生成速度を下回るグラフとbacklog増加が一致し、ホスト保存遅延と通話の回線悪化を別状態で表示できることを確認する。
 - UI・統計表示を有効にした2時間試験でも、録音のframe欠落0と固定長メモリーの基準を維持する。ホストのゲスト表示は更新停止を検知し、常時録音データの全件読込を行わない。
@@ -354,10 +359,13 @@ participantは自身の転送を表示し、hostは自分のローカル保存�
 
 ### Step 4: 最小公開前検証
 
+**状態: 未完了。現時点では本番deploy・一般公開をしない。** TURN保留中はSTUN直接接続の限定的な検証にとどめ、relay必須回線への対応を約束しない。TURNを有効化する場合は別途承認後に4.3の運用・費用条件を満たす。
+
 - 2時間実機試験、DB遅延、マイク切断、AudioContext停止、quota不足、タブ強制終了、ホスト不在、ACK喪失、ディスク満杯。
 - サーバーDB/storage/R2/永続attachment呼び出し・音源受付・秘密ログがないことを確認する。
-- providerログ保持、rate limit、資格TTL、課金停止手順を確認する。
-- 自由公開せず個人招待で試す。録音中転送を含む2人の範囲を合格させてから、多人数へ拡張する。
+- STUN直接接続の2台実機試験、認証、録音開始差、再接続、転送、音源再生成を確認する。TURN relay／provider課金の試験は保留解除後に行う。
+- rate limit binding、namespace、秘密情報の設定有無を確認する。TURNのTTL・providerログ保持・hard cap・課金停止手順は保留解除前に再評価する。
+- 限定した個人招待で2人の全合格基準を満たすまでは公開しない。合格後も多人数拡張は別判断とする。
 
 ---
 
@@ -388,8 +396,9 @@ participantは自身の転送を表示し、hostは自分のローカル保存�
 - PCM24 WAVが正しくても、ADCの真の24-bit入力、入力前のサンプル欠落、電源断に対する完全保全は保証できない。
 - サーバー保管なしでは、participantの未回収WAV削除や端末故障をhost側で救えない。双方オンラインでの転送が必要。
 - 48 kHz AudioContextを実際に得られる端末に限定する。フラグメントや名前だけで接続・認証が成立するわけではない。
-- ヘッドホン必須、マイク設定の実適用確認、保存先許可、同意、退出前警告を省略しない。
-- `prototype/recorder.html`ではAudioWorkletで作成したPCM24 WAVチャンクをIndexedDBへ保存し、take一覧、WAV出力、中断takeの復旧を行う。招待、署名認証、2人Opus通話、READY、時刻同期されたホスト主導録音開始、参加者別波形、録音中DataChannel回収を実装済み。ホストは受信WAVチャンクの形式・SHA-256を検証し、IndexedDB transaction後にACKする。manifest受信時と再接続時はIndexedDB上の保存chunkを再検証し、欠落・破損を検出して再送する。ゲスト音源は必要時にWAVとして書き出す。TURN発行コードと署名permitを実装済みだが、Cloudflare資格設定・費用上限確認・実relay経路試験は未完了。
+- ヘッドホン必須、マイク設定の実適用確認、保存先許可、同意、退出前警告を省略しない。AEC等の無効化は要求するが、実設定の診断表示・IndexedDB persist/quota確認は未完了。
+- 実装済み: `prototype/recorder.html`ではAudioWorkletから受けたPCM24 WAVチャンクをIndexedDBへ保存し、take一覧、WAV出力、中断takeの復旧を行う。招待、署名認証、2人Opus通話、READY、予定時刻開始・実開始確認、参加者別波形、録音中DataChannel回収を実装済み。ホストは受信WAVチャンクの形式・SHA-256を検証し、IndexedDB transaction後にACKする。manifest受信時と再接続時は保存chunkを再検証し、欠落・破損を検出して再送する。転送状況UIと60秒グラフもある。
+- 未完了: Dedicated Workerへの録音処理分離、capture時刻に基づくgap検出・品質status、ローカル復旧manifest/hash検証、quota/persist確認、適応型pacing、実機・数値合格基準。TURN資格・permitコードはあるが運用と試験は保留。
 - 2026-10-05: Step 2の招待・承認・署名付きDTLS fingerprint検証・2人Opus通話と揮発性シグナリングの初期実装を開始。TURN資格発行、公開利用の許可、実機／回線試験は未完了。
 - 2026-10-05: ホストの録音開始・停止をゲストへシグナリングし、ゲスト側は操作できず同じタイミングで端末内録音するプロトタイプを追加。録音ファイルは各参加者の端末に個別保存される。
 - 2026-10-05: 参加者波形Canvasの寸法を固定ラッパー基準に修正。リモートCanvasのサイズ暴走によるブラウザー描画エラーを解消し、静かな入力も表示しやすくした。
@@ -406,6 +415,7 @@ participantは自身の転送を表示し、hostは自分のローカル保存�
 - 2026-10-06: 録音準備時にステレオ入力trackを誤って拒否しないよう、AudioWorklet入力をmonoへdownmixする設定を使う。転送chunk indexからIndexedDBの無効なboolean keyを除き、接続世代の文字列indexで走査するDB v3 migrationを追加。
 - 2026-10-06: IndexedDBへのチャンク保存が1秒をまたいだだけで録音を止める過剰な判定を除去。通常チャンクは最大2件の保存待ちを許容し、録音停止時の最終チャンクは常に保存queueへ入れる。上限超過時だけ明示的な保存エラーで停止する。
 - 2026-10-06: Workerに短命TURN資格の発行、Cloudflare Rate Limiting binding、オフラインEd25519署名の部屋permit検証を追加。permitは部屋ID・ホスト公開鍵hash・期限・ゲスト上限1人へ束縛し、TURN資格はDurable Objectのメモリーにのみcacheする。管理者向け鍵／permit発行CLIとホスト入力欄を追加。provider secret・permit公開鍵・rate-limit namespaceの運用設定、provider hard cap／課金停止手順、2台の実機でのrelay確認が残るため、TURNは未設定環境では発行されずSTUNへfallbackする。
+- 2026-10-07: PLANと実装の差異を再確認。Node.jsの単体テスト60件は全成功。2時間・実回線・開始差・backlog・メモリー・commit p95などの合格基準は未測定。TURNは利用者判断により一旦保留し、資格設定・permit発行・relay試験・公開有効化を行わない。TURN発行コードは残すため、環境secret等が設定済みでないことも別途確認する。
 
 参照資料:
 

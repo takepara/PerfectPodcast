@@ -76,6 +76,14 @@ function validManifest(message) {
     typeof message.tailUnknown === 'boolean';
 }
 
+export function takeWithTransferParticipant(take, fallbackParticipant) {
+  const participant = take.participant ?? fallbackParticipant;
+  if (typeof participant !== 'string' || !participant.trim() || participant.length > 60) {
+    throw new Error('転送する録音の参加者名を復元できません。');
+  }
+  return take.participant === participant ? take : { ...take, participant };
+}
+
 function validInventoryItem(item) {
   return item && UUID_PATTERN.test(item.takeId || '') &&
     (item.kind === 'manifest' ||
