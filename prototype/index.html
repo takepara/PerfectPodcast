@@ -63,6 +63,15 @@
     <p id="status" role="status" aria-live="polite">認証設定を確認しています…</p>
     <button id="loginButton" type="button" hidden>Auth0でログイン</button>
   </main>
+  <script>
+    window.setTimeout(() => {
+      const status = document.getElementById('status');
+      if (status?.textContent === '認証設定を確認しています…') {
+        status.textContent = '認証の初期化がタイムアウトしました。通信状態を確認してページを再読み込みしてください。';
+        status.dataset.kind = 'error';
+      }
+    }, 12000);
+  </script>
   <script type="module">
     import {
       establishHostSession,
@@ -78,26 +87,45 @@
       status.textContent = message;
       status.dataset.kind = isError ? 'error' : 'idle';
     };
+    const waitFor = (promise, message, timeoutMs = 8000) => {
+      let timeoutId;
+      const timeout = new Promise((_, reject) => {
+        timeoutId = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+      });
+      return Promise.race([promise, timeout]).finally(() => window.clearTimeout(timeoutId));
+    };
 
     async function initializeLogin() {
       let client;
       try {
-        client = await getAuth0Client();
+        client = await waitFor(getAuth0Client(), 'Auth0設定の読み込みがタイムアウトしました。');
       } catch (error) {
         setStatus(error.message, true);
         return;
       }
       try {
         if (params.has('error')) {
-          throw new Error('Auth0ログインに失敗しました。時間をおいて再度お試しください。');
+          const code = params.get('error');
+          const description = params.get('error_description');
+          const details = [code, description].filter(Boolean).join(': ').slice(0, 360);
+          throw new Error(details
+            ? `Auth0からエラーが返されました: ${details}`
+            : 'Auth0から詳細のないエラーが返されました。');
         }
         if (params.has('code') && params.has('state')) {
-          const { appState } = await client.handleRedirectCallback();
-          await establishHostSession(client);
+          const { appState } = await waitFor(
+            client.handleRedirectCallback(),
+            'Auth0のcallback処理がタイムアウトしました。',
+            10000
+          );
+          await waitFor(
+            establishHostSession(client),
+            'Workerへの認証セッション作成がタイムアウトしました。'
+          );
           window.location.replace(safeReturnTo(appState?.returnTo));
           return;
         }
-        if (await getHostSession()) {
+        if (await waitFor(getHostSession(), 'Workerの認証状態確認がタイムアウトしました。')) {
           window.location.replace(safeReturnTo(params.get('returnTo')));
           return;
         }

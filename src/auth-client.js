@@ -1,10 +1,13 @@
-import { createAuth0Client } from '@auth0/auth0-spa-js';
+import { Auth0Client } from '@auth0/auth0-spa-js';
 
 let clientPromise;
 let configPromise;
 
 export async function loadAuth0Config() {
-  configPromise ||= fetch('/auth/config', { cache: 'no-store' }).then(async (response) => {
+  configPromise ||= fetch('/auth/config', {
+    cache: 'no-store',
+    signal: AbortSignal.timeout(8000)
+  }).then(async (response) => {
     const config = await response.json();
     if (!response.ok) throw new Error(config.message || 'Auth0設定を読み込めません。');
     return config;
@@ -13,7 +16,7 @@ export async function loadAuth0Config() {
 }
 
 export async function getAuth0Client() {
-  clientPromise ||= loadAuth0Config().then((config) => createAuth0Client({
+  clientPromise ||= loadAuth0Config().then((config) => new Auth0Client({
     domain: config.domain,
     clientId: config.clientId,
     cacheLocation: 'memory',
@@ -29,7 +32,8 @@ export async function getAuth0Client() {
 export async function getHostSession() {
   const response = await fetch('/auth/session', {
     cache: 'no-store',
-    credentials: 'same-origin'
+    credentials: 'same-origin',
+    signal: AbortSignal.timeout(8000)
   });
   const payload = await response.json();
   if (response.status === 401) return null;
@@ -43,7 +47,8 @@ export async function establishHostSession(client) {
     method: 'POST',
     headers: { Authorization: `Bearer ${accessToken}` },
     credentials: 'same-origin',
-    cache: 'no-store'
+    cache: 'no-store',
+    signal: AbortSignal.timeout(8000)
   });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.message || 'ホスト認証を確立できません。');
@@ -54,7 +59,8 @@ export async function signOut(client) {
   const response = await fetch('/auth/logout', {
     method: 'POST',
     credentials: 'same-origin',
-    cache: 'no-store'
+    cache: 'no-store',
+    signal: AbortSignal.timeout(8000)
   });
   if (!response.ok) throw new Error('アプリのログイン状態を終了できません。');
   await client.logout({
