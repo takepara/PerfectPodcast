@@ -17,6 +17,7 @@
         <span class="brand-mark" aria-hidden="true">P</span>
         <span>perfect<span class="brand-light">podcast</span></span>
       </a>
+      <button id="logoutButton" class="button button-quiet" type="button" hidden>ログアウト</button>
     </header>
 
     <section id="setupView" class="view">
@@ -138,22 +139,6 @@
             <button id="copyInviteButton" class="button button-quiet" type="button">リンクをコピー</button>
           </span>
         </label>
-        <details id="turnPermitDetails" class="field turn-permit-field" hidden>
-          <summary>TURN中継の詳細設定（管理者向け・通常は不要）</summary>
-          <p>TURN中継を使う場合のみ、管理者がこの部屋専用に発行した許可証を設定してください。未設定ならSTUN直接接続を試します。</p>
-          <label class="field">
-            <span>許可証発行用の部屋ID</span>
-            <input id="turnPermitRoomId" type="text" readonly>
-          </label>
-          <label class="field">
-            <span>許可証発行用のホスト公開鍵（秘密鍵ではありません）</span>
-            <input id="turnPermitHostKey" type="text" readonly>
-          </label>
-          <label class="field">
-            <span>管理者発行のTURN room permit（ゲストには共有しない）</span>
-            <textarea id="turnPermitInput" rows="2" autocomplete="off" spellcheck="false"></textarea>
-          </label>
-        </details>
         <section id="guestRequestCard" class="guest-request-card" hidden aria-labelledby="guestRequestTitle">
           <div class="guest-request-copy">
             <span class="request-step">ゲストから参加申請</span>

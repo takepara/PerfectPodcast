@@ -1,3 +1,4 @@
+import { getAuth0Client, getHostSession, signOut } from './auth-client.bundle.js';
 import { RoomCall } from './room-call.js';
 import { MAX_SESSION_FRAMES, remainingSessionFrames } from './recording-limits.js';
 import { RecordingTransfer, takeWithTransferParticipant } from './recording-transfer.js';
@@ -1622,6 +1623,18 @@ function audioContextTimeAtPerformanceTime(targetTime) {
 async function startRecording(remoteSchedule = null) {
   if (recording) return true;
   if (finalizing || starting || !activeSession) return false;
+  if (!roomCall?.isGuest) {
+    try {
+      if (!await getHostSession()) {
+        const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+        window.location.replace(`/index.html?returnTo=${encodeURIComponent(returnTo)}`);
+        return false;
+      }
+    } catch (error) {
+      errorText.textContent = `ホスト認証を確認できません: ${error.message}`;
+      return false;
+    }
+  }
   if (roomCall?.isActive && !roomCall.isGuest && !roomCall.canStartRecording) {
     errorText.textContent = '通話接続と双方の録音準備が完了してから録音を開始してください。';
     return false;
@@ -1855,6 +1868,41 @@ window.addEventListener('beforeunload', () => {
 });
 
 async function initialize() {
+  const invitation = new URLSearchParams(window.location.hash.slice(1));
+  const guestInvitation = invitation.has('session') && invitation.has('invite') && invitation.has('host');
+  if (!guestInvitation) {
+    let authSession;
+    try {
+      authSession = await getHostSession();
+    } catch (error) {
+      $('setupMessage').textContent = `ホスト認証を確認できません: ${error.message}`;
+      setupForm.querySelector('button[type="submit"]').disabled = true;
+      return;
+    }
+    if (!authSession) {
+      const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+      window.location.replace(`/index.html?returnTo=${encodeURIComponent(returnTo)}`);
+      return;
+    }
+    $('logoutButton').hidden = false;
+    $('logoutButton').addEventListener('click', async () => {
+      if (recording || finalizing) {
+        $('setupMessage').textContent = '録音を停止して保存してからログアウトしてください。';
+        return;
+      }
+      if (roomCall?.isActive) {
+        $('setupMessage').textContent = '通話または招待を終了してからログアウトしてください。';
+        return;
+      }
+      $('logoutButton').disabled = true;
+      try {
+        await signOut(await getAuth0Client());
+      } catch (error) {
+        $('setupMessage').textContent = `ログアウトできません: ${error.message}`;
+        $('logoutButton').disabled = false;
+      }
+    });
+  }
   try {
     database = await openDatabase();
     database.addEventListener('versionchange', () => database.close());

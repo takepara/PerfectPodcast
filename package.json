@@ -3,11 +3,17 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev --config wrangler.jsonc",
-    "deploy": "wrangler deploy --config wrangler.jsonc",
+    "build:auth": "esbuild src/auth-client.js --bundle --format=esm --target=es2022 --outfile=prototype/auth-client.bundle.js",
+    "dev": "npm run build:auth && wrangler dev --config wrangler.jsonc",
+    "deploy": "npm run build:auth && wrangler deploy --config wrangler.jsonc",
     "test": "node --test"
   },
+  "dependencies": {
+    "@auth0/auth0-spa-js": "^2.3.0",
+    "jose": "^6.0.0"
+  },
   "devDependencies": {
+    "esbuild": "^0.25.0",
     "wrangler": "^4.0.0"
   }
 }

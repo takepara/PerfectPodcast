@@ -117,6 +117,20 @@ function isValidTurnIceServers(iceServers) {
   return hasTurn;
 }
 
+export function findSelectedIceCandidatePair(reports) {
+  const reportList = [...reports.values()];
+  const selectedPairIds = new Set(reportList
+    .filter((report) => report.type === 'transport' && report.selectedCandidatePairId)
+    .map((report) => report.selectedCandidatePairId));
+  const pairs = reportList.filter((report) => report.type === 'candidate-pair');
+  if (selectedPairIds.size > 0) {
+    return pairs.find((pair) => selectedPairIds.has(pair.id)) || null;
+  }
+  return pairs.find((pair) => pair.selected === true) ||
+    pairs.find((pair) => pair.nominated === true && pair.state === 'succeeded') ||
+    null;
+}
+
 export class RoomCall {
   constructor({
     getSession,
@@ -478,8 +492,6 @@ export class RoomCall {
 
   applyRoleUI() {
     const guestMode = this.inviteMode;
-    $('turnPermitDetails').hidden = true;
-    $('turnPermitDetails').open = false;
     $('setupTitle').textContent = guestMode ? '招待された収録' : 'ローカル録音';
     $('setupInstructions').textContent = guestMode
       ? 'あなたはゲストとして招待されています。表示名とマイクを設定してスタジオへ進み、ホストに参加申請してください。ホストが録音を操作し、あなたの音声もこの端末に自動保存されます。'
@@ -1087,11 +1099,6 @@ export class RoomCall {
       this.localRole = 'host';
       await this.openSocket(this.room.roomId, 'host');
       this.updateReadinessUI();
-      $('turnPermitRoomId').value = this.room.roomId;
-      $('turnPermitHostKey').value = publicKey;
-      $('turnPermitInput').value = '';
-      $('turnPermitDetails').hidden = false;
-      $('turnPermitDetails').open = false;
       const url = new URL(window.location.href);
       url.hash = new URLSearchParams({
         session: this.room.roomId,
@@ -1311,10 +1318,6 @@ export class RoomCall {
     if (this.localRole !== 'host' || !this.socket || this.socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error('TURN資格を要求できるシグナリング接続がありません。'));
     }
-    const permit = $('turnPermitInput').value.trim();
-    if (!permit || !this.hostKeys || !this.room) {
-      return Promise.reject(new Error('管理者発行のTURN room permitを設定してください。'));
-    }
     if (this.pendingTurnCredentials) return this.pendingTurnCredentials.promise;
     const requestId = crypto.randomUUID();
     const hostPublicKey = toBase64Url(new Uint8Array(
@@ -1339,7 +1342,7 @@ export class RoomCall {
     };
     this.pendingTurnCredentials = pending;
     try {
-      this.send({ type: 'turn-request', requestId, permit, hostPublicKey });
+      this.send({ type: 'turn-request', requestId });
     } catch (error) {
       window.clearTimeout(pending.timer);
       this.pendingTurnCredentials = null;
@@ -1363,8 +1366,9 @@ export class RoomCall {
       this.setStatus('シグナリングサーバーから不正なTURN資格を受け取りました。', true);
       return;
     }
-    this.turnIceServers = message.iceServers;
     const pending = this.pendingTurnCredentials;
+    if (this.localRole === 'host' && (!pending || pending.requestId !== message.requestId)) return;
+    this.turnIceServers = message.iceServers;
     if (!pending || pending.requestId !== message.requestId) return;
     window.clearTimeout(pending.timer);
     this.pendingTurnCredentials = null;
@@ -1612,9 +1616,7 @@ export class RoomCall {
       const reports = await peerConnection.getStats();
       if (this.peerConnection !== peerConnection || peerConnection.connectionState !== 'connected') return;
       const reportList = [...reports.values()];
-      const pair = reportList.find((report) =>
-        report.type === 'candidate-pair' && report.state === 'succeeded' && (report.selected || report.nominated)
-      );
+      const pair = findSelectedIceCandidatePair(reports);
       const inbound = reportList.find((report) =>
         report.type === 'inbound-rtp' && (report.kind === 'audio' || report.mediaType === 'audio') && !report.isRemote
       );
@@ -1675,6 +1677,8 @@ export class RoomCall {
         const local = reports.get(pair.localCandidateId)?.candidateType;
         const remote = reports.get(pair.remoteCandidateId)?.candidateType;
         if (local || remote) parts.push(`経路 ${local || '?'} → ${remote || '?'}`);
+      } else if (reportList.some((report) => report.type === 'candidate-pair')) {
+        parts.push('選択ICE経路を取得できません');
       }
       const stats = $('connectionStats');
       stats.hidden = false;
@@ -2005,11 +2009,6 @@ export class RoomCall {
     this.readySequence = 0;
     this.remoteReadySequence = 0;
     $('inviteField').hidden = true;
-    $('turnPermitDetails').hidden = true;
-    $('turnPermitDetails').open = false;
-    $('turnPermitRoomId').value = '';
-    $('turnPermitHostKey').value = '';
-    $('turnPermitInput').value = '';
     $('leaveRoomButton').hidden = true;
     $('createRoomButton').hidden = false;
     this.updateReadinessUI();

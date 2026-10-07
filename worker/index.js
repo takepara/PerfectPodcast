@@ -1,6 +1,7 @@
-import { turnPermitSigningMessage } from '../shared/turn-permit.js';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 const ROOM_ID_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const AUTH_COOKIE = '__Host-perfectpodcast-host';
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const ALLOWED_MESSAGES = {
   host: new Set(['approved', 'denied', 'offer', 'auth-confirm', 'candidate', 'ice-restart', 'recording-state', 'ready-state', 'clock-ping', 'turn-request']),
@@ -9,15 +10,73 @@ const ALLOWED_MESSAGES = {
 const RECORDING_EVENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const GENERATION_PATTERN = /^[A-Za-z0-9_-]{22}$/u;
 const TURN_REQUEST_ID_PATTERN = RECORDING_EVENT_ID_PATTERN;
+const TURN_TEST_REQUEST_MAX_BYTES = 8 * 1024;
 const MAX_TRANSFER_FRAMES = 2 * 60 * 60 * 48_000;
 const MAX_TRANSFER_TAKES = 1_000_000;
 const MAX_TRANSFER_BYTES = MAX_TRANSFER_FRAMES * 3 + MAX_TRANSFER_TAKES * 44;
 const TURN_TTL_DEFAULT_SECONDS = 10_800;
 const TURN_TTL_MAX_SECONDS = 172_800;
+const AUTH0_JWKS = new Map();
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname.startsWith('/auth/')) return handleAuthRequest(request, env, url);
+    if (url.pathname === '/turn-test/credentials') {
+      const errorResponse = (message, status) => Response.json({ message }, {
+        status,
+        headers: { 'Cache-Control': 'no-store' }
+      });
+      if (request.method !== 'POST') {
+        return errorResponse('この要求方法は許可されていません。', 405);
+      }
+      if (request.headers.get('Origin') !== url.origin) {
+        return errorResponse('許可されていないオリジンです。', 403);
+      }
+      let authSession;
+      try {
+        authSession = await readAuthSession(request, env);
+      } catch (error) {
+        console.error('Auth0 token verification is unavailable.', error.code || error.name);
+        return errorResponse('Auth0認証を確認できません。設定と接続を確認してください。', error.status || 503);
+      }
+      if (!authSession) return errorResponse('ホストとしてログインしてください。', 401);
+      if (!hasHostPermission(authSession, env)) {
+        return errorResponse('このアカウントには収録ホスト権限がありません。', 403);
+      }
+      if (!/^application\/json(?:\s*;|$)/iu.test(request.headers.get('Content-Type') || '')) {
+        return errorResponse('JSON形式の要求が必要です。', 415);
+      }
+      if (!env.SIGNAL_RATE_LIMITER) {
+        return errorResponse('TURN資格発行のRate Limiting bindingがありません。', 503);
+      }
+      const { success } = await env.SIGNAL_RATE_LIMITER.limit({
+        key: `turn-test:${request.headers.get('CF-Connecting-IP') || 'unknown'}`
+      });
+      if (!success) return errorResponse('TURNテスト要求が多すぎます。', 429);
+
+      const body = await readLimitedText(request, TURN_TEST_REQUEST_MAX_BYTES);
+      if (body === null) return errorResponse('要求データが大きすぎます。', 413);
+      let payload;
+      try {
+        payload = JSON.parse(body);
+      } catch {
+        return errorResponse('JSON形式が不正です。', 400);
+      }
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
+          !ROOM_ID_PATTERN.test(payload.roomId || '')) {
+        return errorResponse('TURNテスト要求の形式が不正です。', 400);
+      }
+      const room = env.ROOMS.getByName(payload.roomId);
+      return room.fetch(new Request(`https://room/turn-test/credentials/${payload.roomId}`, {
+        method: 'POST',
+        headers: {
+          'x-turn-test-rate-limit-configured': 'true',
+          'x-auth0-sub': authSession.sub
+        },
+        body: JSON.stringify({ roomId: payload.roomId })
+      }));
+    }
     if (url.pathname.startsWith('/signal/')) {
       const roomId = url.pathname.slice('/signal/'.length);
       if (request.method !== 'GET' || !ROOM_ID_PATTERN.test(roomId) ||
@@ -32,24 +91,186 @@ export default {
         if (!success) return new Response('Too many signaling connections', { status: 429 });
         rateLimitConfigured = true;
       }
+      let hostAuth = null;
+      const hostToken = readCookie(request.headers.get('Cookie'), AUTH_COOKIE);
+      if (hostToken) {
+        try {
+          const authSession = await verifyAuth0AccessToken(hostToken, env);
+          if (hasHostPermission(authSession, env)) {
+            hostAuth = { sub: authSession.sub, exp: authSession.exp };
+          }
+        } catch (error) {
+          if (!isInvalidAuthToken(error)) {
+            console.error('Auth0 token verification is unavailable.', error.code || error.name);
+            return new Response('Host authentication is temporarily unavailable.', { status: 503 });
+          }
+        }
+      }
       const room = env.ROOMS.getByName(roomId);
       const headers = new Headers(request.headers);
       headers.set('x-signal-rate-limit-configured', String(rateLimitConfigured));
+      headers.set('x-auth0-sub', hostAuth?.sub || '');
+      headers.set('x-auth0-exp', hostAuth?.exp ? String(hostAuth.exp) : '');
+      headers.delete('Authorization');
+      headers.delete('Cookie');
       return room.fetch(new Request(request, { headers }));
     }
     return env.ASSETS.fetch(request);
   }
 };
 
+function getAuth0Config(env) {
+  const domain = typeof env.AUTH0_DOMAIN === 'string'
+    ? env.AUTH0_DOMAIN.trim().replace(/^https?:\/\//u, '').replace(/\/+$/u, '')
+    : '';
+  const clientId = env.AUTH0_CLIENT_ID;
+  const audience = env.AUTH0_AUDIENCE;
+  const hostPermission = env.AUTH0_HOST_PERMISSION;
+  if (!/^[A-Za-z0-9.-]+$/u.test(domain) ||
+      typeof clientId !== 'string' || !clientId ||
+      typeof audience !== 'string' || !audience ||
+      typeof hostPermission !== 'string' || !/^[A-Za-z0-9:_-]{1,128}$/u.test(hostPermission)) {
+    throw Object.assign(new Error('Auth0のdomain、client ID、API audience、host permissionが未設定です。'), {
+      status: 503
+    });
+  }
+  return {
+    domain,
+    clientId,
+    audience,
+    hostPermission,
+    issuer: `https://${domain}/`
+  };
+}
+
+async function handleAuthRequest(request, env, url) {
+  const json = (payload, status = 200, headers = {}) => Response.json(payload, {
+    status,
+    headers: { 'Cache-Control': 'no-store', ...headers }
+  });
+  if (url.pathname === '/auth/config') {
+    if (request.method !== 'GET') return json({ message: 'この要求方法は許可されていません。' }, 405);
+    try {
+      const { domain, clientId, audience, hostPermission } = getAuth0Config(env);
+      return json({ domain, clientId, audience, hostPermission });
+    } catch (error) {
+      return json({ message: error.message }, error.status || 503);
+    }
+  }
+  if (url.pathname === '/auth/session' && request.method === 'GET') {
+    try {
+      const session = await readAuthSession(request, env);
+      if (!session) return json({ message: 'ログインしてください。' }, 401);
+      if (!hasHostPermission(session, env)) {
+        return json({ message: 'このアカウントには収録ホスト権限がありません。' }, 403);
+      }
+      return json({ sub: session.sub, expiresAt: session.exp });
+    } catch (error) {
+      return authErrorResponse(error, json);
+    }
+  }
+  if ((url.pathname === '/auth/session' || url.pathname === '/auth/logout') &&
+      request.method === 'POST') {
+    if (request.headers.get('Origin') !== url.origin) {
+      return json({ message: '許可されていないオリジンです。' }, 403);
+    }
+    if (url.pathname === '/auth/logout') {
+      return json({ loggedOut: true }, 200, {
+        'Set-Cookie': `${AUTH_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0`
+      });
+    }
+    const authorization = request.headers.get('Authorization') || '';
+    const token = authorization.match(/^Bearer ([A-Za-z0-9._~-]+)$/u)?.[1];
+    if (!token) return json({ message: 'Auth0 access tokenが必要です。' }, 401);
+    try {
+      const session = await verifyAuth0AccessToken(token, env);
+      if (!hasHostPermission(session, env)) {
+        return json({ message: 'このアカウントには収録ホスト権限がありません。' }, 403);
+      }
+      const maxAge = Math.max(0, Math.min(86_400, session.exp - Math.floor(Date.now() / 1000)));
+      if (maxAge === 0) return json({ message: 'Auth0 access tokenの期限が切れています。' }, 401);
+      return json({ sub: session.sub, expiresAt: session.exp }, 200, {
+        'Set-Cookie': `${AUTH_COOKIE}=${token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=${maxAge}`
+      });
+    } catch (error) {
+      return authErrorResponse(error, json);
+    }
+  }
+  return json({ message: 'Not found' }, 404);
+}
+
+function authErrorResponse(error, json) {
+  if (isInvalidAuthToken(error)) {
+    return json({ message: 'Auth0 access tokenが無効または期限切れです。' }, 401);
+  }
+  console.error('Auth0 token verification failed.', error.code || error.name);
+  return json({ message: 'Auth0認証を確認できません。設定と接続を確認してください。' }, error.status || 503);
+}
+
+async function verifyAuth0AccessToken(token, env) {
+  const { issuer, audience } = getAuth0Config(env);
+  let jwks = AUTH0_JWKS.get(issuer);
+  if (!jwks) {
+    jwks = createRemoteJWKSet(new URL('.well-known/jwks.json', issuer));
+    AUTH0_JWKS.set(issuer, jwks);
+  }
+  const { payload } = await jwtVerify(token, jwks, {
+    issuer,
+    audience,
+    algorithms: ['RS256'],
+    clockTolerance: 5,
+    requiredClaims: ['exp', 'sub']
+  });
+  if (typeof payload.sub !== 'string' || !payload.sub || !Number.isSafeInteger(payload.exp)) {
+    throw Object.assign(new Error('Auth0 access tokenにsub claimがありません。'), { code: 'ERR_JWT_CLAIM_VALIDATION_FAILED' });
+  }
+  return payload;
+}
+
+function hasHostPermission(session, env) {
+  const { hostPermission } = getAuth0Config(env);
+  const scopes = typeof session.scope === 'string' ? session.scope.split(/\s+/u) : [];
+  const permissions = Array.isArray(session.permissions) ? session.permissions : [];
+  return scopes.includes(hostPermission) || permissions.includes(hostPermission);
+}
+
+function isInvalidAuthToken(error) {
+  return typeof error?.code === 'string' &&
+    (error.code.startsWith('ERR_JWT_') ||
+     error.code.startsWith('ERR_JWS_') ||
+     error.code === 'ERR_JWKS_NO_MATCHING_KEY');
+}
+
+async function readAuthSession(request, env) {
+  const token = readCookie(request.headers.get('Cookie'), AUTH_COOKIE);
+  if (!token) return null;
+  try {
+    return await verifyAuth0AccessToken(token, env);
+  } catch (error) {
+    if (isInvalidAuthToken(error)) return null;
+    throw error;
+  }
+}
+
+function readCookie(header, cookieName) {
+  for (const part of (header || '').split(';')) {
+    const separator = part.indexOf('=');
+    if (separator < 0 || part.slice(0, separator).trim() !== cookieName) continue;
+    return part.slice(separator + 1).trim();
+  }
+  return null;
+}
+
 export class RoomSignaling {
   constructor(state, env = {}) {
     this.state = state;
     this.env = env;
     this.peers = new Map();
+    this.authenticatedSubjects = new WeakMap();
     this.approvedGuest = false;
     this.turnCredentials = null;
-    this.turnCredentialsPermitId = null;
-    this.consumedTurnPermitId = null;
+    this.turnCredentialsKey = null;
+    this.hostSubject = null;
     this.roomId = null;
     this.turnRateLimitConfigured = false;
     this.lastTurnAttemptAt = 0;
@@ -57,21 +278,61 @@ export class RoomSignaling {
   }
 
   async fetch(request) {
+    const url = new URL(request.url);
+    const turnTestRoomMatch = url.pathname.match(/^\/turn-test\/credentials\/([^/]+)$/u);
+    if (turnTestRoomMatch) return this.fetchTurnTestCredentials(request, turnTestRoomMatch[1]);
     const origin = request.headers.get('Origin');
-    if (origin && origin !== new URL(request.url).origin) {
+    if (origin && origin !== url.origin) {
       return new Response('Forbidden', { status: 403 });
     }
-    const roomId = new URL(request.url).pathname.slice('/signal/'.length);
+    const roomId = url.pathname.slice('/signal/'.length);
     if (!ROOM_ID_PATTERN.test(roomId)) return new Response('Not found', { status: 404 });
     this.roomId = roomId;
     this.turnRateLimitConfigured = request.headers.get('x-signal-rate-limit-configured') === 'true';
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
+    const authSub = request.headers.get('x-auth0-sub');
+    const authExp = Number(request.headers.get('x-auth0-exp'));
+    this.authenticatedSubjects.set(server, authSub && Number.isSafeInteger(authExp)
+      ? { sub: authSub, exp: authExp }
+      : null);
     server.addEventListener('message', (event) => { void this.onMessage(server, event); });
     server.addEventListener('close', () => this.onClose(server));
     server.addEventListener('error', () => this.onClose(server));
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async fetchTurnTestCredentials(request, roomId) {
+    const json = (payload, status = 200) => Response.json(payload, {
+      status,
+      headers: { 'Cache-Control': 'no-store' }
+    });
+    if (request.method !== 'POST' || !ROOM_ID_PATTERN.test(roomId) ||
+        request.headers.get('x-turn-test-rate-limit-configured') !== 'true' ||
+        !request.headers.get('x-auth0-sub')) {
+      return json({ message: 'TURNテスト要求が許可されていません。' }, 403);
+    }
+    const body = await readLimitedText(request, TURN_TEST_REQUEST_MAX_BYTES);
+    if (body === null) return json({ message: '要求データが大きすぎます。' }, 413);
+    let payload;
+    try {
+      payload = JSON.parse(body);
+    } catch {
+      return json({ message: 'JSON形式が不正です。' }, 400);
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
+        payload.roomId !== roomId) {
+      return json({ message: 'TURNテスト要求の形式が不正です。' }, 400);
+    }
+    this.roomId = roomId;
+    this.turnRateLimitConfigured = true;
+    try {
+      const credentials = await this.getTurnCredentials(`turn-test:${roomId}`);
+      return json({ iceServers: credentials.iceServers });
+    } catch (error) {
+      return json({ message: `TURN資格を発行できません: ${error.message}` }, error.status || 502);
+    }
   }
 
   async onMessage(socket, event) {
@@ -91,6 +352,13 @@ export class RoomSignaling {
       return;
     }
     const role = this.peers.get(socket);
+    const authSession = this.authenticatedSubjects.get(socket);
+    if (role === 'host' &&
+        (!authSession || authSession.exp <= Math.floor(Date.now() / 1000)) &&
+        !(message?.type === 'recording-state' && message.recording === false)) {
+      this.reject(socket, 'ホストのログイン期限が切れました。再ログインしてください。');
+      return;
+    }
     if (!message || typeof message.type !== 'string' || !ALLOWED_MESSAGES[role].has(message.type)) {
       this.reject(socket, '許可されていないシグナリングメッセージです。');
       return;
@@ -104,7 +372,8 @@ export class RoomSignaling {
       return;
     }
     if (message.type === 'turn-request') {
-      if (role !== 'host' || !TURN_REQUEST_ID_PATTERN.test(message.requestId || '')) {
+      if (role !== 'host' || !this.authenticatedSubjects.get(socket)?.sub ||
+          !TURN_REQUEST_ID_PATTERN.test(message.requestId || '')) {
         this.reject(socket, 'TURN資格を要求できるのは有効なホストだけです。');
         return;
       }
@@ -112,21 +381,6 @@ export class RoomSignaling {
         this.reject(socket, 'ゲストの承認前はTURN資格を発行できません。');
         return;
       }
-      if (typeof message.permit !== 'string' || message.permit.length > 4096 ||
-          typeof message.hostPublicKey !== 'string' || message.hostPublicKey.length > 256) {
-        this.sendTurnError(socket, message.requestId, '管理者発行のTURN room permitが必要です。');
-        return;
-      }
-      const permit = await this.verifyTurnPermit(message.permit, message.hostPublicKey);
-      if (!permit) {
-        this.sendTurnError(socket, message.requestId, 'TURN room permitが無効、期限切れ、または別の部屋向けです。');
-        return;
-      }
-      if (this.consumedTurnPermitId && this.consumedTurnPermitId !== permit.jti) {
-        this.sendTurnError(socket, message.requestId, 'この部屋では別のTURN room permitを使用できません。');
-        return;
-      }
-      this.consumedTurnPermitId = permit.jti;
       await this.issueTurnCredentials(socket, message.requestId);
       return;
     }
@@ -251,6 +505,19 @@ export class RoomSignaling {
       return;
     }
     const roles = [...this.peers.values()];
+    if (message.role === 'host') {
+      const authSession = this.authenticatedSubjects.get(socket);
+      if (!authSession?.sub || authSession.exp <= Math.floor(Date.now() / 1000)) {
+        this.reject(socket, '収録ホストにはAuth0ログインとホスト権限が必要です。');
+        return;
+      }
+      const subject = authSession.sub;
+      if (this.hostSubject && this.hostSubject !== subject) {
+        this.reject(socket, 'この部屋を作成したホストアカウントでログインしてください。');
+        return;
+      }
+      this.hostSubject = subject;
+    }
     if (message.role === 'host' && roles.includes('host')) {
       this.reject(socket, 'この部屋にはホストが既に接続しています。');
       return;
@@ -272,92 +539,33 @@ export class RoomSignaling {
       }
     };
     try {
-      const credentials = await this.getTurnCredentials(hostSocket, this.consumedTurnPermitId);
+      const credentials = await this.getTurnCredentials(`room:${this.roomId}`);
       respond({ type: 'turn-credentials', requestId, iceServers: credentials.iceServers });
     } catch (error) {
       respond({ type: 'turn-error', requestId, message: `TURN資格を発行できません: ${error.message}` });
     }
   }
 
-  sendTurnError(socket, requestId, message) {
-    const payload = JSON.stringify({ type: 'turn-error', requestId, message });
-    const guestSocket = [...this.peers].find(([, role]) => role === 'guest')?.[0];
-    for (const peer of [socket, guestSocket]) {
-      if (peer?.readyState === WebSocket.OPEN) peer.send(payload);
-    }
-  }
-
-  async verifyTurnPermit(permit, hostPublicKey) {
-    if (!this.env.TURN_PERMIT_PUBLIC_KEY) return null;
-    const parts = permit.split('.');
-    if (parts.length !== 2 || parts.some((part) => !/^[A-Za-z0-9_-]+$/u.test(part))) return null;
-    let payload;
-    let signature;
-    let publicKeyBytes;
-    try {
-      payload = JSON.parse(new TextDecoder().decode(decodeBase64Url(parts[0])));
-      signature = decodeBase64Url(parts[1]);
-      publicKeyBytes = decodeBase64Url(hostPublicKey);
-    } catch {
-      return null;
-    }
-    const now = Date.now();
-    if (!payload || payload.v !== 1 || payload.roomId !== this.roomId ||
-        !ROOM_ID_PATTERN.test(payload.roomId || '') ||
-        typeof payload.hostKeyHash !== 'string' ||
-        !/^[A-Za-z0-9_-]{43}$/u.test(payload.hostKeyHash) ||
-        !Number.isSafeInteger(payload.issuedAt) || !Number.isSafeInteger(payload.expiresAt) ||
-        payload.issuedAt > now + 60_000 || payload.issuedAt < now - 86_400_000 ||
-        payload.expiresAt <= now || payload.expiresAt > payload.issuedAt + 86_400_000 ||
-        !/^[A-Za-z0-9_-]{22}$/u.test(payload.jti || '') || payload.maxGuests !== 1 ||
-        publicKeyBytes.length < 64 || publicKeyBytes.length > 256) {
-      return null;
-    }
-    const actualHostKeyHash = encodeBase64Url(await crypto.subtle.digest('SHA-256', publicKeyBytes));
-    if (actualHostKeyHash !== payload.hostKeyHash) return null;
-    let permitKey;
-    try {
-      permitKey = await crypto.subtle.importKey(
-        'spki',
-        decodeBase64Url(this.env.TURN_PERMIT_PUBLIC_KEY),
-        { name: 'Ed25519' },
-        false,
-        ['verify']
-      );
-    } catch {
-      return null;
-    }
-    try {
-      const valid = await crypto.subtle.verify(
-        { name: 'Ed25519' },
-        permitKey,
-        signature,
-        new TextEncoder().encode(turnPermitSigningMessage(payload))
-      );
-      return valid ? payload : null;
-    } catch {
-      return null;
-    }
-  }
-
-  async getTurnCredentials(hostSocket, permitId) {
+  async getTurnCredentials(credentialsKey) {
     const token = this.env.TURN_API_TOKEN;
     const keyId = this.env.TURN_KEY_ID;
     const ttl = Number(this.env.TURN_CREDENTIAL_TTL_SECONDS || TURN_TTL_DEFAULT_SECONDS);
     if (typeof token !== 'string' || !token || typeof keyId !== 'string' ||
         !/^[A-Za-z0-9_-]{1,128}$/u.test(keyId)) {
-      throw new Error('サーバー側のTURN key ID/API tokenが未設定です。');
+      throw Object.assign(new Error('サーバー側のTURN key ID/API tokenが未設定です。'), { status: 503 });
     }
     if (!Number.isSafeInteger(ttl) || ttl < TURN_TTL_DEFAULT_SECONDS || ttl > TURN_TTL_MAX_SECONDS) {
-      throw new Error('TURN資格TTLは3時間以上48時間以下で設定してください。');
+      throw Object.assign(new Error('TURN資格TTLは3時間以上48時間以下で設定してください。'), { status: 503 });
     }
     const now = Date.now();
-    if (this.turnCredentialsPermitId === permitId && this.turnCredentials?.expiresAt > now + 60_000) {
+    if (this.turnCredentialsKey === credentialsKey && this.turnCredentials?.expiresAt > now + 60_000) {
       return this.turnCredentials;
     }
-    if (!this.turnRateLimitConfigured) throw new Error('シグナリングのRate Limiting bindingがありません。');
+    if (!this.turnRateLimitConfigured) {
+      throw Object.assign(new Error('シグナリングのRate Limiting bindingがありません。'), { status: 503 });
+    }
     if (now - this.lastTurnAttemptAt < 60_000) {
-      throw new Error('この部屋からのTURN資格発行頻度が上限に達しました。');
+      throw Object.assign(new Error('この部屋からのTURN資格発行頻度が上限に達しました。'), { status: 429 });
     }
     this.lastTurnAttemptAt = now;
 
@@ -373,16 +581,18 @@ export class RoomSignaling {
         signal: AbortSignal.timeout(10_000)
       }
     );
-    if (!response.ok) throw new Error(`Cloudflare Realtime API returned HTTP ${response.status}.`);
+    if (!response.ok) {
+      throw Object.assign(new Error(`Cloudflare Realtime API returned HTTP ${response.status}.`), { status: 502 });
+    }
     const payload = await response.json();
     if (!validTurnIceServers(payload?.iceServers)) {
-      throw new Error('Cloudflare Realtime APIのTURN資格応答が不正です。');
+      throw Object.assign(new Error('Cloudflare Realtime APIのTURN資格応答が不正です。'), { status: 502 });
     }
     this.turnCredentials = {
       iceServers: payload.iceServers,
       expiresAt: now + ttl * 1000
     };
-    this.turnCredentialsPermitId = permitId;
+    this.turnCredentialsKey = credentialsKey;
     return this.turnCredentials;
   }
 
@@ -417,19 +627,30 @@ export class RoomSignaling {
   }
 }
 
-function decodeBase64Url(value) {
-  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/u.test(value)) {
-    throw new Error('Invalid base64url value.');
+async function readLimitedText(request, maxBytes) {
+  const contentLength = request.headers.get('Content-Length');
+  if (contentLength && /^\d+$/u.test(contentLength) && Number(contentLength) > maxBytes) return null;
+  const reader = request.body?.getReader();
+  if (!reader) return '';
+  const chunks = [];
+  let byteLength = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    byteLength += value.byteLength;
+    if (byteLength > maxBytes) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
   }
-  const normalized = value.replaceAll('-', '+').replaceAll('_', '/');
-  const binary = atob(normalized + '='.repeat((4 - normalized.length % 4) % 4));
-  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
-}
-
-function encodeBase64Url(bytes) {
-  let binary = '';
-  for (const byte of new Uint8Array(bytes)) binary += String.fromCharCode(byte);
-  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '');
+  const bytes = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
 }
 
 function validTurnIceServers(iceServers) {

@@ -42,10 +42,10 @@
       font-weight: 650;
     }
 
-    textarea {
+    input {
       box-sizing: border-box;
       width: 100%;
-      min-height: 160px;
+      min-height: 42px;
       padding: 10px;
       font: 13px/1.45 ui-monospace, monospace;
     }
@@ -114,15 +114,13 @@
 <body>
   <main>
     <h1>Cloudflare TURN 通信テスト</h1>
-    <p>短命のICE資格を読み込み、TURN relay候補に限定したWebRTC DataChannel通信を確認します。マイクやカメラは使用しません。</p>
+    <p>Auth0で許可された収録ホストとしてログインし、短命のICE資格を取得してTURN relay候補に限定したWebRTC DataChannel通信を確認します。マイクやカメラは使用しません。</p>
 
     <section class="card" aria-labelledby="credential-title">
-      <h2 id="credential-title">1. 短命資格を読み込む</h2>
-      <p>Cloudflare Realtime APIから返されたJSON全体、または <code>iceServers</code> 配列を貼り付けてください。API tokenやTURN keyの秘密値は入力しないでください。</p>
-      <label for="credentials">TURN資格レスポンス</label>
-      <textarea id="credentials" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder='{"iceServers":[{"urls":["turn:turn.cloudflare.com:3478?transport=udp"],"username":"...","credential":"..."}]}'></textarea>
+      <h2 id="credential-title">1. 認証済みWorkerから短命資格を取得</h2>
+      <p>資格はWorkerがCloudflare Realtimeから取得します。Cloudflare API tokenやTURN keyの秘密値はこのページへ渡りません。</p>
       <div class="actions">
-        <button id="startButton" type="button">TURN通信をテスト</button>
+        <button id="startButton" type="button" disabled>資格を取得してTURNをテスト</button>
         <button id="stopButton" type="button" disabled>テストを停止</button>
         <button id="clearButton" type="button">表示を消去</button>
       </div>
@@ -130,8 +128,8 @@
 
     <section class="card" aria-live="polite" aria-labelledby="result-title">
       <h2 id="result-title">2. テスト結果</h2>
-      <p id="status" data-kind="idle">資格を貼り付けてテストを開始してください。</p>
-      <pre id="log">このページは資格を保存しません。テスト開始時に入力欄を消去します。</pre>
+      <p id="status" data-kind="idle">Auth0でログインしてテストを開始してください。</p>
+      <pre id="log">短命資格は永続保存せず、値をログに表示しません。</pre>
     </section>
 
     <section class="card">
@@ -146,8 +144,9 @@
   </main>
 
   <script type="module">
+    import { getHostSession } from './auth-client.bundle.js';
+
     const $ = (id) => document.getElementById(id);
-    const credentialsInput = $('credentials');
     const startButton = $('startButton');
     const stopButton = $('stopButton');
     const clearButton = $('clearButton');
@@ -166,6 +165,28 @@
     function setStatus(message, kind = 'idle') {
       statusElement.textContent = message;
       statusElement.dataset.kind = kind;
+    }
+
+    async function requireHostLogin() {
+      try {
+        const session = await getHostSession();
+        if (!session) {
+          const returnTo = `${window.location.pathname}${window.location.search}`;
+          window.location.replace(`/index.html?returnTo=${encodeURIComponent(returnTo)}`);
+          return;
+        }
+        startButton.disabled = false;
+        setStatus('Auth0ホスト認証済みです。テストを開始できます。');
+      } catch (error) {
+        setStatus(`ホスト認証を確認できません: ${error.message}`, 'error');
+      }
+    }
+
+    function createTestRoomId() {
+      const bytes = crypto.getRandomValues(new Uint8Array(32));
+      let binary = '';
+      for (const byte of bytes) binary += String.fromCharCode(byte);
+      return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '');
     }
 
     function normalizeIceServers(input) {
@@ -237,6 +258,7 @@
     }
 
     function closeRun(run) {
+      run.controller?.abort();
       for (const peerConnection of run.peerConnections) peerConnection.close();
       run.dataChannel?.close();
       clearTimeout(run.timeout);
@@ -245,7 +267,12 @@
 
     async function runTest() {
       if (activeRun) return;
-      const run = { peerConnections: [], dataChannel: null, timeout: null };
+      const run = {
+        peerConnections: [],
+        dataChannel: null,
+        timeout: null,
+        controller: new AbortController()
+      };
       activeRun = run;
       startButton.disabled = true;
       stopButton.disabled = false;
@@ -259,17 +286,30 @@
         if (!window.isSecureContext) {
           throw new Error('HTTPSまたはlocalhostでこのページを開いてください。');
         }
-        const credentialsText = credentialsInput.value.trim();
-        credentialsInput.value = '';
-        if (!credentialsText) throw new Error('CloudflareのTURN資格JSONを貼り付けてください。');
+        setStatus('WorkerがAuth0認証を確認して短命資格を取得しています…');
+        const response = await fetch('/turn-test/credentials', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ roomId: createTestRoomId() }),
+          credentials: 'same-origin',
+          cache: 'no-store',
+          redirect: 'error',
+          signal: run.controller.signal
+        });
+        assertCurrentRun(run);
+        const responseText = await response.text();
         let parsed;
         try {
-          parsed = JSON.parse(credentialsText);
+          parsed = JSON.parse(responseText);
         } catch {
-          throw new Error('入力内容をJSONとして読み取れません。');
+          if (!response.ok) throw new Error(`Workerから資格を取得できませんでした (HTTP ${response.status})。`);
+          throw new Error('Workerの資格応答をJSONとして読み取れません。');
+        }
+        if (!response.ok) {
+          throw new Error(parsed?.message || `Workerから資格を取得できませんでした (HTTP ${response.status})。`);
         }
         const iceServers = normalizeIceServers(parsed);
-        addLog('TURN URLと短命資格を確認しました。資格の値はログに表示しません。');
+        addLog('Worker経由でTURN URLと短命資格を取得しました。資格の値は表示しません。');
 
         const configuration = { iceServers, iceTransportPolicy: 'relay' };
         const host = new RTCPeerConnection(configuration);
@@ -387,10 +427,11 @@
       addLog('PeerConnectionとDataChannelを閉じました。');
     });
     clearButton.addEventListener('click', () => {
-      credentialsInput.value = '';
-      logElement.textContent = '表示を消去しました。';
-      setStatus('資格を貼り付けてテストを開始してください。');
+      logElement.textContent = '表示と入力欄を消去しました。';
+      setStatus('Auth0でログインしてテストを開始してください。');
     });
+
+    void requireHostLogin();
   </script>
 </body>
 </html>

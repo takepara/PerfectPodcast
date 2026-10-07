@@ -1,46 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  createHash,
-  createPublicKey,
-  generateKeyPairSync,
-  randomBytes,
-  sign as signMessage,
-  verify as verifyMessage
-} from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { promisify } from 'node:util';
-import { fingerprintFromSdp, invitationProof, RoomCall, transcript } from '../prototype/room-call.js';
+  findSelectedIceCandidatePair,
+  fingerprintFromSdp,
+  invitationProof,
+  RoomCall,
+  transcript
+} from '../prototype/room-call.js';
 import worker, { RoomSignaling } from '../worker/index.js';
-import { turnPermitSigningMessage } from '../shared/turn-permit.js';
-
-const execFileAsync = promisify(execFile);
-
-function createTestTurnPermit(roomId, hostPublicKey, signingKey) {
-  const now = Date.now();
-  const hostKeyHash = createHash('sha256')
-    .update(Buffer.from(hostPublicKey, 'base64url'))
-    .digest('base64url');
-  const payload = {
-    v: 1,
-    roomId,
-    hostKeyHash,
-    issuedAt: now,
-    expiresAt: now + 60 * 60 * 1000,
-    jti: randomBytes(16).toString('base64url'),
-    maxGuests: 1
-  };
-  const payloadPart = Buffer.from(JSON.stringify(payload)).toString('base64url');
-  const signature = signMessage(
-    null,
-    Buffer.from(turnPermitSigningMessage(payload)),
-    signingKey
-  ).toString('base64url');
-  return `${payloadPart}.${signature}`;
-}
 
 test('reads the DTLS SHA-256 fingerprint from CRLF SDP', () => {
   const fingerprint = 'A1:B2:C3:D4';
@@ -74,6 +41,60 @@ test('invitation proof is bound to its room, nonce, and guest key', async () => 
   assert.notEqual(await invitationProof(secret, 'room-a', 'nonce-a', 'guest-key', 1001), proof);
 });
 
+test('selects the ICE pair reported by the transport instead of another nominated pair', () => {
+  const selected = {
+    id: 'relay-pair',
+    type: 'candidate-pair',
+    state: 'succeeded',
+    localCandidateId: 'relay-local',
+    remoteCandidateId: 'relay-remote'
+  };
+  const reports = new Map([
+    ['direct-pair', {
+      id: 'direct-pair',
+      type: 'candidate-pair',
+      state: 'succeeded',
+      nominated: true
+    }],
+    [selected.id, selected],
+    ['transport', {
+      id: 'transport',
+      type: 'transport',
+      selectedCandidatePairId: selected.id
+    }]
+  ]);
+
+  assert.equal(findSelectedIceCandidatePair(reports), selected);
+});
+
+test('uses selected or nominated ICE pair fields only when transport stats are unavailable', () => {
+  const selected = {
+    id: 'selected-pair',
+    type: 'candidate-pair',
+    state: 'succeeded',
+    selected: true
+  };
+  assert.equal(
+    findSelectedIceCandidatePair(new Map([
+      ['nominated-pair', {
+        id: 'nominated-pair',
+        type: 'candidate-pair',
+        state: 'succeeded',
+        nominated: true
+      }],
+      [selected.id, selected]
+    ])),
+    selected
+  );
+  assert.equal(findSelectedIceCandidatePair(new Map([
+    ['unselected-pair', {
+      id: 'unselected-pair',
+      type: 'candidate-pair',
+      state: 'succeeded'
+    }]
+  ])), null);
+});
+
 test('only the host can relay valid recording-state messages', async () => {
   const originalWebSocket = globalThis.WebSocket;
   globalThis.WebSocket = { OPEN: 1 };
@@ -89,6 +110,10 @@ test('only the host can relay valid recording-state messages', async () => {
     const signaling = new RoomSignaling({});
     signaling.peers.set(host, 'host');
     signaling.peers.set(guest, 'guest');
+    signaling.authenticatedSubjects.set(host, {
+      sub: 'auth0|host-recording',
+      exp: Math.floor(Date.now() / 1000) + 600
+    });
 
     const recordingState = {
       type: 'recording-state',
@@ -136,6 +161,10 @@ test('rejects malformed host recording-state messages', async () => {
     const signaling = new RoomSignaling({});
     signaling.peers.set(host, 'host');
     signaling.peers.set(guest, 'guest');
+    signaling.authenticatedSubjects.set(host, {
+      sub: 'auth0|host-readiness',
+      exp: Math.floor(Date.now() / 1000) + 600
+    });
 
     await signaling.onMessage(host, { data: JSON.stringify({
       type: 'recording-state',
@@ -262,6 +291,10 @@ test('relays readiness only with a valid authenticated-generation shape', async 
     const signaling = new RoomSignaling({});
     signaling.peers.set(host, 'host');
     signaling.peers.set(guest, 'guest');
+    signaling.authenticatedSubjects.set(host, {
+      sub: 'auth0|host-readiness',
+      exp: Math.floor(Date.now() / 1000) + 600
+    });
     const ready = {
       type: 'ready-state',
       ready: true,
@@ -761,7 +794,100 @@ test('acknowledges duplicate scheduled starts even after their target time', asy
   }
 });
 
-test('issues short-lived TURN credentials only after host approval and caches them in memory', async () => {
+test('accepts only matching host TURN responses and installs relayed credentials for both roles', async () => {
+  const originalWindow = globalThis.window;
+  const originalRTCPeerConnection = globalThis.RTCPeerConnection;
+  const requestId = '123e4567-e89b-42d3-a456-426614174000';
+  const iceServers = [
+    { urls: ['stun:stun.cloudflare.com:3478'] },
+    {
+      urls: ['turn:turn.cloudflare.com:3478?transport=udp'],
+      username: 'short-lived-user',
+      credential: 'short-lived-password'
+    }
+  ];
+  const connectionConfigurations = [];
+  class MockRTCPeerConnection {
+    constructor(configuration) {
+      connectionConfigurations.push(configuration);
+    }
+
+    addEventListener() {}
+
+    createDataChannel(label, options) {
+      return { label, ...options };
+    }
+  }
+  globalThis.window = {
+    RTCPeerConnection: MockRTCPeerConnection,
+    clearTimeout() {}
+  };
+  globalThis.RTCPeerConnection = MockRTCPeerConnection;
+
+  try {
+    const host = Object.create(RoomCall.prototype);
+    let resolvedCredentials = null;
+    const pending = {
+      requestId,
+      timer: 1,
+      resolve(value) { resolvedCredentials = value; },
+      reject() {}
+    };
+    Object.assign(host, {
+      localRole: 'host',
+      pendingTurnCredentials: pending,
+      turnIceServers: null,
+      recordingTransfer: { setRole() {}, setChannel() {} }
+    });
+
+    host.receiveTurnCredentials({
+      requestId: '223e4567-e89b-42d3-a456-426614174001',
+      iceServers
+    });
+    assert.equal(host.turnIceServers, null);
+    assert.equal(host.pendingTurnCredentials, pending);
+
+    host.receiveTurnCredentials({ requestId, iceServers });
+    assert.deepEqual(resolvedCredentials, iceServers);
+    assert.deepEqual(host.turnIceServers, iceServers);
+    assert.equal(host.pendingTurnCredentials, null);
+
+    const guest = Object.create(RoomCall.prototype);
+    Object.assign(guest, {
+      localRole: 'guest',
+      pendingTurnCredentials: null,
+      turnIceServers: null,
+      recordingTransfer: { setRole() {}, setChannel() {} }
+    });
+    guest.receiveTurnCredentials({ requestId, iceServers });
+    assert.deepEqual(guest.turnIceServers, iceServers);
+
+    await host.createPeerConnection();
+    await guest.createPeerConnection();
+    assert.deepEqual(connectionConfigurations.slice(0, 2), [
+      { iceServers },
+      { iceServers }
+    ]);
+
+    const fallbackHost = Object.create(RoomCall.prototype);
+    Object.assign(fallbackHost, {
+      localRole: 'host',
+      turnIceServers: null,
+      recordingTransfer: { setRole() {}, setChannel() {} }
+    });
+    await fallbackHost.createPeerConnection();
+    assert.deepEqual(connectionConfigurations[2], {
+      iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }]
+    });
+  } finally {
+    if (originalWindow === undefined) delete globalThis.window;
+    else globalThis.window = originalWindow;
+    if (originalRTCPeerConnection === undefined) delete globalThis.RTCPeerConnection;
+    else globalThis.RTCPeerConnection = originalRTCPeerConnection;
+  }
+});
+
+test('issues short-lived TURN credentials only for an authenticated host after guest approval', async () => {
   const originalWebSocket = globalThis.WebSocket;
   const originalFetch = globalThis.fetch;
   globalThis.WebSocket = { OPEN: 1 };
@@ -772,110 +898,55 @@ test('issues short-lived TURN credentials only after host approval and caches th
     close() { this.readyState = 3; }
   });
   let fetchCount = 0;
-  const permitKeys = generateKeyPairSync('ed25519');
-  const permitPublicKey = permitKeys.publicKey.export({ type: 'spki', format: 'der' }).toString('base64url');
-  const roomId = 'A'.repeat(43);
-  const hostPublicKey = Buffer.alloc(91, 4).toString('base64url');
-  const permit = createTestTurnPermit(roomId, hostPublicKey, permitKeys.privateKey);
   globalThis.fetch = async (url, init) => {
     fetchCount += 1;
     assert.match(String(url), /rtc\.live\.cloudflare\.com\/v1\/turn\/keys\/test-key\/credentials/u);
     assert.equal(init.headers.Authorization, 'Bearer test-token');
     assert.equal(JSON.parse(init.body).ttl, 10_800);
-    return Response.json({
-      iceServers: [
-        { urls: ['stun:stun.cloudflare.com:3478'] },
-        {
-          urls: ['turn:turn.cloudflare.com:3478?transport=udp'],
-          username: 'short-lived-user',
-          credential: 'short-lived-password'
-        }
-      ]
-    });
+    return Response.json({ iceServers: [{
+      urls: ['turn:turn.cloudflare.com:3478?transport=udp'],
+      username: 'short-lived-user',
+      credential: 'short-lived-password'
+    }] });
   };
   try {
+    const unauthorized = new RoomSignaling({}, { TURN_API_TOKEN: 'test-token', TURN_KEY_ID: 'test-key' });
+    const deniedHost = makeSocket();
+    unauthorized.peers.set(deniedHost, 'host');
+    unauthorized.turnRateLimitConfigured = true;
+    await unauthorized.onMessage(deniedHost, {
+      data: JSON.stringify({ type: 'turn-request', requestId: '123e4567-e89b-42d3-a456-426614174000' })
+    });
+    assert.equal(deniedHost.readyState, 3);
+    assert.equal(fetchCount, 0);
+
     const host = makeSocket();
     const guest = makeSocket();
     const signaling = new RoomSignaling({}, {
       TURN_API_TOKEN: 'test-token',
-      TURN_KEY_ID: 'test-key',
-      TURN_PERMIT_PUBLIC_KEY: permitPublicKey
+      TURN_KEY_ID: 'test-key'
     });
     signaling.peers.set(host, 'host');
     signaling.peers.set(guest, 'guest');
-    signaling.roomId = roomId;
+    signaling.authenticatedSubjects.set(host, { sub: 'auth0|host-1', exp: Math.floor(Date.now() / 1000) + 600 });
+    signaling.roomId = 'A'.repeat(43);
     signaling.turnRateLimitConfigured = true;
-
-    const requestId = '123e4567-e89b-42d3-a456-426614174000';
-    await signaling.onMessage(host, {
-      data: JSON.stringify({ type: 'turn-request', requestId, permit, hostPublicKey })
-    });
-    assert.equal(fetchCount, 0);
-    assert.equal(host.readyState, 3);
-
-    const approvedHost = makeSocket();
-    const approvedGuest = makeSocket();
-    const approvedSignaling = new RoomSignaling({}, {
-      TURN_API_TOKEN: 'test-token',
-      TURN_KEY_ID: 'test-key',
-      TURN_PERMIT_PUBLIC_KEY: permitPublicKey
-    });
-    approvedSignaling.peers.set(approvedHost, 'host');
-    approvedSignaling.peers.set(approvedGuest, 'guest');
-    approvedSignaling.roomId = roomId;
-    approvedSignaling.turnRateLimitConfigured = true;
-    await approvedSignaling.onMessage(approvedHost, { data: JSON.stringify({ type: 'approved' }) });
-    const otherRoomPermit = createTestTurnPermit(
-      'D'.repeat(43),
-      hostPublicKey,
-      permitKeys.privateKey
-    );
-    await approvedSignaling.onMessage(approvedHost, {
-      data: JSON.stringify({
-        type: 'turn-request',
-        requestId,
-        permit: otherRoomPermit,
-        hostPublicKey
-      })
-    });
-    assert.equal(approvedHost.messages.at(-1).type, 'turn-error');
-    assert.equal(fetchCount, 0);
-    assert.equal(approvedGuest.messages.at(-1).type, 'turn-error');
-    await approvedSignaling.onMessage(approvedHost, {
-      data: JSON.stringify({
-        type: 'turn-request',
-        requestId: '323e4567-e89b-42d3-a456-426614174002',
-        permit,
-        hostPublicKey: Buffer.alloc(91, 7).toString('base64url')
-      })
-    });
-    assert.equal(approvedHost.messages.at(-1).type, 'turn-error');
-    assert.equal(fetchCount, 0);
-    await approvedSignaling.onMessage(approvedHost, {
-      data: JSON.stringify({ type: 'turn-request', requestId, permit, hostPublicKey })
-    });
+    await signaling.onMessage(host, { data: JSON.stringify({ type: 'approved' }) });
+    const requestId = '223e4567-e89b-42d3-a456-426614174001';
+    await signaling.onMessage(host, { data: JSON.stringify({ type: 'turn-request', requestId }) });
     assert.equal(fetchCount, 1);
-    assert.deepEqual(approvedHost.messages.at(-1), {
+    assert.deepEqual(host.messages.at(-1), {
       type: 'turn-credentials',
       requestId,
-      iceServers: [
-        { urls: ['stun:stun.cloudflare.com:3478'] },
-        {
-          urls: ['turn:turn.cloudflare.com:3478?transport=udp'],
-          username: 'short-lived-user',
-          credential: 'short-lived-password'
-        }
-      ]
+      iceServers: [{
+        urls: ['turn:turn.cloudflare.com:3478?transport=udp'],
+        username: 'short-lived-user',
+        credential: 'short-lived-password'
+      }]
     });
-    assert.deepEqual(approvedGuest.messages.at(-1), approvedHost.messages.at(-1));
-
-    await approvedSignaling.onMessage(approvedHost, {
-      data: JSON.stringify({
-        type: 'turn-request',
-        requestId: '223e4567-e89b-42d3-a456-426614174001',
-        permit,
-        hostPublicKey
-      })
+    assert.deepEqual(guest.messages.at(-1), host.messages.at(-1));
+    await signaling.onMessage(host, {
+      data: JSON.stringify({ type: 'turn-request', requestId: '323e4567-e89b-42d3-a456-426614174002' })
     });
     assert.equal(fetchCount, 1);
   } finally {
@@ -888,36 +959,18 @@ test('issues short-lived TURN credentials only after host approval and caches th
 test('reports missing TURN API configuration without exposing an API secret', async () => {
   const originalWebSocket = globalThis.WebSocket;
   globalThis.WebSocket = { OPEN: 1 };
-  const permitKeys = generateKeyPairSync('ed25519');
-  const permitPublicKey = permitKeys.publicKey.export({ type: 'spki', format: 'der' }).toString('base64url');
-  const roomId = 'B'.repeat(43);
-  const hostPublicKey = Buffer.alloc(91, 5).toString('base64url');
-  const permit = createTestTurnPermit(roomId, hostPublicKey, permitKeys.privateKey);
-  const host = {
-    readyState: 1,
-    messages: [],
-    send(message) { this.messages.push(JSON.parse(message)); },
-    close() { this.readyState = 3; }
-  };
-  const guest = {
-    readyState: 1,
-    messages: [],
-    send(message) { this.messages.push(JSON.parse(message)); },
-    close() { this.readyState = 3; }
-  };
+  const host = { readyState: 1, messages: [], send(message) { this.messages.push(JSON.parse(message)); }, close() { this.readyState = 3; } };
+  const guest = { readyState: 1, messages: [], send(message) { this.messages.push(JSON.parse(message)); }, close() { this.readyState = 3; } };
   try {
-    const signaling = new RoomSignaling({}, { TURN_PERMIT_PUBLIC_KEY: permitPublicKey });
+    const signaling = new RoomSignaling({});
     signaling.peers.set(host, 'host');
     signaling.peers.set(guest, 'guest');
-    signaling.roomId = roomId;
+    signaling.authenticatedSubjects.set(host, { sub: 'auth0|host-2', exp: Math.floor(Date.now() / 1000) + 600 });
+    signaling.roomId = 'B'.repeat(43);
+    signaling.turnRateLimitConfigured = true;
     await signaling.onMessage(host, { data: JSON.stringify({ type: 'approved' }) });
     await signaling.onMessage(host, {
-      data: JSON.stringify({
-        type: 'turn-request',
-        requestId: '123e4567-e89b-42d3-a456-426614174000',
-        permit,
-        hostPublicKey
-      })
+      data: JSON.stringify({ type: 'turn-request', requestId: '123e4567-e89b-42d3-a456-426614174000' })
     });
     assert.equal(host.messages.at(-1).type, 'turn-error');
     assert.deepEqual(guest.messages.at(-1), host.messages.at(-1));
@@ -970,43 +1023,29 @@ test('rate limits signaling connections before forwarding them to a room', async
   assert.equal(forwarded, 1);
 });
 
-test('creates a host-bound room permit with the offline signing tools', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'perfectpodcast-turn-permit-'));
-  const privateKeyPath = join(directory, 'permit-key.pem');
-  try {
-    const keypair = await execFileAsync(process.execPath, [
-      'scripts/create-turn-permit-keypair.js',
-      privateKeyPath
-    ]);
-    const roomId = 'C'.repeat(43);
-    const hostPublicKey = Buffer.alloc(91, 6).toString('base64url');
-    const result = await execFileAsync(
-      process.execPath,
-      ['scripts/create-turn-permit.js', roomId, hostPublicKey],
-      { env: { ...process.env, TURN_PERMIT_PRIVATE_KEY_PATH: privateKeyPath } }
-    );
-    const [payloadPart, signaturePart] = result.stdout.trim().split('.');
-    const payload = JSON.parse(Buffer.from(payloadPart, 'base64url').toString());
-    assert.equal(payload.roomId, roomId);
-    assert.equal(payload.hostKeyHash, createHash('sha256')
-      .update(Buffer.from(hostPublicKey, 'base64url'))
-      .digest('base64url'));
-    assert.equal(payload.maxGuests, 1);
-    assert.ok(payload.expiresAt > payload.issuedAt);
-    assert.equal(
-      verifyMessage(
-        null,
-        Buffer.from(turnPermitSigningMessage(payload)),
-        createPublicKey({
-          key: Buffer.from(keypair.stdout.trim(), 'base64url'),
-          format: 'der',
-          type: 'spki'
-        }),
-        Buffer.from(signaturePart, 'base64url')
-      ),
-      true
-    );
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
+test('requires Auth0 host authentication before issuing TURN test credentials', async () => {
+  const roomId = 'G'.repeat(43);
+  const response = await worker.fetch(new Request('https://pod.test/turn-test/credentials', {
+    method: 'POST',
+    headers: {
+      Origin: 'https://pod.test',
+      'Content-Type': 'application/json',
+      'CF-Connecting-IP': '192.0.2.60'
+    },
+    body: JSON.stringify({ roomId })
+  }), {
+    SIGNAL_RATE_LIMITER: { async limit() { return { success: true }; } },
+    ROOMS: { getByName() { assert.fail('Unauthenticated requests must not reach the room object.'); } }
+  });
+  assert.equal(response.status, 401);
+  assert.match((await response.json()).message, /ログイン/u);
+});
+
+test('rejects cross-origin TURN test credential requests', async () => {
+  const response = await worker.fetch(new Request('https://pod.test/turn-test/credentials', {
+    method: 'POST',
+    headers: { Origin: 'https://attacker.test', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ roomId: 'H'.repeat(43) })
+  }), {});
+  assert.equal(response.status, 403);
 });

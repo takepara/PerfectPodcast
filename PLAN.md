@@ -1,7 +1,7 @@
 # PerfectPodcast 最小実装計画
 
 改訂日: 2026-10-07
-状態: 録音・復旧、2人Opus通話、同期開始、録音中転送、ホスト側検証・ACK、再接続時inventory突合、転送状況UIの主要コードは実装済み。2026-10-07に`npm test`は60件成功。ただし2時間・実回線・数値合格基準は未検証で、公開可能な状態ではない。TURN発行コードは存在するが、TURNの資格設定・permit発行・運用・実機試験は一旦保留し、設定・有効化しない。Rate Limitingの本番namespaceも未確認。
+状態: 録音・復旧、2人Opus通話、同期開始、録音中転送、ホスト側検証・ACK、再接続時inventory突合、転送状況UIの主要コードは実装済み。Auth0 SPAログイン、Worker側JWT/permission検証、ホストセッション、未認証ゲスト参加も実装済み。`npm test`は76件成功し、Auth bundle生成とWrangler deploy dry-runも成功。2時間・実回線・数値合格基準、実Auth0ログイン、TURN relay実機試験は未検証。Auth0/Cloudflareの実値設定、本番secret登録・deploy・一般公開は行っていない。
 
 ## 1. 維持する要件と今回の変更
 
@@ -12,7 +12,7 @@
 - 参加者は自端末へ録音し、ホストPCへ回収。最終WAV生成・台帳・完了判定はホスト側で行う。
 - サーバーDB・KV・オブジェクトストレージへの音源・セッション永続保存、一時保管を行わない。
 - URLハッシュにランダムなセッションIDと招待資格を含め、参加時は名前入力・確認を必須にする。
-- ブラウザー側・中継側ともJavaScript。ユーザー登録やAuth0は不要。
+- ブラウザー側・中継側ともJavaScript。ホストはAuth0ログインと`recording:host` permissionが必須。ゲストはAuth0ログイン不要で、招待リンクから参加できる。
 
 ### 今回変更する要件
 
@@ -28,7 +28,7 @@
 
 ### 2.1 通信方式
 
-**P2P native WebRTC / Opus mono + STUNによる直接接続**を現時点の検証対象とする。managed TURNは一旦保留し、制限回線の接続保証・公開利用は行わない。
+**P2P native WebRTC / Opus mono + STUNによる直接接続とCloudflare managed TURN fallback**を実装対象とする。TURN資格発行はWorker経由で保護する。実relay経路・制限回線の接続保証・公開利用は未検証。
 
 - マイクトラックを`RTCPeerConnection.addTrack()`へ直接渡す。AudioWorklet、PCM16変換、WASMエンコーダーを通話の必須経路にしない。
 - 同じ入力をWeb Audioへ分岐し、マスターだけAudioWorklet→Worker→PCM24 WAV→IndexedDBへ保存する。
@@ -37,7 +37,7 @@
 - ブラウザーの輻輳制御・ジッターバッファー・損失隠蔽を利用する。FEC/DTXは交渉された提供範囲に任せ、SDP書き換え・独自FEC・自作帯域推定は行わない。
 - 任意のユーザー操作で「低帯域モード」24 kbps上限へ変更できるようにする。初版では統計から頻繁にbitrateを変更する独自制御を作らない。
 - bitrate設定失敗は警告し、ブラウザー既定値で継続する。Opusが選べない場合は検証対象外として開始不可にする。
-- 現状はSTUNによる直接ICE接続を試す。TURN UDP/TCP/TLS 443は保留中で、資格を設定・発行しない。STUNで接続できない回線は未対応として記録する。
+- ICEはSTUNによる直接接続を試し、必要な場合はWorkerが短命TURN資格を発行する。Auth0ホストpermissionで発行経路を保護する。実回線で`relay`候補が選択されることは未検証。
 - 現状はホストだけがofferを開始する1ホスト＋1ゲスト構成。perfect negotiationによるoffer衝突処理は未実装で、役割・交渉方式を広げる場合に再検討する。
 
 ### 2.2 再接続・診断
@@ -70,7 +70,7 @@
 | 通話 | native RTCPeerConnection / Opus | 通話音声をマスター保存しない |
 | マスター回収 | reliable RTCDataChannel | 録音中から保存確定チャンクをparticipant→hostへ転送 |
 | 接続調整 | Workers + DB保存API未使用のDurable Object | 接続中WebSocketの一時メモリーだけ |
-| NAT越え | STUNによる直接接続を検証。TURNは保留 | TURN資格・provider secretを設定せず、relayを有効化しない |
+| NAT越え | STUN直接接続とCloudflare managed TURN fallback | Workerから短命資格を取得。実relay経路の確認は未完了 |
 | ホスト保存 | IndexedDB | ゲスト音源のWAVチャンク、manifest、回収台帳。必要時にWAVを書き出す |
 | 検証 | Vitest、Playwright、ffprobe、DAW | テスト出力も端末内 |
 
@@ -100,7 +100,9 @@ R2/S3、D1、KV、DO SQL/storage、永続attachments、Queues、Workflows、ク�
 
 URLハッシュはフラグメントであり、一意性はランダムIDの極めて低い衝突確率で得る。世界全体のDB重複検査は不要。名前は本人認証ではなく表示名。XSS・空白名・長すぎる名を拒否する。
 
-### 4.2 独自認証基盤を増やさないための最小契約
+### 4.2 ピア間の接続認証
+
+ホストのアプリ利用認証にはAuth0を使い、収録開始とホスト用Worker APIには`recording:host` permissionを要求する。招待ゲストはAuth0認証なしで参加できる。以下の署名検証はAuth0とは別に、招待リンクと実際のWebRTCピアを結び付けるために維持する。
 
 - 鍵の生成・署名・検証・招待証明はWeb Cryptoを使う。独自暗号アルゴリズムを実装しない。
 - 通話／controlのWebRTC接続を先に確立し、**認証完了まではマイク送信・マスター送信を無効**にする。
@@ -110,17 +112,18 @@ URLハッシュはフラグメントであり、一意性はランダムIDの極
 - 初版は長期自動再開・鍵ローテーション・ホスト移譲なし。鍵を失った場合はWAV手動回収、新しい部屋を作成する。
 - 認証protocolは少数の固定メッセージとテストに絞るが、接続への署名bindingは省略しない。成立を検証できるまで公開利用しない。
 
-### 4.3 TURN資格の乱用対策
+### 4.3 TURN資格の乱用対策と運用
 
-**状態: 保留。** Workerの短命資格発行、Ed25519 room permit検証、鍵／permit発行CLI、ホストUIは実装済みだが、現時点では運用設定・有効化・provider接続を行わない。保留中は`TURN_PERMIT_PUBLIC_KEY`、`TURN_API_TOKEN`、`TURN_KEY_ID`等の設定、鍵／permitの生成・配布、TURN発行要求、relay試験を行わない。既存環境でこれらが設定済みかは未確認のため、本番環境があれば別途無効状態を確認する。
+**状態: Auth0によるホスト認証、Worker側JWT/permission検証、Auth0セッションcookie、ホスト限定のTURN資格発行を実装し、自動テスト済み。** 手動Ed25519 room permitと発行CLIは廃止した。ゲストは認証不要だが、招待承認後に限ってTURN資格をWorkerのシグナリング経由で受け取る。実Auth0 tenant・Cloudflare資格情報は未設定で、実ログイン・relay試験・本番運用は未実施。
 
-再開する場合は別途承認を得て、次を全て確認してから行う。コードの存在は費用上限や乱用防止の成立を意味しない。
+本番運用前に次を確認する。コードの存在は費用上限や乱用防止の成立を意味しない。
 
-- Ed25519 permitを部屋ID・ホスト公開鍵hash・期限・guest上限1人へ束縛し、秘密鍵をWorker・ブラウザー・リポジトリへ置かない。
+- Auth0 APIでRBACとAccess Tokenへのpermission追加を有効にし、ホスト対象ユーザーまたはRoleに`recording:host`を割り当てる。
+- Auth0 callback/logout/web origin、API audience、`AUTH0_DOMAIN`、`AUTH0_CLIENT_ID`、`AUTH0_AUDIENCE`、`AUTH0_HOST_PERMISSION`を確認する。Client SecretはWorkerにもブラウザーにも登録しない。
 - `SIGNAL_RATE_LIMITER`の本番bindingとCloudflareアカウント内で一意な`namespace_id`を確認する。現リポジトリ設定の`namespace_id: "1001"`は本番値として確認されていない。
 - Rate Limitingはlocationごとの近似制限であり、アカウント全体の費用hard capではない。利用上限、通知、資格発行停止手順、既発行資格の残存時間を確認する。
 - STUN接続成功をTURN成功と見なさず、実機でICE candidate typeが`relay`であることを確認する。
-- 資格TTL・再利用制御・providerログ保持・費用見積もりを再確認する。確認が揃わなければTURNを再開しない。
+- 資格TTL・providerログ保持・費用見積もりを再確認する。確認が揃わなければTURNを有効化しない。
 
 ---
 
@@ -322,13 +325,13 @@ participantは自身の転送を表示し、hostは自分のローカル保存�
 
 ### Step 2: 招待・認証・2人Opus通話
 
-成果物: URL作成、名前入力、ゲスト承認、native音声、接続状態、限定的な自動再接続。TURN作成・利用は保留。
+成果物: URL作成、名前入力、ゲスト承認、native音声、接続状態、限定的な自動再接続。TURNはpermit付き短命資格で利用し、失敗時はSTUNへフォールバックする。
 
 **実装状況:** 招待、承認、署名・DTLS fingerprint認証、2人Opus、READY、ICE restart、接続統計を実装済み。Opus優先設定はあるが、選択codecと実回線品質の確認は未完了。ICE restartは最大3回で、計画上の30秒復帰基準と手動再接続UIは未検証／未実装。
 
-**TURNは一旦保留:** permit検証・短命資格発行コードは存在するが、資格・secret・rate-limit本番namespaceを設定せず、permit発行・TURN資格要求・relay試験を行わない。現在の対象はSTUN直接接続だけ。TURN対応がないと接続できない回線があるため、一般公開・接続保証はしない。再開には別途承認が必要。
+**TURN統合状態:** Workerはホスト承認後にpermitを検証して短命資格を発行し、両端へ配信する。両端のPeerConnectionは配信資格を使い、発行失敗時はエラーを表示してSTUNへフォールバックする。診断は選択中ICE candidate pairを表示する。単体`turn-test.html`の成功は実通話統合の成功を意味しない。自動テストは成功したが、ローカル資格設定がないため2台relay実機試験は未実施。両端で`relay → relay`を確認するまでrelay通話成功と扱わない。資格を伴う本番secret設定・deploy・接続保証は対象外で、別途承認が必要。
 
-ローカル確認は`npm install`、`npm run dev`を実行し、`http://localhost:8787/recorder`を開く。単体テストは`npm test`。本番deployは保留。TURNを含む公開範囲と運用条件を再判断し、別途承認するまで行わない。
+ローカル確認は`npm install`、必要な場合は`.dev.vars`へローカル専用TURN設定を置き、`npm run dev`で`http://localhost:8787/recorder`を開く。単体テストは`npm test`。本番deployは保留。TURNを含む公開範囲と運用条件は別途判断する。
 
 収録画面では「自分のトラック」とリモート参加者のトラックを分けて表示する。リモート波形は参加者の音声トラック接続後に参加者ごとに生成し、退出・切断時に除去する。波形は受信した通話音声から描画し、マスター録音には混ぜない。初版はホスト1人＋ゲスト1人まで。
 
@@ -336,7 +339,7 @@ participantは自身の転送を表示し、hostは自分のローカル保存�
 - 32 kbps上限、実選択codecがmono/Opusであることと実bitrateを確認。録音処理を止めても通話は継続。
 - 上下256 kbps・RTT 100 ms・損失1%の試験で、2秒超の聞こえない区間0を目標にする。concealed samples等と試聴を併記し、音質合格は別判定。
 - 回線復帰後30秒以内の再接続を目標。未達でも録音継続／ローカル停止が可能で、手動再接続手段を示す。
-- TURNのUDP/TLS 443試験、資格発行の拒否試験は保留解除後に別途行う。このStepの合格条件には含めず、TURN未対応の制約を明記する。
+- ローカル2台でのTURN relay経路、双方向音声、DataChannel転送、permit／資格発行失敗時のSTUN fallbackを個別に検証する。Cloudflare本番secret・deploy、費用上限・運用・公開判断は本番運用の別承認後に行う。
 
 ### Step 3: 開始／停止・録音中回収・早期退出
 
@@ -363,7 +366,7 @@ participantは自身の転送を表示し、hostは自分のローカル保存�
 
 - 2時間実機試験、DB遅延、マイク切断、AudioContext停止、quota不足、タブ強制終了、ホスト不在、ACK喪失、ディスク満杯。
 - サーバーDB/storage/R2/永続attachment呼び出し・音源受付・秘密ログがないことを確認する。
-- STUN直接接続の2台実機試験、認証、録音開始差、再接続、転送、音源再生成を確認する。TURN relay／provider課金の試験は保留解除後に行う。
+- STUN直接接続とTURN relayの2台実機試験、認証、録音開始差、再接続、転送、音源再生成を確認する。TURNの本番provider設定・課金運用確認は別途行う。
 - rate limit binding、namespace、秘密情報の設定有無を確認する。TURNのTTL・providerログ保持・hard cap・課金停止手順は保留解除前に再評価する。
 - 限定した個人招待で2人の全合格基準を満たすまでは公開しない。合格後も多人数拡張は別判断とする。
 
@@ -398,7 +401,7 @@ participantは自身の転送を表示し、hostは自分のローカル保存�
 - 48 kHz AudioContextを実際に得られる端末に限定する。フラグメントや名前だけで接続・認証が成立するわけではない。
 - ヘッドホン必須、マイク設定の実適用確認、保存先許可、同意、退出前警告を省略しない。AEC等の無効化は要求するが、実設定の診断表示・IndexedDB persist/quota確認は未完了。
 - 実装済み: `prototype/recorder.html`ではAudioWorkletから受けたPCM24 WAVチャンクをIndexedDBへ保存し、take一覧、WAV出力、中断takeの復旧を行う。招待、署名認証、2人Opus通話、READY、予定時刻開始・実開始確認、参加者別波形、録音中DataChannel回収を実装済み。ホストは受信WAVチャンクの形式・SHA-256を検証し、IndexedDB transaction後にACKする。manifest受信時と再接続時は保存chunkを再検証し、欠落・破損を検出して再送する。転送状況UIと60秒グラフもある。
-- 未完了: Dedicated Workerへの録音処理分離、capture時刻に基づくgap検出・品質status、ローカル復旧manifest/hash検証、quota/persist確認、適応型pacing、実機・数値合格基準。TURN資格・permitコードはあるが運用と試験は保留。
+- 未完了: Dedicated Workerへの録音処理分離、capture時刻に基づくgap検出・品質status、ローカル復旧manifest/hash検証、quota/persist確認、適応型pacing、実機・数値合格基準。TURN資格発行とAuth0保護は実装済みだが、実設定・relay試験は保留。
 - 2026-10-05: Step 2の招待・承認・署名付きDTLS fingerprint検証・2人Opus通話と揮発性シグナリングの初期実装を開始。TURN資格発行、公開利用の許可、実機／回線試験は未完了。
 - 2026-10-05: ホストの録音開始・停止をゲストへシグナリングし、ゲスト側は操作できず同じタイミングで端末内録音するプロトタイプを追加。録音ファイルは各参加者の端末に個別保存される。
 - 2026-10-05: 参加者波形Canvasの寸法を固定ラッパー基準に修正。リモートCanvasのサイズ暴走によるブラウザー描画エラーを解消し、静かな入力も表示しやすくした。
@@ -414,8 +417,10 @@ participantは自身の転送を表示し、hostは自分のローカル保存�
 - 2026-10-06: 録音開始約1秒後の停止を修正。最初のPCMチャンクをWAV化する際、未定義の`makeWavHeader`を参照して保存が失敗していたため、PCM24 WAV encoderを共有モジュールへ移してテストを追加。native 44.1 kHz入力も48 kHz AudioContextへのブラウザーresampleで録音できることをChrome fake-mic smoke testで確認した。
 - 2026-10-06: 録音準備時にステレオ入力trackを誤って拒否しないよう、AudioWorklet入力をmonoへdownmixする設定を使う。転送chunk indexからIndexedDBの無効なboolean keyを除き、接続世代の文字列indexで走査するDB v3 migrationを追加。
 - 2026-10-06: IndexedDBへのチャンク保存が1秒をまたいだだけで録音を止める過剰な判定を除去。通常チャンクは最大2件の保存待ちを許容し、録音停止時の最終チャンクは常に保存queueへ入れる。上限超過時だけ明示的な保存エラーで停止する。
-- 2026-10-06: Workerに短命TURN資格の発行、Cloudflare Rate Limiting binding、オフラインEd25519署名の部屋permit検証を追加。permitは部屋ID・ホスト公開鍵hash・期限・ゲスト上限1人へ束縛し、TURN資格はDurable Objectのメモリーにのみcacheする。管理者向け鍵／permit発行CLIとホスト入力欄を追加。provider secret・permit公開鍵・rate-limit namespaceの運用設定、provider hard cap／課金停止手順、2台の実機でのrelay確認が残るため、TURNは未設定環境では発行されずSTUNへfallbackする。
+- 2026-10-06: Workerに短命TURN資格の発行、Cloudflare Rate Limiting binding、オフラインEd25519署名の部屋permit検証を追加（旧方式。後にAuth0へ置換）。permitは部屋ID・ホスト公開鍵hash・期限・ゲスト上限1人へ束縛し、TURN資格はDurable Objectのメモリーにのみcacheする。管理者向け鍵／permit発行CLIとホスト入力欄を追加した。
 - 2026-10-07: PLANと実装の差異を再確認。Node.jsの単体テスト60件は全成功。2時間・実回線・開始差・backlog・メモリー・commit p95などの合格基準は未測定。TURNは利用者判断により一旦保留し、資格設定・permit発行・relay試験・公開有効化を行わない。TURN発行コードは残すため、環境secret等が設定済みでないことも別途確認する。
+- 2026-10-07: TURN単体ページでの資格・relay疎通確認と実通話統合を区別。受信TURN資格のrequest ID照合、両端PeerConnectionへの適用、選択中ICE pair診断の自動テストを追加し`npm test`69件成功。ローカル`.dev.vars`がないため2台実通話relayは未検証。本番secret設定・deploy・公開運用は引き続き対象外。
+- 現在: ホスト向けAuth0ログインとWorker側JWT/permission検証、ゲストの匿名招待参加、TURN資格発行のホスト認証を実装。旧permitコード・CLI・UIを削除し、`TURN_SETUP.md`をAuth0設定手順へ更新。76件のテスト、Auth bundle生成、Wrangler deploy dry-runは成功。実Auth0/Cloudflare設定、実ログイン、relay実機試験、本番deployは未実施。
 
 参照資料:
 
