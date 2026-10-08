@@ -159,9 +159,11 @@
         </div>
         <div class="waveform-track">
           <div class="waveform-heading">
+            <div class="waveform-heading-control">
+              <button id="microphoneMuteButton" class="button button-quiet meter-mute-button" type="button" aria-label="マイクをミュート" aria-pressed="false" disabled>MUTE</button>
+            </div>
             <div class="waveform-track-title">
               <span class="track-indicator" aria-hidden="true"></span>
-              <button id="microphoneMuteButton" class="button button-quiet meter-mute-button" type="button" aria-label="マイクをミュート" aria-pressed="false" disabled>MUTE</button>
               <div>
                 <h3 id="waveformParticipant"></h3>
               </div>
@@ -201,6 +203,9 @@
         <template id="remoteWaveformTemplate">
           <div class="waveform-track remote-waveform-track">
             <div class="waveform-heading">
+              <div class="waveform-heading-control">
+                <span class="remote-mute-state wait" aria-live="polite" aria-label="相手のミュート状態を確認中">WAIT</span>
+              </div>
               <div class="waveform-track-title">
                 <span class="track-indicator remote-track-indicator" aria-hidden="true"></span>
                 <div>
@@ -217,9 +222,7 @@
             </div>
             <div class="waveform-monitor-grid">
               <div class="waveform-ruler-row remote-waveform-ruler-row">
-                <div class="waveform-ruler-control">
-                  <span class="remote-mute-state wait" aria-live="polite" aria-label="相手のミュート状態を確認中">WAIT</span>
-                </div>
+                <div class="waveform-ruler-spacer" aria-hidden="true"></div>
                 <div class="waveform-timeline">
                   <span>00:00</span><span>00:15</span><span>00:30</span><span>00:45</span><span>01:00</span>
                 </div>

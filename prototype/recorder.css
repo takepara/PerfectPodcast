@@ -130,13 +130,14 @@ h1 { margin-bottom: 0; font-family: Georgia, "Yu Mincho", serif; font-size: clam
 .waveform-visual-row { align-items: stretch; }
 .waveform-ruler-control { display: flex; justify-content: center; align-items: center; }
 .waveform-ruler-spacer { min-width: 0; }
-.waveform-track-title .meter-mute-button { width: 76px; min-width: 76px; padding: 2px 7px; }
+.waveform-heading-control { display: flex; justify-content: center; align-items: center; }
+.waveform-heading-control .meter-mute-button { width: 64px; min-width: 64px; padding: 2px 3px; }
 .waveform-visual { min-width: 0; }
 .meter-block { display: grid; width: 74px; height: var(--waveform-box-height); grid-template-rows: minmax(0, 1fr); justify-items: center; align-items: stretch; }
 .meter-label { color: var(--muted); font-size: 12px; font-weight: 750; text-align: center; }
 .meter-mute-button { width: 100%; min-height: 24px; margin: 0; padding: 2px 3px; font: inherit; letter-spacing: .06em; }
 .meter-mute-button[aria-pressed="true"] { border-color: var(--coral); background: #3a2027; color: #ff8792; }
-.meter { display: flex; width: 16px; height: 100%; min-height: 0; align-items: flex-end; overflow: hidden; border-radius: 2px; background: #303640; }
+.meter { display: flex; width: 24px; height: 100%; min-height: 0; align-items: flex-end; overflow: hidden; border-radius: 2px; background: #303640; }
 .meter-fill { width: 100%; height: 0; border-radius: inherit; background: #829598; transition: height .08s linear, background-color .12s; }
 .meter-fill.good { background: var(--teal); }
 .meter-fill.near-clip { background: #edc76a; }
@@ -199,14 +200,15 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
 .remote-waveform-tracks:empty { display: none; }
 .remote-waveform-tracks:not(:empty) { margin-top: 22px; border-top: 1px solid var(--line); padding-top: 17px; }
 .remote-waveform-tracks .waveform-track + .waveform-track { margin-top: 22px; border-top: 1px solid var(--line); padding-top: 17px; }
-.waveform-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.waveform-heading { display: grid; grid-template-columns: 74px minmax(0, 1fr) auto; align-items: center; gap: 12px; }
 .waveform-input-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; min-width: 0; max-width: 100%; }
 .waveform-device-field { min-width: 0; width: 240px; max-width: 100%; }
 .waveform-device-field select { width: 100%; }
 .waveform-device-field select:disabled { opacity: .5; cursor: not-allowed; }
 .waveform-device-field select.remote-waveform-device:disabled { opacity: 1; cursor: default; }
 .waveform-device-hint { margin: 10px 0 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
-.waveform-track-title { display: flex; align-items: center; gap: 11px; }
+.waveform-track-title { position: relative; display: flex; min-width: 0; align-items: center; }
+.waveform-track-title > .track-indicator { position: absolute; left: -8px; }
 .track-indicator { width: 3px; height: 32px; border-radius: 2px; background: var(--teal); box-shadow: 0 0 12px rgb(85 214 178 / 35%); }
 .remote-track-indicator { background: var(--coral); box-shadow: 0 0 12px rgb(255 89 107 / 35%); }
 .waveform-track-title h3 { margin: 0 0 3px; font-size: 11px; font-weight: 850; }
@@ -214,7 +216,7 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
 .waveform-state { border: 1px solid var(--line); border-radius: 3px; padding: 5px 8px; color: var(--muted); font-size: 8px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .waveform-state.live { border-color: rgb(85 214 178 / 35%); background: var(--teal-soft); color: var(--teal); }
 .waveform-state.remote-live { border-color: rgb(255 89 107 / 35%); background: #3a2027; color: #ff8792; }
-.remote-mute-state { display: inline-flex; width: 76px; min-width: 76px; justify-content: center; border: 1px solid var(--line); border-radius: 3px; padding: 5px 8px; color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: .06em; white-space: nowrap; }
+.remote-mute-state { display: inline-flex; width: 64px; min-width: 64px; height: 24px; min-height: 24px; justify-content: center; align-items: center; border: 1px solid var(--line); border-radius: 3px; padding: 2px 3px; color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: .06em; white-space: nowrap; }
 .remote-mute-state.muted { border-color: rgb(255 89 107 / 45%); background: #3a2027; color: #ff8792; }
 .remote-mute-state.unmuted { border-color: rgb(85 214 178 / 35%); background: var(--teal-soft); color: var(--teal); }
 .waveform-timeline { display: flex; justify-content: space-between; margin: 18px 0 5px 43px; color: #69727f; font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -373,9 +375,9 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
 .terminal-ui .meter-block { width: 74px; margin-bottom: 0; }
 .terminal-ui .meter-label { margin: 0; color: var(--muted); font-family: inherit; font-size: 12px; }
 .terminal-ui .meter-mute-button { min-height: 24px; border-radius: 2px; font: inherit; }
-.terminal-ui .waveform-track-title .meter-mute-button { width: 76px; min-width: 76px; min-height: 24px; margin: 0; padding: 2px 7px; font-size: 12px; }
+.terminal-ui .waveform-heading-control .meter-mute-button { width: 64px; min-width: 64px; min-height: 24px; margin: 0; padding: 2px 3px; font-size: 12px; }
 .terminal-ui .meter-mute-button[aria-pressed="true"] { border-color: #8f3c43; background: #211315; color: var(--coral); }
-.terminal-ui .meter { width: 16px; height: 100%; min-height: 0; border-radius: 0; background: #17231b; }
+.terminal-ui .meter { width: 24px; height: 100%; min-height: 0; border-radius: 0; background: #17231b; }
 .terminal-ui .meter-fill { border-radius: 0; background: #526b56; }
 .terminal-ui .meter-fill.good { background: var(--teal); }
 .terminal-ui .meter-fill.near-clip { background: var(--yellow); }
@@ -421,8 +423,8 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
 .terminal-ui .waveform-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; border-bottom: 1px dashed var(--line); padding-bottom: 10px; }
 .terminal-ui .waveform-panel-heading h2 { margin: 0; font-size: 16px; letter-spacing: .02em; }
 .terminal-ui .waveform-panel-heading .terminal-section-code { margin: 0 0 4px; }
-.terminal-ui .waveform-heading { gap: 9px; }
-.terminal-ui .waveform-track-title { gap: 8px; }
+.terminal-ui .waveform-heading { gap: 12px; }
+.terminal-ui .waveform-track-title { gap: 0; }
 .terminal-ui .track-indicator { width: 3px; height: 27px; border-radius: 0; background: var(--teal); box-shadow: none; }
 .terminal-ui .remote-track-indicator { background: var(--coral); box-shadow: none; }
 .terminal-ui .waveform-track-title h3 { font-family: inherit; font-size: 14px; }
@@ -433,7 +435,7 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
 .terminal-ui .waveform-state { border-color: var(--line); border-radius: 2px; color: var(--muted); font-family: inherit; font-size: 12px; }
 .terminal-ui .waveform-state.live { border-color: #326b45; background: #112a1a; color: var(--teal); }
 .terminal-ui .waveform-state.remote-live { border-color: #66383b; background: #211315; color: var(--coral); }
-.terminal-ui .remote-mute-state { border-color: var(--line); border-radius: 2px; font-family: inherit; font-size: 12px; }
+.terminal-ui .remote-mute-state { border-color: var(--line); border-radius: 2px; font-family: inherit; font-size: 10px; }
 .terminal-ui .remote-mute-state.muted { border-color: #66383b; background: #211315; color: var(--coral); }
 .terminal-ui .remote-mute-state.unmuted { border-color: #326b45; background: #112a1a; color: var(--teal); }
 .terminal-ui .waveform-timeline { margin: 10px 0 4px 11px; color: var(--muted); font: 12px ui-monospace, monospace; }
@@ -485,7 +487,8 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
   .terminal-ui .guest-request-actions { justify-content: start; }
   .terminal-ui .remote-audio-row { align-items: start; flex-direction: column; }
   .terminal-ui .waveform-panel-heading { align-items: start; flex-direction: column; }
-  .terminal-ui .waveform-heading { align-items: start; flex-direction: column; }
+  .terminal-ui .waveform-heading { grid-template-columns: 64px minmax(0, 1fr); align-items: start; gap: 8px; }
+  .terminal-ui .waveform-input-controls { grid-column: 1 / -1; }
   .terminal-ui .waveform-input-controls { width: 100%; }
   .terminal-ui .waveform-device-field { width: min(100%, 280px); }
   .terminal-ui .waveform-monitor-grid { --waveform-box-height: 52px; }

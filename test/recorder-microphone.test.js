@@ -289,7 +289,8 @@ test('shows microphone selection only beside the local waveform and removes diag
   assert.match(html, /class="meter remote-waveform-meter"/);
   const remoteTemplate = html.slice(html.indexOf('<template id="remoteWaveformTemplate"'));
   assert.match(remoteTemplate, /<div class="waveform-input-controls">[\s\S]*?<label class="field waveform-device-field remote-waveform-device-field">[\s\S]*?<select class="remote-waveform-device"[^>]*disabled/);
-  assert.match(remoteTemplate, /class="waveform-ruler-row remote-waveform-ruler-row">[\s\S]*?class="remote-mute-state wait" aria-live="polite"[\s\S]*?class="waveform-timeline"/);
+  assert.match(remoteTemplate, /class="waveform-heading-control">[\s\S]*?class="remote-mute-state wait" aria-live="polite"[\s\S]*?class="waveform-track-title"/);
+  assert.match(remoteTemplate, /class="waveform-ruler-row remote-waveform-ruler-row">[\s\S]*?class="waveform-ruler-spacer"[\s\S]*?class="waveform-timeline"/);
   assert.match(remoteTemplate, /class="waveform-visual-row remote-waveform-visual-row">[\s\S]*?class="meter-block remote-meter-block">[\s\S]*?class="meter remote-waveform-meter"[\s\S]*?waveform-canvas-wrap/);
   assert.match(html, /<h3 id="waveformParticipant"><\/h3>/);
   assert.match(remoteTemplate, /<h3 class="remote-waveform-participant"><\/h3>/);

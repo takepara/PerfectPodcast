@@ -169,19 +169,23 @@ test('places the vertical input meter beside the local waveform', () => {
   assert.equal(recordPanel.includes('meter-block'), false);
   const waveformTrack = recorder.slice(recorder.indexOf('<div class="waveform-track">'), recorder.indexOf('<div id="remoteWaveformTracks"'));
   assert.match(waveformTrack, /waveform-visual-row[\s\S]*meter-block[\s\S]*role="meter" aria-orientation="vertical"[\s\S]*waveform-canvas-wrap/);
-  assert.match(waveformTrack, /waveform-track-title[\s\S]*microphoneMuteButton[\s\S]*waveformParticipant/);
+  assert.match(waveformTrack, /waveform-heading-control[\s\S]*microphoneMuteButton[\s\S]*waveform-track-title[\s\S]*waveformParticipant/);
   assert.match(waveformTrack, /waveform-ruler-row[\s\S]*waveform-ruler-spacer[\s\S]*waveMark0[\s\S]*waveform-visual-row/);
 
   const source = readPrototype('recorder.js');
   assert.match(source, /fill\.style\.height = `\$\{percent\}%`/);
   const css = readPrototype('recorder.css');
   assert.match(css, /\.meter \{ display: flex;[^}]*align-items: flex-end;/);
+  assert.match(css, /\.waveform-heading \{ display: grid; grid-template-columns: 74px minmax\(0, 1fr\) auto;/);
+  assert.match(css, /\.waveform-ruler-row, \.waveform-visual-row \{ display: grid; grid-template-columns: 74px minmax\(0, 1fr\);/);
+  assert.match(css, /\.terminal-ui \.meter \{ width: 24px; height: 100%; min-height: 0;/);
+  assert.match(css, /\.terminal-ui \.waveform-heading \{ gap: 12px; \}/);
   assert.match(css, /\.waveform-monitor-grid \{ --waveform-box-height: 100px;/);
   assert.match(css, /\.meter-block \{[^}]*height: var\(--waveform-box-height\); grid-template-rows: minmax\(0, 1fr\);/);
   assert.match(css, /\.waveform-canvas-wrap \{ height: var\(--waveform-box-height\);/);
   assert.match(css, /\.terminal-ui \.waveform-monitor-grid \{ --waveform-box-height: 62px; \}/);
-  assert.match(css, /\.terminal-ui \.waveform-track-title \.meter-mute-button \{ width: 76px; min-width: 76px; min-height: 24px; margin: 0; padding: 2px 7px; font-size: 12px; \}/);
-  assert.match(css, /\.remote-mute-state \{ display: inline-flex; width: 76px; min-width: 76px; justify-content: center;/);
+  assert.match(css, /\.terminal-ui \.waveform-heading-control \.meter-mute-button \{ width: 64px; min-width: 64px; min-height: 24px; margin: 0; padding: 2px 3px; font-size: 12px; \}/);
+  assert.match(css, /\.remote-mute-state \{ display: inline-flex; width: 64px; min-width: 64px; height: 24px; min-height: 24px; justify-content: center; align-items: center;/);
   assert.match(css, /\.terminal-ui \.waveform-ruler-row \{ font: 12px ui-monospace, monospace; \}/);
   assert.match(css, /\.meter-fill \{[^}]*transition: height \.08s linear/);
 });
