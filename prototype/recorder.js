@@ -47,7 +47,6 @@ let activeTake = null;
 let audioContext = null;
 let mediaStream = null;
 let recorderAudioContextSampleRate = null;
-let sampleSizeConstraintFallback = false;
 let sourceNode = null;
 let analyserNode = null;
 let recorderNode = null;
@@ -1261,26 +1260,13 @@ async function ensureCaptureStream() {
   if (!navigator.mediaDevices?.getUserMedia) throw new Error('マイク取得に対応していません。Chrome または Edge を使用してください。');
   clearCaptureTrackSettingsListeners();
   recorderAudioContextSampleRate = null;
-  sampleSizeConstraintFallback = false;
-  const audioConstraints = {
-    deviceId: { exact: micDevice.value },
-    ...RAW_AUDIO_CONSTRAINTS,
-    sampleRate: TARGET_RATE
-  };
-  try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: { ...audioConstraints, sampleSize: { exact: 24 } }
-    });
-  } catch (error) {
-    const failedConstraint = error.constraint || error.constraintName;
-    const canRetryWithoutSampleSize = error.name === 'OverconstrainedError' ||
-      (['NotSupportedError', 'TypeError'].includes(error.name) &&
-        (!failedConstraint || failedConstraint === 'sampleSize'));
-    if (!canRetryWithoutSampleSize) throw error;
-    sampleSizeConstraintFallback = true;
-    renderCaptureAudioTrackSettings();
-    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
-  }
+  mediaStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      deviceId: { exact: micDevice.value },
+      ...RAW_AUDIO_CONSTRAINTS,
+      sampleRate: TARGET_RATE
+    }
+  });
   observeCaptureAudioTracks();
   return mediaStream;
 }
@@ -1315,12 +1301,7 @@ function formatTrackValue(value, unit = '') {
 
 function renderCaptureAudioTrackSettings() {
   const container = $('audioTrackSettings');
-  const requestStatus = $('audioTrackRequestStatus');
   const tracks = mediaStream?.getAudioTracks() ?? [];
-  requestStatus.textContent = sampleSizeConstraintFallback
-    ? '24-bit指定を含む入力要求で取得できなかったため、指定を外して再試行しました。下の報告値を確認してください。'
-    : 'マイク取得時に sampleSize: { exact: 24 } を要求しています。実際の値は下の各トラックの報告値を確認してください。';
-  requestStatus.classList.toggle('warning', sampleSizeConstraintFallback);
   container.replaceChildren();
   if (!tracks.length) {
     const message = document.createElement('p');
@@ -1345,7 +1326,6 @@ function renderCaptureAudioTrackSettings() {
       ? (track.muted ? '一時停止中' : '有効')
       : '終了');
     appendTrackSetting(list, 'トラックのサンプルレート', formatTrackValue(trackRate, ' Hz'));
-    appendTrackSetting(list, 'トラックのサンプルサイズ', formatTrackValue(settings.sampleSize, ' bit'));
     appendTrackSetting(list, 'チャンネル数', formatTrackValue(settings.channelCount));
     appendTrackSetting(list, '録音AudioContext', formatTrackValue(contextRate, ' Hz'));
     appendTrackSetting(list, 'エコーキャンセル', formatTrackValue(settings.echoCancellation));
