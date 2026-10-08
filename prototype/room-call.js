@@ -145,24 +145,6 @@ function networkMessageSummary(message) {
   return [`type=${type}`, ...fields].join(' ');
 }
 
-function dataChannelPayloadSummary(data) {
-  if (typeof data !== 'string') {
-    const byteLength = data instanceof ArrayBuffer
-      ? data.byteLength
-      : ArrayBuffer.isView(data)
-        ? data.byteLength
-        : data instanceof Blob
-          ? data.size
-          : null;
-    return byteLength === null ? 'binary payload' : `binary bytes=${byteLength}`;
-  }
-  try {
-    return networkMessageSummary(JSON.parse(data));
-  } catch {
-    return `text bytes=${new TextEncoder().encode(data).byteLength}`;
-  }
-}
-
 export function findSelectedIceCandidatePair(reports) {
   const reportList = [...reports.values()];
   const selectedPairIds = new Set(reportList
@@ -190,6 +172,8 @@ export class RoomCall {
     onLocalStream,
     onSessionName,
     onNetworkEvent,
+    prepareRecordingAudioContext,
+    releasePreparedRecordingAudioContext,
     getNextTransferChunk,
     prepareTransferChunk,
     markTransferChunkStored,
@@ -213,6 +197,8 @@ export class RoomCall {
     this.onLocalStream = onLocalStream;
     this.onSessionName = onSessionName;
     this.onNetworkEvent = onNetworkEvent;
+    this.prepareRecordingAudioContext = prepareRecordingAudioContext;
+    this.releasePreparedRecordingAudioContext = releasePreparedRecordingAudioContext;
     this.onError = onError;
     this.hasPendingTransfer = hasPendingTransfer;
     this.recordingTransfer = new RecordingTransfer({
@@ -256,8 +242,7 @@ export class RoomCall {
       onStatus: (message, isError = false) => {
         if (isError) this.logNetworkEvent('Transfer error', message);
         this.setStatus(message, isError);
-      },
-      onNetworkEvent: (event, details) => this.logNetworkEvent(event, details)
+      }
     });
     this.socket = null;
     this.peerConnection = null;
@@ -465,7 +450,12 @@ export class RoomCall {
         observedAt,
         frame
       });
+      this.logNetworkEvent(
+        'Recording start confirmation sent',
+        `event=${event.eventId} sequence=${event.sequence} observedAt=${observedAt.toFixed(3)} ms`
+      );
     } catch (error) {
+      this.logNetworkEvent('Recording start confirmation failed', error.message);
       this.setStatus(`Unable to send the recording start confirmation to the host: ${error.message}`, true);
     }
   }
@@ -488,10 +478,33 @@ export class RoomCall {
   }
 
   receiveRecordingStarted(message) {
-    if (this.localRole !== 'host' || message.generation !== this.authFields?.generation) return;
+    if (this.localRole !== 'host') return;
+    if (message.generation !== this.authFields?.generation) {
+      this.logNetworkEvent('Recording start confirmation ignored', 'generation mismatch');
+      return;
+    }
     const pending = this.pendingStartEvents.get(message.eventId);
-    if (!pending || pending.sequence !== message.sequence || message.frame !== 0 ||
-        !Number.isFinite(message.observedAt)) return;
+    if (!pending) {
+      this.logNetworkEvent(
+        'Recording start confirmation ignored',
+        `event=${message.eventId} no pending start event (timed out, canceled, or already completed)`
+      );
+      return;
+    }
+    if (pending.sequence !== message.sequence) {
+      this.logNetworkEvent(
+        'Recording start confirmation ignored',
+        `event=${message.eventId} sequence mismatch expected=${pending.sequence} received=${message.sequence}`
+      );
+      return;
+    }
+    if (message.frame !== 0 || !Number.isFinite(message.observedAt)) {
+      this.logNetworkEvent(
+        'Recording start confirmation ignored',
+        `event=${message.eventId} invalid frame or observedAt`
+      );
+      return;
+    }
     pending.remoteStartedAt = message.observedAt - pending.clockOffsetMs;
     this.logNetworkEvent(
       'Recording start remote',
@@ -644,9 +657,7 @@ export class RoomCall {
       this.lastInputMonitorSentState.muted !== this.localInputMonitorState.muted ||
       this.lastInputMonitorSentState.deviceLabel !== this.localInputMonitorState.deviceLabel;
     if (!stateChanged && performance.now() - this.lastInputMonitorSentAt < 100) return;
-    const message = { type: 'input-state', ...this.localInputMonitorState };
-    channel.send(JSON.stringify(message));
-    this.logNetworkEvent('DataChannel TX', `input-monitor-v1 ${networkMessageSummary(message)}`);
+    channel.send(JSON.stringify({ type: 'input-state', ...this.localInputMonitorState }));
     this.lastInputMonitorSentAt = performance.now();
     this.lastInputMonitorSentState = {
       muted: this.localInputMonitorState.muted,
@@ -904,6 +915,12 @@ export class RoomCall {
         if (Number.isFinite(pending.hostStartedAt)) message.hostStartedAt = pending.hostStartedAt;
       }
       this.send(message);
+      if (!pending.recording) {
+        this.logNetworkEvent(
+          'Recording stop command sent',
+          `event=${pending.eventId} sequence=${pending.sequence}`
+        );
+      }
       pending.timer = window.setTimeout(() => {
         if (this.pendingRecordingCommands.get(pending.eventId) !== pending) return;
         if (pending.retries < 3) {
@@ -980,6 +997,12 @@ export class RoomCall {
     }
     this.lastGuestRecordingSequence = message.sequence;
     this.remoteRecordingState = message.recording;
+    if (!message.recording) {
+      this.logNetworkEvent(
+        'Recording stop command received',
+        `event=${message.eventId} sequence=${message.sequence}`
+      );
+    }
     const command = {
       eventId: message.eventId,
       sequence: message.sequence,
@@ -1337,6 +1360,7 @@ export class RoomCall {
     $('joinRoomButton').disabled = true;
     this.setStatus('Checking microphone and requesting to join…');
     try {
+      this.prepareRecordingAudioContext?.();
       await this.getMicrophoneStream();
       this.guestIdentity = await crypto.subtle.generateKey(
         { name: 'ECDSA', namedCurve: 'P-256' },
@@ -1358,6 +1382,7 @@ export class RoomCall {
         publicKey,
         proof
       });
+      this.logNetworkEvent('Join request sent', `issuedAt=${issuedAt}`);
       this.setStatus('Join request sent. Waiting for the host to approve.');
       this.setCallState('Waiting for host approval');
       this.setRemoteWaveState('Awaiting approval');
@@ -1386,17 +1411,12 @@ export class RoomCall {
       socket.addEventListener('open', () => {
         this.logNetworkEvent('Signaling socket', 'open');
         socket.send(JSON.stringify({ type: 'join', role }));
-        this.logNetworkEvent('Signal TX', networkMessageSummary({ type: 'join', role }));
       }, { once: true });
       socket.addEventListener('message', (event) => {
         let message;
         try {
           message = JSON.parse(event.data);
         } catch {
-          const bytes = typeof event.data === 'string'
-            ? new TextEncoder().encode(event.data).byteLength
-            : event.data?.size ?? event.data?.byteLength ?? 0;
-          this.logNetworkEvent('Signal RX', `invalid JSON bytes=${bytes}`);
           socket.close();
           if (!settled) {
             settled = true;
@@ -1405,7 +1425,6 @@ export class RoomCall {
           }
           return;
         }
-        this.logNetworkEvent('Signal RX', networkMessageSummary(message));
         if (message.type === 'joined' && !settled) {
           settled = true;
           window.clearTimeout(timeout);
@@ -1447,7 +1466,6 @@ export class RoomCall {
       throw new Error('There is no signaling connection to the other participant.');
     }
     this.socket.send(JSON.stringify(message));
-    this.logNetworkEvent('Signal TX', networkMessageSummary(message));
   }
 
   setSessionName(name) {
@@ -1630,6 +1648,7 @@ export class RoomCall {
   }
 
   async receiveJoinRequest(message) {
+    this.logNetworkEvent('Join request received');
     if (this.pendingGuest || this.peerConnection || this.getRecordingState()) {
       this.send({ type: 'denied' });
       return;
@@ -1764,15 +1783,6 @@ export class RoomCall {
     });
     channel.addEventListener('error', () => {
       this.logNetworkEvent('DataChannel state', `${String(channel.label).slice(0, 64)} error`);
-    });
-    channel.addEventListener('message', ({ data }) => {
-      this.logNetworkEvent('DataChannel RX', `${String(channel.label).slice(0, 64)} ${dataChannelPayloadSummary(data)}`);
-    });
-    channel.addEventListener('bufferedamountlow', () => {
-      this.logNetworkEvent(
-        'DataChannel buffer',
-        `${String(channel.label).slice(0, 64)} bufferedAmount=${channel.bufferedAmount}`
-      );
     });
   }
 
@@ -1999,29 +2009,6 @@ export class RoomCall {
       const stats = $('connectionStats');
       stats.hidden = false;
       stats.textContent = parts.length ? parts.join(' · ') : '—';
-      const localCandidate = pair && reports.get(pair.localCandidateId);
-      const remoteCandidate = pair && reports.get(pair.remoteCandidateId);
-      const networkDetails = [
-        `connection=${peerConnection.connectionState}`,
-        `ice=${peerConnection.iceConnectionState}`,
-        `path=${localCandidate?.candidateType || 'unknown'}/${localCandidate?.protocol || 'unknown'}→${remoteCandidate?.candidateType || 'unknown'}/${remoteCandidate?.protocol || 'unknown'}`
-      ];
-      if (pair?.currentRoundTripTime !== undefined) {
-        networkDetails.push(`rtt=${(pair.currentRoundTripTime * 1000).toFixed(2)}ms`);
-      }
-      if (inbound?.jitter !== undefined) networkDetails.push(`jitter=${(inbound.jitter * 1000).toFixed(2)}ms`);
-      if (intervalStats.packetLossPercent !== null) {
-        networkDetails.push(`loss=${intervalStats.packetLossPercent.toFixed(2)}%`);
-      }
-      if (intervalStats.bitrateKbps !== null) {
-        networkDetails.push(`audioSend=${intervalStats.bitrateKbps.toFixed(2)}kbps`);
-      }
-      if (Number.isFinite(this.transferSendMbps)) {
-        networkDetails.push(`transferSend=${this.transferSendMbps.toFixed(3)}Mbps`);
-      }
-      if (Number.isFinite(outbound?.bytesSent)) networkDetails.push(`audioBytesSent=${outbound.bytesSent}`);
-      if (Number.isFinite(inbound?.bytesReceived)) networkDetails.push(`audioBytesReceived=${inbound.bytesReceived}`);
-      this.logNetworkEvent('WebRTC stats', networkDetails.join(' '));
     } catch (error) {
       if (this.peerConnection !== peerConnection) return;
       $('connectionStats').hidden = false;
@@ -2265,6 +2252,7 @@ export class RoomCall {
     this.pendingRecordingCommands.clear();
     this.clearPendingClockProbes();
     this.clearPendingStartEvents();
+    this.releasePreparedRecordingAudioContext?.();
     this.clockOffsetMs = null;
     const previousRole = this.localRole;
     const wasConnected = this.connected;

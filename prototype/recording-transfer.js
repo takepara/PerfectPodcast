@@ -106,8 +106,7 @@ export class RecordingTransfer {
     reconcileTransferInventory,
     storeChunk,
     storeManifest,
-    onStatus,
-    onNetworkEvent
+    onStatus
   }) {
     this.role = role;
     this.isAuthorized = isAuthorized;
@@ -122,7 +121,6 @@ export class RecordingTransfer {
     this.storeChunk = storeChunk;
     this.storeManifest = storeManifest;
     this.onStatus = onStatus;
-    this.onNetworkEvent = onNetworkEvent;
     this.channel = null;
     this.pendingAcks = new Map();
     this.currentChunk = null;
@@ -190,36 +188,6 @@ export class RecordingTransfer {
 
   sendData(data) {
     this.channel.send(data);
-    if (typeof data !== 'string') {
-      const byteLength = data instanceof ArrayBuffer
-        ? data.byteLength
-        : ArrayBuffer.isView(data)
-          ? data.byteLength
-          : data instanceof Blob
-            ? data.size
-            : 0;
-      this.onNetworkEvent?.('DataChannel TX', `master-transfer-v1 binary bytes=${byteLength}`);
-      return;
-    }
-    let message;
-    try {
-      message = JSON.parse(data);
-    } catch {
-      this.onNetworkEvent?.('DataChannel TX', `master-transfer-v1 text bytes=${new TextEncoder().encode(data).byteLength}`);
-      return;
-    }
-    const type = typeof message?.type === 'string' && /^[a-z0-9-]{1,60}$/iu.test(message.type)
-      ? message.type
-      : 'unknown';
-    const fields = [];
-    for (const key of ['takeId', 'sequence', 'startFrame', 'frames', 'totalBytes', 'count', 'accepted', 'startedAt']) {
-      const value = message[key];
-      if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value)) ||
-          (typeof value === 'string' && /^[0-9a-f-]{36}$/iu.test(value))) {
-        fields.push(`${key}=${value}`);
-      }
-    }
-    this.onNetworkEvent?.('DataChannel TX', `master-transfer-v1 type=${type}${fields.length ? ` ${fields.join(' ')}` : ''}`);
   }
 
   wake() {

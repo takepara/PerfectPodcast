@@ -658,7 +658,7 @@ test('sends host session-name updates to a connected guest and applies them on t
   assert.deepEqual(received, ['Recording 10/08 21:52']);
 });
 
-test('logs signaling messages with timing fields but without arbitrary payloads', () => {
+test('does not log signaling message traffic', () => {
   const originalWebSocket = globalThis.WebSocket;
   globalThis.WebSocket = { OPEN: 1 };
   try {
@@ -679,14 +679,34 @@ test('logs signaling messages with timing fields but without arbitrary payloads'
       secret: 'must-not-be-logged'
     });
     assert.equal(sent.length, 1);
-    assert.deepEqual(events, [{
-      event: 'Signal TX',
-      details: 'type=recording-state eventId=123e4567-e89b-42d3-a456-426614174000 sequence=4 recording=true startAt=12345.5 clockOffsetMs=-2.25'
-    }]);
+    assert.deepEqual(events, []);
   } finally {
     if (originalWebSocket === undefined) delete globalThis.WebSocket;
     else globalThis.WebSocket = originalWebSocket;
   }
+});
+
+test('logs join requests sent and received without exposing guest identity', async () => {
+  assert.match(
+    RoomCall.prototype.requestJoin.toString(),
+    /this\.prepareRecordingAudioContext\?\.\(\);[\s\S]*?await this\.getMicrophoneStream\(\)/
+  );
+  assert.match(
+    RoomCall.prototype.requestJoin.toString(),
+    /this\.send\(\{[\s\S]*?type: 'join-request'[\s\S]*?\}\);\s*this\.logNetworkEvent\('Join request sent', `issuedAt=\$\{issuedAt\}`\)/
+  );
+
+  const receivedEvents = [];
+  const host = Object.create(RoomCall.prototype);
+  Object.assign(host, {
+    pendingGuest: {},
+    peerConnection: null,
+    getRecordingState: () => false,
+    send() {},
+    onNetworkEvent: (event, details) => receivedEvents.push({ event, details })
+  });
+  await host.receiveJoinRequest({ name: 'Private guest name' });
+  assert.deepEqual(receivedEvents, [{ event: 'Join request received', details: '' }]);
 });
 
 test('resets remote waveform history to the local recording start time', () => {
@@ -873,6 +893,120 @@ test('passes the host wall-clock start timestamp to the guest recorder', async (
   } finally {
     if (originalWebSocket === undefined) delete globalThis.WebSocket;
     else globalThis.WebSocket = originalWebSocket;
+  }
+});
+
+test('logs guest recording-start confirmation dispatch and host unmatched confirmation', () => {
+  const originalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = { OPEN: 1 };
+  try {
+    const generation = '0123456789abcdefghij_-';
+    const sent = [];
+    const guestEvents = [];
+    const guest = Object.create(RoomCall.prototype);
+    Object.assign(guest, {
+      localRole: 'guest',
+      authFields: { generation },
+      socket: { readyState: 1, send: (message) => sent.push(JSON.parse(message)) },
+      onNetworkEvent: (event, details) => guestEvents.push({ event, details })
+    });
+    guest.notifyRecordingStarted(
+      { eventId: '123e4567-e89b-42d3-a456-426614174000', sequence: 3 },
+      456.789,
+      0
+    );
+    assert.equal(sent[0].type, 'recording-started');
+    assert.deepEqual(guestEvents.map(({ event }) => event), [
+      'Recording start local',
+      'Recording start confirmation sent'
+    ]);
+
+    const hostEvents = [];
+    const host = Object.create(RoomCall.prototype);
+    Object.assign(host, {
+      localRole: 'host',
+      authFields: { generation },
+      pendingStartEvents: new Map(),
+      onNetworkEvent: (event, details) => hostEvents.push({ event, details })
+    });
+    host.receiveRecordingStarted({
+      eventId: '123e4567-e89b-42d3-a456-426614174000',
+      sequence: 3,
+      generation,
+      observedAt: 456.789,
+      frame: 0
+    });
+    assert.deepEqual(hostEvents, [{
+      event: 'Recording start confirmation ignored',
+      details: 'event=123e4567-e89b-42d3-a456-426614174000 no pending start event (timed out, canceled, or already completed)'
+    }]);
+  } finally {
+    if (originalWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = originalWebSocket;
+  }
+});
+
+test('logs synchronized recording stop commands when sent and received', async () => {
+  const originalWindow = globalThis.window;
+  globalThis.window = {
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout
+  };
+  try {
+    const eventId = '123e4567-e89b-42d3-a456-426614174000';
+    const hostEvents = [];
+    const pending = {
+      recording: false,
+      eventId,
+      sequence: 4,
+      generation: 'generation',
+      retries: 0,
+      timer: null
+    };
+    const host = Object.create(RoomCall.prototype);
+    Object.assign(host, {
+      pendingRecordingCommands: new Map([[eventId, pending]]),
+      pendingStartEvents: new Map(),
+      onNetworkEvent: (event, details) => hostEvents.push({ event, details }),
+      send() {},
+      setStatus() {}
+    });
+    host.sendRecordingCommand(pending);
+    window.clearTimeout(pending.timer);
+    assert.deepEqual(hostEvents, [{
+      event: 'Recording stop command sent',
+      details: `event=${eventId} sequence=4`
+    }]);
+
+    const guestEvents = [];
+    const guest = Object.create(RoomCall.prototype);
+    Object.defineProperties(guest, {
+      connected: { value: true },
+      isPeerReadyForRecording: { value: true }
+    });
+    Object.assign(guest, {
+      localRole: 'guest',
+      authFields: { generation: 'generation' },
+      guestRecordingCommands: new Map(),
+      lastGuestRecordingSequence: 0,
+      onNetworkEvent: (event, details) => guestEvents.push({ event, details }),
+      applyGuestRecordingCommand: async () => {},
+      sendRecordingAck() {}
+    });
+    await guest.receiveRecordingState({
+      type: 'recording-state',
+      recording: false,
+      eventId,
+      sequence: 4,
+      generation: 'generation'
+    });
+    assert.deepEqual(guestEvents, [{
+      event: 'Recording stop command received',
+      details: `event=${eventId} sequence=4`
+    }]);
+  } finally {
+    if (originalWindow === undefined) delete globalThis.window;
+    else globalThis.window = originalWindow;
   }
 });
 

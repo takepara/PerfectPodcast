@@ -306,6 +306,7 @@ test('keeps waveform rendering limited to active recording for every participant
   assert.doesNotMatch(drawWaveform, /previewAnalyserNode|previewSamples/);
   assert.match(startHandler, /drawWaveform\(\)/);
   assert.match(stopRecording, /recording = false;\s*stopWaveformRendering\(\)/);
+  assert.match(stopRecording, /appendNetworkEvent\(\s*'Recording stop local'/);
 
   const roomCall = readPrototype('room-call.js');
   const remoteDraw = roomCall.slice(roomCall.indexOf('drawRemoteWaveform(waveform)'), roomCall.indexOf('\n  stopRemoteWaveform'));

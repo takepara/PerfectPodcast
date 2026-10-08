@@ -52,6 +52,9 @@ let studioTitleSaveFailed = false;
 let roomCall = null;
 let activeTake = null;
 let audioContext = null;
+let primedRecordingAudioContext = null;
+let primedRecordingAudioContextResume = null;
+let primedRecordingAudioContextAnchor = null;
 let mediaStream = null;
 let sourceNode = null;
 let inputChannelNode = null;
@@ -388,13 +391,13 @@ function startLocalPreview(stream) {
   }
 }
 
-function stopLocalPreview() {
+function stopLocalPreview({ preserveAudioContext = false } = {}) {
   stopMeterMonitoring();
   previewSourceNode?.disconnect();
   previewInputChannelNode?.disconnect();
   previewAnalyserNode?.disconnect();
-  previewSilentGain?.disconnect();
-  if (previewAudioContext && previewAudioContext.state !== 'closed') {
+  if (!preserveAudioContext) previewSilentGain?.disconnect();
+  if (!preserveAudioContext && previewAudioContext && previewAudioContext.state !== 'closed') {
     void previewAudioContext.close();
   }
   previewAudioContext = null;
@@ -1818,8 +1821,14 @@ async function createTake({
   }
   await stopDiagnostics({ stopCapture: !roomCall?.isActive });
   await ensureCaptureStream();
-  stopLocalPreview();
+  const reusePreviewContext = previewAudioContext === preparedAudioContext;
+  stopLocalPreview({ preserveAudioContext: reusePreviewContext });
   audioContext = preparedAudioContext || new AudioContext({ sampleRate: TARGET_RATE });
+  if (primedRecordingAudioContext === audioContext) {
+    primedRecordingAudioContext = null;
+    primedRecordingAudioContextResume = null;
+    primedRecordingAudioContextAnchor = null;
+  }
   if (audioContext.sampleRate !== TARGET_RATE) {
     throw new Error(`This device’s AudioContext is ${audioContext.sampleRate} Hz. 48,000 Hz is required.`);
   }
@@ -1963,6 +1972,13 @@ async function createTake({
   } else {
     await audioContext.resume();
   }
+  if (audioContext.state !== 'running') {
+    throw new Error(`The recording AudioContext did not start (state: ${audioContext.state}).`);
+  }
+  appendNetworkEvent(
+    'Recording AudioContext ready',
+    `state=${audioContext.state} currentTime=${audioContext.currentTime.toFixed(3)} s`
+  );
   if (track.readyState !== 'live') throw new Error('Microphone input ended before recording started. Check the device and try again.');
   if (scheduledStartAt !== null && scheduledStartAt < performance.now() + 250) {
     throw new Error('The synchronized start could not be prepared in time. Check recording readiness and try again.');
@@ -2022,6 +2038,10 @@ async function stopDiagnostics({ stopCapture = true } = {}) {
 
 async function stopRecording(recoveryReason = null) {
   if (!activeTake || finalizing) return !recording && !finalizing;
+  appendNetworkEvent(
+    'Recording stop local',
+    `requestedAt=${performance.now().toFixed(3)} ms frames=${activeTake.frames} recovery=${Boolean(recoveryReason)}`
+  );
   finalizing = true;
   recording = false;
   stopWaveformRendering();
@@ -2098,15 +2118,74 @@ async function stopRecording(recoveryReason = null) {
 function audioContextTimeAtPerformanceTime(targetTime) {
   const timestamp = audioContext?.getOutputTimestamp?.();
   if (timestamp && Number.isFinite(timestamp.contextTime) && Number.isFinite(timestamp.performanceTime)) {
-    return timestamp.contextTime + (targetTime - timestamp.performanceTime) / 1000;
+    const contextTarget = timestamp.contextTime + (targetTime - timestamp.performanceTime) / 1000;
+    appendNetworkEvent(
+      'Recording start schedule mapping',
+      `targetPerf=${targetTime.toFixed(3)} ms nowPerf=${performance.now().toFixed(3)} ms context=${audioContext.state} currentTime=${audioContext.currentTime.toFixed(3)} s outputPerf=${timestamp.performanceTime.toFixed(3)} ms outputContext=${timestamp.contextTime.toFixed(3)} s targetContext=${contextTarget.toFixed(3)} s`
+    );
+    return contextTarget;
   }
-  return audioContext.currentTime + (targetTime - performance.now()) / 1000;
+  const contextTarget = audioContext.currentTime + (targetTime - performance.now()) / 1000;
+  appendNetworkEvent(
+    'Recording start schedule mapping',
+    `targetPerf=${targetTime.toFixed(3)} ms nowPerf=${performance.now().toFixed(3)} ms context=${audioContext.state} currentTime=${audioContext.currentTime.toFixed(3)} s targetContext=${contextTarget.toFixed(3)} s`
+  );
+  return contextTarget;
 }
 
 function primeRecordingAudioContext() {
-  const context = new AudioContext({ sampleRate: TARGET_RATE });
-  const resume = context.resume().then(() => null, (error) => error);
-  return { context, resume };
+  if (primedRecordingAudioContext && primedRecordingAudioContext.state !== 'closed') {
+    appendNetworkEvent(
+      'Recording AudioContext',
+      `reusing prepared context state=${primedRecordingAudioContext.state}`
+    );
+    return {
+      context: primedRecordingAudioContext,
+      resume: primedRecordingAudioContextResume
+    };
+  }
+  const context = previewAudioContext?.state === 'running'
+    ? previewAudioContext
+    : new AudioContext({ sampleRate: TARGET_RATE });
+  primedRecordingAudioContext = context;
+  if (context === previewAudioContext) {
+    primedRecordingAudioContextResume = Promise.resolve(null);
+    appendNetworkEvent('Recording AudioContext', 'prepared running microphone preview context');
+    return { context, resume: primedRecordingAudioContextResume };
+  }
+
+  const keepAlive = context.createOscillator();
+  const silence = context.createGain();
+  silence.gain.value = 0;
+  keepAlive.connect(silence).connect(context.destination);
+  keepAlive.start();
+  primedRecordingAudioContextAnchor = { keepAlive, silence };
+  appendNetworkEvent('Recording AudioContext', `created context state=${context.state}`);
+  context.addEventListener('statechange', () => {
+    appendNetworkEvent('Recording AudioContext state', context.state);
+  });
+  appendNetworkEvent('Recording AudioContext', 'resume requested');
+  primedRecordingAudioContextResume = context.resume().then(() => {
+    appendNetworkEvent('Recording AudioContext', 'resume completed');
+    return null;
+  }, (error) => {
+    appendNetworkEvent('Recording AudioContext', `resume failed: ${error.message}`);
+    return error;
+  });
+  return { context, resume: primedRecordingAudioContextResume };
+}
+
+function releasePrimedRecordingAudioContext() {
+  const context = primedRecordingAudioContext;
+  const anchor = primedRecordingAudioContextAnchor;
+  primedRecordingAudioContext = null;
+  primedRecordingAudioContextResume = null;
+  primedRecordingAudioContextAnchor = null;
+  if (!context || context === audioContext || context === previewAudioContext || context.state === 'closed') return;
+  anchor?.keepAlive.stop();
+  anchor?.keepAlive.disconnect();
+  anchor?.silence.disconnect();
+  void context.close();
 }
 
 async function startRecording(remoteSchedule = null) {
@@ -2490,6 +2569,8 @@ async function initialize() {
       onReadinessState: () => updateRecordButtonAvailability(),
       onRecordingState: applyHostRecordingState,
       onNetworkEvent: appendNetworkEvent,
+      prepareRecordingAudioContext: () => { primeRecordingAudioContext(); },
+      releasePreparedRecordingAudioContext: releasePrimedRecordingAudioContext,
       onSessionName: async (name) => {
         if (roomCall?.isGuest !== true || !activeSession) return;
         activeSession.name = name;
