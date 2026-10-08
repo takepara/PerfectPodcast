@@ -13,7 +13,7 @@
   <div class="top-rule" aria-hidden="true"></div>
   <main class="shell">
     <header class="topbar">
-      <a class="brand" href="./recorder.html" aria-label="PerfectPodcast ホーム">
+      <a class="brand" href="./index.html" aria-label="PerfectPodcast ホーム">
         <span class="brand-mark" aria-hidden="true">P</span>
         <span>perfect<span class="brand-light">podcast</span></span>
       </a>
@@ -21,10 +21,7 @@
     </header>
 
     <section id="setupView" class="view">
-      <div class="intro">
-        <h1 id="setupTitle">ローカル録音</h1>
-        <p id="setupInstructions" class="setup-instructions">この端末で収録を始めるか、スタジオからゲストを招待できます。</p>
-      </div>
+      <h1 class="visually-hidden">収録の準備</h1>
       <div class="setup-grid">
         <form id="setupForm" class="panel setup-panel">
           <div class="panel-heading">
@@ -61,7 +58,10 @@
         <button id="backButton" class="text-button" type="button"><span aria-hidden="true">←</span> セッション一覧</button>
         <div class="studio-title-row">
           <div><h1 id="studioTitle">収録</h1></div>
-          <div class="participant-chip"><span id="roleBadge" class="role-badge">ホスト</span><span class="avatar">P</span><span id="participantLabel">Participant</span></div>
+          <div class="participant-controls">
+            <div class="participant-chip"><span id="roleBadge" class="role-badge">ホスト</span><span id="participantLabel">Participant</span></div>
+            <button id="deleteSessionButton" class="button button-danger session-delete" type="button" hidden>セッション削除</button>
+          </div>
         </div>
       </div>
 
@@ -80,20 +80,12 @@
               <div id="meterFill" class="meter-fill"></div>
             </div>
           </div>
-          <details class="audio-track-diagnostics" open>
-            <summary>マイク設定（トラック別）</summary>
-            <p class="audio-track-diagnostics-note">ブラウザーが報告するマイク入力トラックの設定です。</p>
-            <div id="audioTrackSettings" class="audio-track-settings" aria-live="polite">
-              <p class="empty-state">マイク入力を取得すると設定を表示します。</p>
-            </div>
-          </details>
           <div id="recordControls" class="controls">
             <button id="recordButton" class="button button-record" type="button"><span aria-hidden="true">●</span> 録音開始</button>
             <button id="stopButton" class="button button-stop" type="button" disabled><span aria-hidden="true">■</span> 録音停止</button>
           </div>
           <div id="hostRecordingNotice" class="host-recording-notice" hidden role="status" aria-live="polite">
             <strong id="hostRecordingStatus">ホストの録音を待っています</strong>
-            <p>ホストが録音を開始・停止します。通話中はあなたの音声もこの端末に自動で保存されます。</p>
           </div>
           <div id="errorText" class="error-text" role="alert" aria-live="assertive"></div>
         </section>
@@ -105,6 +97,11 @@
           </div>
           <div class="saved-total"><span>このセッションの保存済み</span><strong id="sessionSaved">0.00 MB</strong></div>
           <div class="saved-total"><span>保存チャンク</span><strong id="chunkCount">0</strong></div>
+          <section class="storage-recordings" aria-label="このセッションの録音">
+            <div id="takeList" class="take-list">
+              <p class="empty-state">録音したtakeがここに表示されます。</p>
+            </div>
+          </section>
         </aside>
       </div>
 
@@ -113,7 +110,6 @@
           <div>
             <span id="roomRoleLabel" class="room-role-label">ホスト操作</span>
             <h2 id="roomHeading">ゲストを招待</h2>
-            <p id="roomInstructions">招待リンクを共有し、参加申請が届いたら相手を確認して承認してください。ゲスト音源は録音中にこの端末のブラウザー内へ保存されます。</p>
           </div>
           <span class="format-pill">Opus · mono · 最大32 kbps</span>
         </div>
@@ -125,22 +121,20 @@
           <button id="retryTransferButton" class="button button-quiet" type="button" hidden>転送を再試行</button>
           <button id="leaveRoomButton" class="button button-quiet" type="button" hidden>通話を終了</button>
         </div>
-        <p id="localStorageNotice" class="room-status">ホスト・ゲストそれぞれの録音は、その端末のブラウザー内（IndexedDB）に保存され、ゲスト音源もホスト側へ転送・保存されます。ブラウザーの保存容量には上限があり、サイトデータ削除で消えるため、必要な音源はホスト端末の録音一覧から「WAVを保存」で書き出してください。</p>
         <section id="transferProgressCard" class="transfer-progress" hidden aria-labelledby="transferProgressHeading">
           <h3 id="transferProgressHeading">ゲスト音源の受信状況</h3>
-          <p id="transferProgressDescription">ゲストの録音がこの端末に届き、保存されているかを表示します。</p>
           <progress id="transferProgressBar" max="1" value="0" aria-label="音源の受信済み割合"></progress>
           <p id="transferProgressText" role="status">通話接続後に保存状況を表示します。</p>
           <details id="transferDiagnostics" class="transfer-diagnostics">
             <summary>転送の詳しい状況</summary>
             <p id="transferProgressDetails">詳細を読み込んでいます。</p>
             <canvas id="transferGraph" width="600" height="132" aria-hidden="true"></canvas>
-            <p id="transferGraphSummary">送出・保存確認速度と1.152 Mbpsの録音データ生成基準を表示します。</p>
+            <p id="transferGraphSummary" role="status"></p>
             <p class="transfer-graph-legend"><span>送出速度</span><span>保存確認速度</span><span>録音データ生成基準</span></p>
           </details>
         </section>
         <label id="inviteField" class="field invite-field" hidden>
-          <span>ゲストに共有する招待リンク（招待資格を含むため、相手だけに共有してください）</span>
+          <span>招待リンク</span>
           <span class="invite-input-row">
             <input id="inviteUrl" type="url" readonly>
             <button id="copyInviteButton" class="button button-quiet" type="button">リンクをコピー</button>
@@ -150,7 +144,6 @@
           <div class="guest-request-copy">
             <span class="request-step">ゲストから参加申請</span>
             <h3 id="guestRequestTitle"><span id="guestRequestName"></span> さん</h3>
-            <p>この名前は申請者が入力した表示名です。本人確認ではありません。承認すると音声通話を開始します。</p>
           </div>
           <div class="guest-request-actions">
             <button id="approveGuestButton" class="button button-primary" type="button">承認して通話を開始</button>
@@ -177,8 +170,15 @@
                 <p id="waveformParticipant">この端末の入力</p>
               </div>
             </div>
-            <span id="waveformState" class="waveform-state">録音待ち</span>
+            <div class="waveform-input-controls">
+              <label class="field waveform-device-field">
+                <span>自分の録音マイク（入力1 / L）</span>
+                <select id="trackMicDevice" aria-describedby="trackMicDeviceHint"><option value="">デバイスを確認しています…</option></select>
+              </label>
+              <span id="waveformState" class="waveform-state">録音待ち</span>
+            </div>
           </div>
+          <p id="trackMicDeviceHint" class="waveform-device-hint" role="status"></p>
           <div class="waveform-timeline">
             <span id="waveMark0">00:00</span><span id="waveMark1">00:15</span><span id="waveMark2">00:30</span><span id="waveMark3">00:45</span><span id="waveMark4">01:00</span>
           </div>
@@ -210,15 +210,6 @@
         </template>
       </section>
 
-      <section class="panel takes-panel" aria-labelledby="takesHeading">
-        <div class="takes-heading">
-          <h2 id="takesHeading">このセッションの録音</h2>
-          <span id="takeCount" class="count-pill">0 takes</span>
-        </div>
-        <div id="takeList" class="take-list">
-          <p class="empty-state">録音したtakeがここに表示されます。</p>
-        </div>
-      </section>
     </section>
   </main>
   <div id="notice" class="notice" role="status" aria-live="polite"></div>

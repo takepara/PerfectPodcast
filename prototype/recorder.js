@@ -1,4 +1,4 @@
-import { getAuth0Client, getHostSession, signOut } from './auth-client.bundle.js';
+import { getAuth0Client, getHostDisplayName, getHostSession, signOut } from './auth-client.bundle.js';
 import { RoomCall } from './room-call.js';
 import { MAX_SESSION_FRAMES, remainingSessionFrames } from './recording-limits.js';
 import { RecordingTransfer, takeWithTransferParticipant } from './recording-transfer.js';
@@ -9,6 +9,7 @@ import { createPcm24Wav, writePcm24Wav } from './wav-export.js';
 import { splitTransferBacklog, summarizeTransferChunks } from './transfer-progress.js';
 import { monitorRecordingTrack } from './recording-track-monitor.js';
 import { makeRecordingFilename } from './recording-filename.js';
+import { connectFirstMicrophoneChannel } from './microphone-input.js';
 
 const TARGET_RATE = 48000;
 const BYTES_PER_FRAME = 3;
@@ -18,7 +19,7 @@ const DB_VERSION = 3;
 const BLOB_DOWNLOAD_LIMIT = 256 * 1024 * 1024;
 const MAX_WAV_BYTES = 1024 * 1024 * 1024;
 const RAW_AUDIO_CONSTRAINTS = {
-  channelCount: { ideal: 1 },
+  channelCount: { ideal: 2 },
   echoCancellation: false,
   noiseSuppression: false,
   autoGainControl: false
@@ -30,6 +31,7 @@ const studioView = $('studioView');
 const setupForm = $('setupForm');
 const participantNameInput = $('participantName');
 const micDevice = $('micDevice');
+const trackMicDevice = $('trackMicDevice');
 const sessionList = $('sessionList');
 const takeList = $('takeList');
 const recordButton = $('recordButton');
@@ -46,13 +48,14 @@ let roomCall = null;
 let activeTake = null;
 let audioContext = null;
 let mediaStream = null;
-let recorderAudioContextSampleRate = null;
 let sourceNode = null;
+let inputChannelNode = null;
 let analyserNode = null;
 let recorderNode = null;
 let silentGain = null;
 let previewAudioContext = null;
 let previewSourceNode = null;
+let previewInputChannelNode = null;
 let previewAnalyserNode = null;
 let previewSilentGain = null;
 let previewSamples = null;
@@ -90,7 +93,9 @@ let transferProgressTimer = null;
 let transferProgressCache = null;
 let transferGraphSamples = [];
 let cleanupRecordingTrackMonitor = null;
-const captureTrackSettingsListeners = new Map();
+let switchingMicrophone = false;
+let detectingDevices = false;
+let deletingSession = false;
 
 const requestResult = (request) => new Promise((resolve, reject) => {
   request.addEventListener('success', () => resolve(request.result), { once: true });
@@ -185,7 +190,15 @@ function updateRecordingPreparation() {
 }
 
 function updateRecordButtonAvailability() {
-  recordButton.disabled = sessionLimitReached || recording || starting || finalizing ||
+  trackMicDevice.disabled = recording || starting || finalizing || switchingMicrophone || detectingDevices ||
+    Boolean(roomCall?.readinessCheckInProgress) || !trackMicDevice.value;
+  const deleteSessionButton = $('deleteSessionButton');
+  if (deleteSessionButton) {
+    deleteSessionButton.hidden = !activeSession || roomCall?.isGuest === true;
+    deleteSessionButton.disabled = recording || starting || finalizing || switchingMicrophone ||
+      deletingSession || Boolean(roomCall?.isActive);
+  }
+  recordButton.disabled = sessionLimitReached || recording || starting || finalizing || switchingMicrophone ||
     Boolean(roomCall?.isActive && !roomCall.isGuest && !roomCall.canStartRecording);
 }
 
@@ -248,7 +261,7 @@ function startLocalPreview(stream) {
     previewSamples = new Float32Array(previewAnalyserNode.fftSize);
     previewSilentGain = previewAudioContext.createGain();
     previewSilentGain.gain.value = 0;
-    previewSourceNode.connect(previewAnalyserNode);
+    previewInputChannelNode = connectFirstMicrophoneChannel(previewAudioContext, previewSourceNode, previewAnalyserNode);
     previewAnalyserNode.connect(previewSilentGain).connect(previewAudioContext.destination);
     previewStartedAt = performance.now();
     waveformHistory.fill(0);
@@ -278,6 +291,7 @@ function startLocalPreview(stream) {
 
 function stopLocalPreview() {
   previewSourceNode?.disconnect();
+  previewInputChannelNode?.disconnect();
   previewAnalyserNode?.disconnect();
   previewSilentGain?.disconnect();
   if (previewAudioContext && previewAudioContext.state !== 'closed') {
@@ -285,6 +299,7 @@ function stopLocalPreview() {
   }
   previewAudioContext = null;
   previewSourceNode = null;
+  previewInputChannelNode = null;
   previewAnalyserNode = null;
   previewSilentGain = null;
   previewSamples = null;
@@ -375,6 +390,32 @@ async function persistSession(session) {
   const transaction = database.transaction('sessions', 'readwrite');
   const done = transactionComplete(transaction);
   transaction.objectStore('sessions').put(session);
+  await done;
+}
+
+async function deleteSessionAndRecordings(sessionId) {
+  const transaction = database.transaction(['sessions', 'takes', 'chunks'], 'readwrite');
+  const done = transactionComplete(transaction);
+  const takes = transaction.objectStore('takes');
+  const chunks = transaction.objectStore('chunks').index('takeId');
+  transaction.objectStore('sessions').delete(sessionId);
+  const takeRequest = takes.index('sessionId').openCursor(IDBKeyRange.only(sessionId));
+  takeRequest.addEventListener('error', () => transaction.abort(), { once: true });
+  takeRequest.addEventListener('success', () => {
+    const takeCursor = takeRequest.result;
+    if (!takeCursor) return;
+    const takeId = takeCursor.primaryKey;
+    takes.delete(takeId);
+    const chunkRequest = chunks.openCursor(IDBKeyRange.only(takeId));
+    chunkRequest.addEventListener('error', () => transaction.abort(), { once: true });
+    chunkRequest.addEventListener('success', () => {
+      const chunkCursor = chunkRequest.result;
+      if (!chunkCursor) return;
+      chunkCursor.delete();
+      chunkCursor.continue();
+    });
+    takeCursor.continue();
+  });
   await done;
 }
 
@@ -1124,19 +1165,12 @@ async function refreshSessionList() {
   }
 }
 
-function takeStatusLabel(take) {
-  if (take.status === 'recording') return [take.remote ? '受信中' : '録音中断', 'recording'];
-  if (take.status === 'recovered') return ['復旧データ', 'recovered'];
-  return ['保存完了', ''];
-}
-
 async function renderTakes() {
   if (!activeSession) return;
   const takes = (await loadAll('takes'))
     .filter((take) => take.sessionId === activeSession.id)
     .sort((left, right) => left.startedAt - right.startedAt);
   takeList.replaceChildren();
-  $('takeCount').textContent = `${takes.length} ${takes.length === 1 ? 'take' : 'takes'}`;
   if (!takes.length) {
     takeList.innerHTML = '<p class="empty-state">録音したtakeがここに表示されます。</p>';
     return;
@@ -1146,27 +1180,16 @@ async function renderTakes() {
     row.className = 'take-row';
     const info = document.createElement('div');
     info.className = 'take-info';
-    const title = document.createElement('p');
-    title.className = 'take-title';
     const label = document.createElement('span');
-    label.textContent = `${take.remote ? `${take.participant} · ` : ''}Take ${String(take.number).padStart(2, '0')}`;
-    const [status, badgeClass] = takeStatusLabel(take);
-    const badge = document.createElement('span');
-    badge.className = `take-badge${badgeClass ? ` ${badgeClass}` : ''}`;
-    badge.textContent = status;
-    title.append(label, badge);
+    label.className = 'take-title';
+    const participant = take.participant || activeSession.participant;
+    label.textContent = `${participant} ${String(take.number).padStart(2, '0')}`;
     const meta = document.createElement('p');
     meta.className = 'take-meta';
-    const duration = (take.frames || 0) / TARGET_RATE;
-    const quality = take.status === 'recovered' ? ' · 保存済みチャンクから復旧' : '';
-    const transfer = take.transferGeneration && !take.remote
-      ? take.hostStored
-        ? ' · ホスト端末に保存済み'
-        : ' · ホスト端末への保存確認待ち'
-      : '';
-    const bytes = take.bytes ? ` · ${formatBytes(take.bytes)}` : '';
-    meta.textContent = `${new Date(take.startedAt).toLocaleString('ja-JP')} · ${formatDuration(duration)}${bytes}${quality}${transfer}`;
-    info.append(title, meta);
+    const duration = formatDuration((take.frames || 0) / TARGET_RATE);
+    const size = Number.isFinite(take.bytes) ? formatBytes(take.bytes) : '—';
+    meta.textContent = `${duration} · ${size}`;
+    info.append(label, meta);
     const actions = document.createElement('div');
     actions.className = 'take-actions';
     if (roomCall?.isGuest !== true) {
@@ -1186,6 +1209,7 @@ async function renderTakes() {
 
 async function openSession(session) {
   activeSession = session;
+  updateRecordButtonAvailability();
   $('studioTitle').textContent = roomCall?.inviteMode ? 'ゲスト収録' : session.name;
   $('participantLabel').textContent = session.participant;
   $('waveformParticipant').textContent = session.participant;
@@ -1198,7 +1222,6 @@ async function openSession(session) {
   studioView.hidden = false;
   $('waveformState').textContent = '待機中';
   $('waveformState').classList.remove('live');
-  if (roomCall?.isActive && mediaStream && !recording) startLocalPreview(mediaStream);
   if (waveformFrame === null) drawWaveform();
   errorText.textContent = '';
   setStatus('録音を始める準備ができました');
@@ -1213,10 +1236,61 @@ async function openSession(session) {
   if (sessionLimitReached) setStatus('このセッションは2時間の録音上限に達しています');
   $('chunkCount').textContent = String(takes.at(-1)?.chunks || 0);
   await updateSessionSavedSize();
+  if (!recording && !starting) {
+    try {
+      const stream = await ensureCaptureStream();
+      if (activeSession === session && !studioView.hidden) startLocalPreview(stream);
+      else if (!activeSession && !roomCall?.isActive) await releaseCaptureStream();
+    } catch (error) {
+      if (activeSession === session) {
+        setLocalWaveformState('マイク待機中');
+        errorText.textContent = `マイクの波形を開始できませんでした: ${error.message}`;
+      }
+    }
+  }
+}
+
+async function deleteActiveSession() {
+  const session = activeSession;
+  if (!session || roomCall?.isGuest || $('deleteSessionButton').disabled) return;
+  const confirmed = window.confirm(
+    `「${session.name}」と、このセッションに保存された録音・受信音声をすべて削除します。この操作は取り消せません。`
+  );
+  if (!confirmed) return;
+
+  deletingSession = true;
+  updateRecordButtonAvailability();
+  let deleted = false;
+  try {
+    await deleteSessionAndRecordings(session.id);
+    deleted = true;
+    stopLocalPreview();
+    await releaseCaptureStream();
+    activeSession = null;
+    sessionLimitReached = false;
+    transferProgressCache = null;
+    previousTransferProgress = null;
+    transferGraphSamples = [];
+    studioView.hidden = true;
+    setupView.hidden = false;
+    await refreshSessionList();
+    await updateSessionSavedSize();
+    setMessage('セッションと録音を削除しました。');
+  } catch (error) {
+    errorText.textContent = deleted
+      ? `セッションは削除されましたが、画面を更新できませんでした: ${error.message}`
+      : `セッションを削除できませんでした: ${error.message}`;
+  } finally {
+    deletingSession = false;
+    updateRecordButtonAvailability();
+  }
 }
 
 async function detectDevices(requestPermission = true) {
+  if (detectingDevices || switchingMicrophone) return;
   const button = $('detectDevices');
+  detectingDevices = true;
+  updateRecordButtonAvailability();
   button.disabled = true;
   button.textContent = '確認中…';
   $('setupMessage').textContent = '';
@@ -1229,6 +1303,8 @@ async function detectDevices(requestPermission = true) {
     }
     const devices = await navigator.mediaDevices.enumerateDevices();
     const microphones = devices.filter((device) => device.kind === 'audioinput');
+    const selectedDevice = micDevice.value;
+    const selectedLabel = micDevice.selectedOptions[0]?.textContent;
     micDevice.replaceChildren();
     if (!microphones.length) {
       micDevice.add(new Option('マイクが見つかりません', ''));
@@ -1237,16 +1313,25 @@ async function detectDevices(requestPermission = true) {
       for (const [index, device] of microphones.entries()) {
         micDevice.add(new Option(device.label || `マイク ${index + 1}`, device.deviceId));
       }
+      if (microphones.some((device) => device.deviceId === selectedDevice)) micDevice.value = selectedDevice;
       const labelsVisible = microphones.every((device) => device.label);
       $('setupMessage').textContent = labelsVisible
         ? `${microphones.length} 台のマイクを検出しました。`
         : `${microphones.length} 台のマイクを検出しました。名前を表示するには「デバイスを検出」を押してください。`;
+    }
+    if (selectedDevice && !microphones.some((device) => device.deviceId === selectedDevice) && mediaStream) {
+      micDevice.add(new Option(`${selectedLabel || '選択中のマイク'}（未接続）`, selectedDevice));
+      micDevice.value = selectedDevice;
     }
   } catch (error) {
     $('setupMessage').textContent = error.name === 'NotAllowedError'
       ? 'マイクの使用が許可されませんでした。ブラウザーのサイト設定を確認してください。'
       : `デバイスを検出できませんでした: ${error.message}`;
   } finally {
+    trackMicDevice.replaceChildren(...Array.from(micDevice.options, (option) => option.cloneNode(true)));
+    trackMicDevice.value = micDevice.value;
+    detectingDevices = false;
+    updateRecordButtonAvailability();
     button.disabled = false;
     button.textContent = 'デバイスを検出';
   }
@@ -1254,107 +1339,58 @@ async function detectDevices(requestPermission = true) {
 
 async function ensureCaptureStream() {
   if (mediaStream?.getAudioTracks().some((track) => track.readyState === 'live')) {
-    observeCaptureAudioTracks();
     return mediaStream;
   }
   if (!navigator.mediaDevices?.getUserMedia) throw new Error('マイク取得に対応していません。Chrome または Edge を使用してください。');
-  clearCaptureTrackSettingsListeners();
-  recorderAudioContextSampleRate = null;
-  mediaStream = await navigator.mediaDevices.getUserMedia({
+  mediaStream = await acquireMicrophoneStream(micDevice.value);
+  return mediaStream;
+}
+
+async function acquireMicrophoneStream(deviceId) {
+  return navigator.mediaDevices.getUserMedia({
     audio: {
-      deviceId: { exact: micDevice.value },
+      deviceId: { exact: deviceId },
       ...RAW_AUDIO_CONSTRAINTS,
       sampleRate: TARGET_RATE
     }
   });
-  observeCaptureAudioTracks();
-  return mediaStream;
 }
 
-function clearCaptureTrackSettingsListeners() {
-  for (const [track, listener] of captureTrackSettingsListeners) {
-    for (const eventName of ['mute', 'unmute', 'ended']) {
-      track.removeEventListener(eventName, listener);
-    }
-  }
-  captureTrackSettingsListeners.clear();
-}
-
-function appendTrackSetting(list, label, value) {
-  const item = document.createElement('div');
-  const term = document.createElement('dt');
-  const description = document.createElement('dd');
-  term.textContent = label;
-  description.textContent = value;
-  item.append(term, description);
-  list.append(item);
-  return item;
-}
-
-function formatTrackValue(value, unit = '') {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return `${value.toLocaleString('ja-JP')}${unit}`;
-  }
-  if (typeof value === 'boolean') return value ? '有効' : '無効';
-  return '取得できません';
-}
-
-function renderCaptureAudioTrackSettings() {
-  const container = $('audioTrackSettings');
-  const tracks = mediaStream?.getAudioTracks() ?? [];
-  container.replaceChildren();
-  if (!tracks.length) {
-    const message = document.createElement('p');
-    message.className = 'empty-state';
-    message.textContent = 'マイク入力トラックがありません。';
-    container.append(message);
+async function changeMicrophone() {
+  const previousDevice = micDevice.value;
+  const deviceId = trackMicDevice.value;
+  if (trackMicDevice.disabled || !deviceId || deviceId === previousDevice) {
+    trackMicDevice.value = previousDevice;
     return;
   }
-
-  for (const [index, track] of tracks.entries()) {
-    const settings = typeof track.getSettings === 'function' ? track.getSettings() : {};
-    const entry = document.createElement('section');
-    const title = document.createElement('h3');
-    const list = document.createElement('dl');
-    const trackRate = settings.sampleRate;
-    const contextRate = recorderAudioContextSampleRate;
-    const titleLabel = track.label || `名前なし (${track.id.slice(0, 8)})`;
-    title.textContent = `トラック ${index + 1} · ${titleLabel}`;
-    entry.className = 'audio-track-entry';
-    entry.append(title, list);
-    appendTrackSetting(list, '状態', track.readyState === 'live'
-      ? (track.muted ? '一時停止中' : '有効')
-      : '終了');
-    appendTrackSetting(list, 'トラックのサンプルレート', formatTrackValue(trackRate, ' Hz'));
-    appendTrackSetting(list, 'チャンネル数', formatTrackValue(settings.channelCount));
-    appendTrackSetting(list, '録音AudioContext', formatTrackValue(contextRate, ' Hz'));
-    appendTrackSetting(list, 'エコーキャンセル', formatTrackValue(settings.echoCancellation));
-    appendTrackSetting(list, 'ノイズ抑制', formatTrackValue(settings.noiseSuppression));
-    appendTrackSetting(list, '自動ゲイン調整', formatTrackValue(settings.autoGainControl));
-    if (typeof trackRate === 'number' && typeof contextRate === 'number' && trackRate !== contextRate) {
-      appendTrackSetting(
-        list,
-        'サンプルレート',
-        `${trackRate.toLocaleString('ja-JP')} Hz → ${contextRate.toLocaleString('ja-JP')} Hz（変換が必要）`
-      ).className = 'audio-track-rate-warning';
-    }
-    container.append(entry);
+  switchingMicrophone = true;
+  updateRecordButtonAvailability();
+  $('trackMicDeviceHint').textContent = 'マイクを切り替えています…';
+  let nextStream = null;
+  try {
+    if (roomCall?.connected) await roomCall.checkLocalReadiness();
+    nextStream = await acquireMicrophoneStream(deviceId);
+    if (roomCall?.connected) await roomCall.attachLocalAudio(nextStream);
+    const previousStream = mediaStream;
+    mediaStream = nextStream;
+    nextStream = null;
+    micDevice.value = deviceId;
+    startLocalPreview(mediaStream);
+    previousStream?.getTracks().forEach((track) => track.stop());
+    $('trackMicDeviceHint').textContent = 'マイクを切り替えました。';
+  } catch (error) {
+    nextStream?.getTracks().forEach((track) => track.stop());
+    trackMicDevice.value = previousDevice;
+    $('trackMicDeviceHint').textContent = `マイクを変更できませんでした: ${error.message}`;
+  } finally {
+    switchingMicrophone = false;
+    updateRecordButtonAvailability();
+    if (roomCall?.connected) await roomCall.checkLocalReadiness();
   }
-}
-
-function observeCaptureAudioTracks() {
-  for (const track of mediaStream?.getAudioTracks() ?? []) {
-    if (captureTrackSettingsListeners.has(track)) continue;
-    const listener = () => renderCaptureAudioTrackSettings();
-    for (const eventName of ['mute', 'unmute', 'ended']) {
-      track.addEventListener(eventName, listener);
-    }
-    captureTrackSettingsListeners.set(track, listener);
-  }
-  renderCaptureAudioTrackSettings();
 }
 
 async function checkRecordingReadiness() {
+  if (switchingMicrophone) throw new Error('マイクを切り替えています。');
   const stream = mediaStream || await ensureCaptureStream();
   const track = stream.getAudioTracks()[0];
   if (!track || track.readyState !== 'live' || track.muted) {
@@ -1362,8 +1398,6 @@ async function checkRecordingReadiness() {
   }
   if (!window.AudioContext) throw new Error('AudioContextを利用できません。');
   const context = new AudioContext({ sampleRate: TARGET_RATE });
-  recorderAudioContextSampleRate = context.sampleRate;
-  renderCaptureAudioTrackSettings();
   try {
     if (context.sampleRate !== TARGET_RATE) throw new Error('48 kHzのAudioContextを作成できません。');
     await context.audioWorklet.addModule('./recorder-worklet.js');
@@ -1383,10 +1417,8 @@ async function checkRecordingReadiness() {
 
 async function releaseCaptureStream() {
   if (recording) return;
-  clearCaptureTrackSettingsListeners();
   mediaStream?.getTracks().forEach((track) => track.stop());
   mediaStream = null;
-  renderCaptureAudioTrackSettings();
 }
 
 async function commitChunk(samples, isFinal, startFrame) {
@@ -1455,8 +1487,6 @@ async function createTake({ scheduledStartAt = null, event = null } = {}) {
   await ensureCaptureStream();
   stopLocalPreview();
   audioContext = new AudioContext({ sampleRate: TARGET_RATE });
-  recorderAudioContextSampleRate = audioContext.sampleRate;
-  renderCaptureAudioTrackSettings();
   if (audioContext.sampleRate !== TARGET_RATE) {
     throw new Error(`この端末のAudioContextは ${audioContext.sampleRate} Hzです。48,000 Hzが必要です。`);
   }
@@ -1562,7 +1592,7 @@ async function createTake({ scheduledStartAt = null, event = null } = {}) {
       ));
     }
   };
-  sourceNode.connect(analyserNode);
+  inputChannelNode = connectFirstMicrophoneChannel(audioContext, sourceNode, analyserNode);
   analyserNode.connect(recorderNode);
   recorderNode.connect(silentGain).connect(audioContext.destination);
   const track = mediaStream.getAudioTracks()[0];
@@ -1625,6 +1655,7 @@ async function createTake({ scheduledStartAt = null, event = null } = {}) {
 async function stopDiagnostics({ stopCapture = true } = {}) {
   clearRecordingTrackMonitor();
   if (sourceNode) sourceNode.disconnect();
+  inputChannelNode?.disconnect();
   if (recorderNode) {
     recorderNode.port.onmessage = null;
     recorderNode.disconnect();
@@ -1633,6 +1664,7 @@ async function stopDiagnostics({ stopCapture = true } = {}) {
   if (stopCapture) mediaStream?.getTracks().forEach((track) => track.stop());
   if (audioContext && audioContext.state !== 'closed') await audioContext.close();
   sourceNode = null;
+  inputChannelNode = null;
   analyserNode = null;
   recorderNode = null;
   silentGain = null;
@@ -1645,6 +1677,7 @@ async function stopRecording(recoveryReason = null) {
   if (!activeTake || finalizing) return !recording && !finalizing;
   finalizing = true;
   recording = false;
+  updateRecordButtonAvailability();
   scheduledRecordingStartAt = null;
   updateRecordingPreparation();
   roomCall?.endRecordingWaveform();
@@ -1723,7 +1756,7 @@ function audioContextTimeAtPerformanceTime(targetTime) {
 
 async function startRecording(remoteSchedule = null) {
   if (recording) return true;
-  if (finalizing || starting || !activeSession) return false;
+  if (finalizing || starting || switchingMicrophone || !activeSession) return false;
   if (!roomCall?.isGuest) {
     try {
       if (!await getHostSession()) {
@@ -1740,7 +1773,9 @@ async function startRecording(remoteSchedule = null) {
     errorText.textContent = '通話接続と双方の録音準備が完了してから録音を開始してください。';
     return false;
   }
+  if (switchingMicrophone) return false;
   starting = true;
+  updateRecordButtonAvailability();
   scheduledRecordingStartAt = remoteSchedule?.startAt ?? null;
   updateRecordingPreparation();
   recordButton.disabled = true;
@@ -1943,6 +1978,10 @@ setupForm.addEventListener('submit', async (event) => {
 });
 
 $('detectDevices').addEventListener('click', () => { void detectDevices(); });
+$('deleteSessionButton').addEventListener('click', () => { void deleteActiveSession(); });
+micDevice.addEventListener('change', () => { trackMicDevice.value = micDevice.value; updateRecordButtonAvailability(); });
+trackMicDevice.addEventListener('change', () => { void changeMicrophone(); });
+navigator.mediaDevices?.addEventListener('devicechange', () => { if (!switchingMicrophone) void detectDevices(false); });
 recordButton.addEventListener('click', () => {
   if (!roomCall?.isGuest) void startRecording();
 });
@@ -1958,7 +1997,14 @@ $('backButton').addEventListener('click', async () => {
     setMessage('通話または招待を終了してからセッション一覧へ戻ってください。', true);
     return;
   }
+  if (switchingMicrophone) {
+    setMessage('マイクの切り替えが完了してからセッション一覧へ戻ってください。', true);
+    return;
+  }
+  stopLocalPreview();
+  await releaseCaptureStream();
   activeSession = null;
+  updateRecordButtonAvailability();
   if (waveformFrame !== null) {
     window.cancelAnimationFrame(waveformFrame);
     waveformFrame = null;
@@ -1990,6 +2036,9 @@ async function initialize() {
       window.location.replace(`/index.html?returnTo=${encodeURIComponent(returnTo)}`);
       return;
     }
+    void getHostDisplayName(authSession).then((name) => {
+      if (name && !participantNameInput.value.trim() && !activeSession) participantNameInput.value = name;
+    });
     $('logoutButton').hidden = false;
     $('logoutButton').addEventListener('click', async () => {
       if (recording || finalizing) {

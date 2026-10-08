@@ -1,4 +1,5 @@
 import { Auth0Client } from '@auth0/auth0-spa-js';
+import { clearHostProfile, readHostProfile, saveHostProfile } from './auth-profile.js';
 
 let clientPromise;
 let configPromise;
@@ -52,7 +53,24 @@ export async function establishHostSession(client) {
   });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.message || 'ホスト認証を確立できません。');
+  try {
+    saveHostProfile(window.sessionStorage, await client.getUser(), payload.sub);
+  } catch {
+    // Profile access must not prevent a successful login.
+  }
   return payload;
+}
+
+export async function getHostDisplayName(session) {
+  try {
+    const storedName = readHostProfile(window.sessionStorage, session.sub);
+    if (storedName) return storedName;
+    const client = await getAuth0Client();
+    await client.getTokenSilently();
+    return saveHostProfile(window.sessionStorage, await client.getUser(), session.sub);
+  } catch {
+    return '';
+  }
 }
 
 export async function signOut(client) {
@@ -63,6 +81,11 @@ export async function signOut(client) {
     signal: AbortSignal.timeout(8000)
   });
   if (!response.ok) throw new Error('アプリのログイン状態を終了できません。');
+  try {
+    clearHostProfile(window.sessionStorage);
+  } catch {
+    // Storage may be unavailable even when logout succeeds.
+  }
   await client.logout({
     logoutParams: { returnTo: `${window.location.origin}/index.html?logout=1` }
   });

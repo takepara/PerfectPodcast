@@ -492,10 +492,6 @@ export class RoomCall {
 
   applyRoleUI() {
     const guestMode = this.inviteMode;
-    $('setupTitle').textContent = guestMode ? '招待された収録' : 'ローカル録音';
-    $('setupInstructions').textContent = guestMode
-      ? 'あなたはゲストとして招待されています。表示名とマイクを設定してスタジオへ進み、ホストに参加申請してください。ホストが録音を操作し、あなたの音声もこの端末に自動保存されます。'
-      : 'この端末で収録を始めるか、スタジオからゲストを招待できます。';
     $('setupFormTitle').textContent = guestMode ? 'ゲスト参加の準備' : '収録の準備';
     $('participantNameLabel').textContent = guestMode ? 'ホストに表示する名前' : 'あなたの名前';
     $('micDeviceLabel').textContent = guestMode ? '通話・録音に使うマイク' : '録音マイク';
@@ -508,28 +504,18 @@ export class RoomCall {
     $('roleBadge').classList.toggle('guest', guestMode);
     $('roomRoleLabel').textContent = guestMode ? 'ゲスト操作' : 'ホスト操作';
     $('roomHeading').textContent = guestMode ? '招待された部屋に参加' : 'ゲストを招待';
-    $('roomInstructions').textContent = guestMode
-      ? 'ホストに参加申請を送り、承認されると音声通話が始まります。'
-      : '招待リンクを共有し、参加申請が届いたら相手を確認して承認してください。ゲスト音源は録音中にこの端末のブラウザー内へ保存されます。';
     $('createRoomButton').hidden = guestMode;
     $('joinRoomButton').hidden = !guestMode || !this.invitation;
     $('joinRoomButton').disabled = guestMode && !this.invitation;
     $('recordControls').hidden = guestMode;
     $('hostRecordingNotice').hidden = !guestMode;
-    $('localStorageNotice').hidden = false;
     $('transferProgressHeading').textContent = guestMode
       ? 'ホストへの音源送信状況'
       : 'ゲスト音源の受信状況';
-    $('transferProgressDescription').textContent = guestMode
-      ? 'この端末で録音した音声がホストに届き、保存された量と状態を表示します。'
-      : 'ゲストの録音がこの端末に届き、保存された量と状態を表示します。';
     $('joinRoomButton').textContent = 'ホストに参加申請';
-    $('takesHeading').textContent = guestMode ? 'この端末のゲスト録音' : 'このセッションの録音';
     this.setRemoteWaveState('未接続');
     if (guestMode && !this.invitation) {
-      $('setupInstructions').textContent = '招待リンクが正しくありません。ホストに新しいリンクを依頼してください。';
-      $('setupInstructions').classList.add('setup-error');
-      $('setupMessage').textContent = 'このリンクからゲスト参加できません。';
+      $('setupMessage').textContent = '招待リンクが正しくありません。ホストに新しいリンクを依頼してください。';
     } else if (guestMode) {
       this.setStatus('招待を確認しました。準備ができたらホストに参加申請してください。');
     } else {
@@ -615,6 +601,7 @@ export class RoomCall {
       return this.localReady;
     } finally {
       this.readinessCheckInProgress = false;
+      this.updateReadinessUI();
     }
   }
 
@@ -1859,9 +1846,12 @@ export class RoomCall {
     }
   }
 
-  async attachLocalAudio() {
+  async attachLocalAudio(replacementStream = null) {
+    if (replacementStream && (!this.connected || !this.authFields)) {
+      throw new Error('認証済みの通話がありません。');
+    }
     if (!this.localSender) throw new Error('送信用オーディオトラックがありません。');
-    const stream = await this.getMicrophoneStream();
+    const stream = replacementStream ?? await this.getMicrophoneStream();
     await this.localSender.replaceTrack(stream.getAudioTracks()[0]);
     const parameters = this.localSender.getParameters();
     if (!parameters.encodings?.length) parameters.encodings = [{}];
