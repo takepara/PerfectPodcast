@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>スタジオ案03 — オーディオコンソール | PerfectPodcast</title>
+  <link rel="stylesheet" href="./studio-layouts.css">
+</head>
+<body class="layout-three">
+  <main class="studio-page">
+    <header class="topbar"><a class="brand" href="./studio-index.html"><span class="brand-mark">P</span><span>perfect<span class="brand-light">podcast</span></span></a><span class="demo-label">案 03 / Console</span></header>
+    <header class="studio-header"><div><a class="back-link" href="./studio-index.html">← セッション一覧</a><p class="eyebrow">Input / monitoring / local archive</p><h1>秋の新作を語る</h1><p class="subheading">参加者ごとの入力状態をまとめて確認</p></div><div class="user-actions"><span class="participant-chip"><span class="role">HOST</span>山田 花子</span><button class="btn btn-danger">セッション削除</button></div></header>
+    <div class="workspace">
+      <section class="card record-card" aria-labelledby="record-title">
+        <div class="record-topline"><span class="status"><i class="status-dot"></i>入力待ち · 録音停止中</span><span class="format">PCM 24-bit / 48 kHz</span></div>
+        <h2 class="card-heading" id="record-title" style="margin-top:22px">ローカルトラック</h2><div class="timer">00:00</div>
+        <div class="meter-block"><div class="meter-label"><span>入力レベル</span><span>マイク待機中</span></div><div class="meter"><div class="meter-fill"></div></div><p class="meter-note">入力ピークを検知するとレベル表示が動きます。</p></div>
+        <div class="record-controls"><button class="btn btn-record">● 録音開始</button><button class="btn btn-stop" disabled>■ 録音停止</button></div>
+        <label class="microphone">入力デバイス<select><option>MacBook Proのマイク（入力1 / L）</option></select></label>
+      </section>
+      <section class="card room-card" aria-labelledby="room-title">
+        <div class="card-heading"><div><h2 id="room-title">ルーム / ゲスト</h2><p>ホストとして招待を管理</p></div><span class="format">ROOM</span></div>
+        <p class="room-copy">招待リンクからゲストが参加すると、個別録音トラックが追加されます。</p>
+        <div class="room-state"><span class="state-chip">通話 未接続</span><span class="state-chip">録音準備 未確認</span></div>
+        <div class="invite-box"><input aria-label="招待リンク" value="perfectpodcast.app/join/7k2m…" readonly><button class="btn">コピー</button></div>
+        <div class="room-actions"><button class="btn btn-primary">リンクを作成</button><button class="btn">準備を再確認</button></div>
+        <div class="call-status"><span>受信転送</span><strong>待機中</strong></div>
+      </section>
+      <section class="card wave-card" aria-labelledby="wave-title">
+        <div class="wave-heading"><div><h2 id="wave-title">モニタリング・トラック</h2><p>ホストとゲストの音声を分けて表示</p></div><span class="format">60秒表示</span></div>
+        <div class="wave-track"><div class="wave-track-head"><div class="track-name"><i class="track-mark"></i><div>Track 01 · 山田 花子<div class="track-caption">ローカルマイク入力 · mono</div></div></div><span class="wave-state">入力待ち</span></div><div class="wave-timeline"><span>00:00</span><span>00:15</span><span>00:30</span><span>00:45</span><span>01:00</span></div><div class="wave-plot"><svg viewBox="0 0 900 80" preserveAspectRatio="none" aria-hidden="true"><path d="M0 40h18l6-4 6 8 8-18 8 29 9-38 10 48 9-36 10 18 9-8 12 1 8-12 9 25 10-38 9 48 11-23 9 8 10-7 10 2 9-17 9 30 11-35 9 43 10-22 9 8 9-3 10 1 8-14 10 27 10-42 10 39 8-16 10 7 11-1 9-8 8 19 11-30 10 39 9-25 8 9 13-4 10 2 8-17 10 29 10-40 9 36 10-12 8 7 10-3 11 1 10-17 9 30 10-39 9 43 9-22 11 8 10-3 9 2 10-12 8 26 10-33 10 38 9-18 12 7 10-2 9 1 9-15 11 29 9-36 11 41 10-23 9 8h18"/></svg></div></div>
+        <div class="wave-track remote"><div class="wave-track-head"><div class="track-name"><i class="track-mark"></i><div>Track 02 · ゲスト<div class="track-caption">リモート音声 · 転送後に端末へ保存</div></div></div><span class="wave-state">未接続</span></div><div class="wave-timeline"><span>00:00</span><span>00:15</span><span>00:30</span><span>00:45</span><span>01:00</span></div><div class="wave-plot"><svg viewBox="0 0 900 80" preserveAspectRatio="none" aria-hidden="true"><path d="M0 40h32l9-5 8 10 9-24 10 37 10-29 10 14 9-3 11 1 9-13 9 27 10-37 9 43 10-20 10 7 11-5 10 1 10-16 9 30 10-38 10 43 9-18 10 6 10-2 10 1 10-13 9 25 11-34 10 39 9-19 9 8 11-3 10 1 9-12 10 24 10-32 10 39 9-19 10 9 10-4 10 2 10-14 10 28 10-34 9 38 10-21 10 7 11-1 8 1 12-16 10 30 9-36 10 42 10-20 9 8h31"/></svg></div></div>
+      </section>
+      <section class="card storage-card" aria-labelledby="storage-title">
+        <div class="card-heading"><div><h2 id="storage-title">ローカル・アーカイブ</h2><p>保存済みテイク</p></div><span class="format">3 TAKES</span></div>
+        <div class="storage-summary"><div class="storage-stat"><span>保存容量</span><strong>38.4 MB</strong></div><div class="storage-stat"><span>チャンク</span><strong>31</strong></div></div>
+        <div class="takes"><article class="take"><div class="take-info"><strong>Take 04 · Host</strong><span>03:12 · 8.1 MB · WAV</span></div><div class="take-actions"><button class="btn">再生</button><button class="btn">保存</button></div></article><article class="take"><div class="take-info"><strong>Take 03 · Host</strong><span>02:48 · 7.0 MB · WAV</span></div><div class="take-actions"><button class="btn">再生</button><button class="btn">保存</button></div></article><article class="take"><div class="take-info"><strong>Take 02 · Guest</strong><span>02:41 · 6.8 MB · WAV</span></div><div class="take-actions"><button class="btn">再生</button><button class="btn">保存</button></div></article></div>
+      </section>
+    </div>
+    <nav class="sample-nav" aria-label="デザイン案の切り替え"><span>スタジオ案</span><a href="./studio-layout-01.html">01</a><a href="./studio-layout-02.html">02</a><a href="./studio-layout-03.html" aria-current="page">03</a><a href="./studio-layout-04.html">04</a><a href="./studio-layout-05.html">05</a></nav>
+  </main>
+</body>
+</html>
