@@ -563,27 +563,48 @@ test('processes readiness only after an earlier asynchronous auth message comple
 });
 
 test('resets remote waveform history to the local recording start time', () => {
+  const canvasClears = [];
   const waveform = {
+    id: 'track',
     history: new Float32Array(600).fill(0.5),
     historyCount: 12,
+    lastSampleIndex: 11,
+    recordingStartedAt: null,
     sampledAt: 10,
     startedAt: 5,
-    rulerSecond: 10
+    rulerSecond: 10,
+    animationFrame: null,
+    track: { muted: false },
+    canvas: {
+      width: 100,
+      height: 50,
+      getContext: () => ({ clearRect: (...args) => canvasClears.push(args) })
+    }
   };
   const call = Object.create(RoomCall.prototype);
   call.remoteWaveforms = new Map([['track', waveform]]);
+  const drawn = [];
+  const states = [];
+  call.drawRemoteWaveform = (track) => drawn.push(track);
+  call.setRemoteWaveState = (...state) => states.push(state);
 
   call.beginRecordingWaveform(100);
   assert.equal(call.waveformRecordingStartedAt, 100);
   assert.equal(waveform.history.some((sample) => sample !== 0), false);
   assert.equal(waveform.historyCount, 0);
+  assert.equal(waveform.lastSampleIndex, -1);
   assert.equal(waveform.sampledAt, 100);
   assert.equal(waveform.startedAt, 100);
   assert.equal(waveform.rulerSecond, -1);
+  assert.deepEqual(drawn, [waveform]);
+  assert.deepEqual(states, [['波形準備中', false, 'track']]);
 
   call.endRecordingWaveform();
   assert.equal(call.waveformRecordingStartedAt, null);
   assert.equal(waveform.historyCount, 0);
+  assert.equal(waveform.recordingStartedAt, null);
+  assert.deepEqual(canvasClears, [[0, 0, 100, 50]]);
+  assert.deepEqual(states.at(-1), ['録音待ち', false, 'track']);
 });
 
 test('host recording requires both readiness checks and an active peer connection', () => {
@@ -815,7 +836,7 @@ test('accepts only matching host TURN responses and installs relayed credentials
     addEventListener() {}
 
     createDataChannel(label, options) {
-      return { label, ...options };
+      return { label, readyState: 'connecting', bufferedAmount: 0, addEventListener() {}, ...options };
     }
   }
   globalThis.window = {
@@ -838,6 +859,98 @@ test('accepts only matching host TURN responses and installs relayed credentials
       pendingTurnCredentials: pending,
       turnIceServers: null,
       recordingTransfer: { setRole() {}, setChannel() {} }
+    });
+
+    test('validates and applies bounded remote microphone monitor updates', () => {
+      const call = Object.create(RoomCall.prototype);
+      const errors = [];
+      call.remoteWaveforms = new Map();
+      call.setStatus = (message, isError) => errors.push({ message, isError });
+      call.updateRemoteInputMonitor = (state) => { call.remoteInputMonitorState = state; };
+
+      call.receiveInputMonitorMessage(JSON.stringify({
+        type: 'input-state',
+        level: 0.42,
+        muted: false,
+        deviceLabel: 'USB Microphone'
+      }));
+      assert.deepEqual(call.remoteInputMonitorState, {
+        level: 0.42,
+        muted: false,
+        deviceLabel: 'USB Microphone'
+      });
+
+      call.receiveInputMonitorMessage(JSON.stringify({
+        type: 'input-state',
+        level: 2,
+        muted: false,
+        deviceLabel: 'invalid'
+      }));
+      assert.equal(errors.at(-1).isError, true);
+    });
+
+    test('sends mute changes immediately instead of rate-limiting them with meter updates', () => {
+      const messages = [];
+      const call = Object.create(RoomCall.prototype);
+      Object.assign(call, {
+        inputMonitorChannel: {
+          readyState: 'open',
+          bufferedAmount: 0,
+          send(message) { messages.push(JSON.parse(message)); }
+        },
+        lastInputMonitorSentAt: -Infinity,
+        lastInputMonitorSentState: null,
+        localInputMonitorState: { level: 0.5, muted: false, deviceLabel: '' }
+      });
+
+      call.sendInputMonitorState(0.5, false, 'USB Microphone');
+      call.lastInputMonitorSentAt = performance.now();
+      call.sendInputMonitorState(0, true, 'USB Microphone');
+
+      assert.equal(messages.length, 2);
+      assert.equal(messages[1].muted, true);
+    });
+
+    test('renders the other participant microphone name in the read-only selector', () => {
+      const call = Object.create(RoomCall.prototype);
+      const option = { textContent: '情報待ち' };
+      const muteClasses = new Set();
+      const muteState = {
+        textContent: 'WAIT',
+        classList: {
+          toggle(name, enabled) {
+            if (enabled) muteClasses.add(name);
+            else muteClasses.delete(name);
+          }
+        },
+        setAttribute(name, value) {
+          this[name] = value;
+        }
+      };
+      const waveform = {
+        meterFill: { style: {}, className: '' },
+        meter: { setAttribute(name, value) { this[name] = value; } },
+        device: { options: [option] },
+        muteState
+      };
+      call.remoteWaveforms = new Map([['track', waveform]]);
+
+      call.updateRemoteInputMonitor({ level: 0, muted: null, deviceLabel: '' });
+      assert.equal(muteState.textContent, 'WAIT');
+
+      call.updateRemoteInputMonitor({ level: 0.5, muted: true, deviceLabel: 'USB Microphone' });
+      assert.equal(option.textContent, 'USB Microphone · MUTE');
+      assert.equal(muteState.textContent, 'MUTED');
+      assert.equal(muteState['aria-label'], '相手はミュート中');
+      assert.equal(muteClasses.has('muted'), true);
+      assert.equal(waveform.meter['aria-valuenow'], '0');
+      assert.equal(waveform.meterFill.style.height, '0%');
+
+      call.updateRemoteInputMonitor({ level: 0.5, muted: false, deviceLabel: 'USB Microphone' });
+      assert.equal(muteState.textContent, 'UNMUTED');
+      assert.equal(muteState['aria-label'], '相手はミュートしていません');
+      assert.equal(muteClasses.has('muted'), false);
+      assert.equal(muteClasses.has('unmuted'), true);
     });
 
     host.receiveTurnCredentials({

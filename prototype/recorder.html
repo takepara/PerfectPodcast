@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#101318">
+  <meta name="theme-color" content="#080c0b">
   <meta name="description" content="PerfectPodcast ローカル録音プロトタイプ">
   <title>PerfectPodcast — Local Recorder</title>
   <link rel="stylesheet" href="./recorder.css">
   <script type="module" src="./recorder.js"></script>
 </head>
-<body>
+<body class="terminal-ui">
   <div class="top-rule" aria-hidden="true"></div>
   <main class="shell">
     <header class="topbar">
@@ -57,7 +57,7 @@
       <div class="studio-head">
         <button id="backButton" class="text-button" type="button"><span aria-hidden="true">←</span> セッション一覧</button>
         <div class="studio-title-row">
-          <div><h1 id="studioTitle">収録</h1></div>
+          <div class="studio-title-copy"><p class="terminal-breadcrumb">SYS / REC / SESSION</p><h1 id="studioTitle">収録</h1></div>
           <div class="participant-controls">
             <div class="participant-chip"><span id="roleBadge" class="role-badge">ホスト</span><span id="participantLabel">Participant</span></div>
             <button id="deleteSessionButton" class="button button-danger session-delete" type="button" hidden>セッション削除</button>
@@ -65,21 +65,16 @@
         </div>
       </div>
 
-      <div class="studio-grid">
+      <div class="studio-grid terminal-grid">
         <section class="panel record-panel" aria-labelledby="recordHeading">
+          <div class="terminal-section-code">01 // CAPTURE</div>
           <div class="panel-topline">
-            <div class="status-line"><span id="statusDot" class="status-dot"></span><span id="statusText">録音を始める準備ができました</span></div>
+            <div class="status-line visually-hidden"><span id="statusDot" class="status-dot"></span><span id="statusText" class="visually-hidden">録音を始める準備ができました</span></div>
             <span class="format-pill">24-bit / 48 kHz WAV</span>
           </div>
           <h2 id="recordHeading" class="visually-hidden">録音操作</h2>
           <div id="timer" class="timer" aria-live="off">00:00</div>
           <p id="recordingPreparation" class="recording-preparation" role="status" aria-live="polite" hidden></p>
-          <div class="meter-block">
-            <div class="meter-label"><span>入力レベル</span><span id="meterHint">マイク待機中</span></div>
-            <div class="meter" role="meter" aria-label="マイク入力レベル" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-              <div id="meterFill" class="meter-fill"></div>
-            </div>
-          </div>
           <div id="recordControls" class="controls">
             <button id="recordButton" class="button button-record" type="button"><span aria-hidden="true">●</span> 録音開始</button>
             <button id="stopButton" class="button button-stop" type="button" disabled><span aria-hidden="true">■</span> 録音停止</button>
@@ -93,8 +88,9 @@
         <section id="roomPanel" class="panel room-panel" aria-labelledby="roomHeading">
           <div class="room-heading">
             <div>
-              <span id="roomRoleLabel" class="room-role-label">ホスト操作</span>
-              <h2 id="roomHeading">ゲストを招待</h2>
+              <span class="terminal-section-code">02 // ROOM LINK</span>
+              <span id="roomRoleLabel" class="room-role-label visually-hidden">ホスト操作</span>
+              <h2 id="roomHeading" class="visually-hidden">ゲストを招待</h2>
             </div>
             <span class="format-pill">Opus · mono · 最大32 kbps</span>
           </div>
@@ -106,18 +102,6 @@
             <button id="retryTransferButton" class="button button-quiet" type="button" hidden>転送を再試行</button>
             <button id="leaveRoomButton" class="button button-quiet" type="button" hidden>通話を終了</button>
           </div>
-          <section id="transferProgressCard" class="transfer-progress" hidden aria-labelledby="transferProgressHeading">
-            <h3 id="transferProgressHeading">ゲスト音源の受信状況</h3>
-            <progress id="transferProgressBar" max="1" value="0" aria-label="音源の受信済み割合"></progress>
-            <p id="transferProgressText" role="status">通話接続後に保存状況を表示します。</p>
-            <details id="transferDiagnostics" class="transfer-diagnostics">
-              <summary>転送の詳しい状況</summary>
-              <p id="transferProgressDetails">詳細を読み込んでいます。</p>
-              <canvas id="transferGraph" width="600" height="132" aria-hidden="true"></canvas>
-              <p id="transferGraphSummary" role="status"></p>
-              <p class="transfer-graph-legend"><span>送出速度</span><span>保存確認速度</span><span>録音データ生成基準</span></p>
-            </details>
-          </section>
           <label id="inviteField" class="field invite-field" hidden>
             <span>招待リンク</span>
             <span class="invite-input-row">
@@ -135,18 +119,131 @@
               <button id="denyGuestButton" class="button button-danger" type="button">拒否</button>
             </div>
           </section>
+        </section>
+
+        <section id="networkPanel" class="panel network-panel" aria-labelledby="networkHeading">
+          <div class="network-heading">
+            <span class="terminal-section-code">03 // NETWORK</span>
+            <h2 id="networkHeading" class="visually-hidden">接続・音源受信</h2>
+          </div>
+          <section id="transferProgressCard" class="transfer-progress" aria-labelledby="transferProgressHeading">
+            <h3 id="transferProgressHeading" class="visually-hidden">ゲスト音源の受信状況</h3>
+            <progress id="transferProgressBar" max="1" value="0" aria-label="音源の受信済み割合"></progress>
+            <table class="network-metrics" aria-label="ネットワークと音源転送の状況">
+              <tbody>
+                <tr><th scope="row">未転送 / 総量</th><td id="transferProgressText" role="status">— / — · —%</td></tr>
+                <tr><th scope="row">RTT・jitter・損失・音声kbps</th><td id="connectionStats" role="status">—</td></tr>
+                <tr id="networkProgressErrorRow" hidden><th scope="row">エラー</th><td id="networkProgressError">—</td></tr>
+              </tbody>
+            </table>
+            <div class="visually-hidden">
+              <span id="callState">通話は未接続です</span>
+              <span id="recordingReadiness">録音準備は未確認です</span>
+            </div>
+            <div class="transfer-diagnostics">
+              <canvas id="transferGraph" width="600" height="96" aria-hidden="true"></canvas>
+              <p id="transferGraphSummary" role="status"></p>
+              <p class="transfer-graph-legend"><span>送出速度</span><span>保存確認速度</span></p>
+            </div>
+          </section>
           <div class="remote-audio-row">
-            <span id="callState" class="call-state">通話は未接続です</span>
-            <span id="recordingReadiness" class="call-state">録音準備は未確認です</span>
-            <p id="connectionStats" class="connection-stats" role="status" hidden>接続統計を取得していません</p>
             <audio id="remoteAudio" autoplay playsinline></audio>
             <button id="playRemoteAudioButton" class="button button-quiet" type="button" hidden>音声の再生を許可</button>
           </div>
         </section>
 
+      <section class="panel waveform-panel" aria-labelledby="waveformHeading">
+        <div class="waveform-panel-heading">
+          <div><span class="terminal-section-code">04 // TRACK MONITOR</span><h2 id="waveformHeading" class="visually-hidden">参加者ごとの音声波形</h2></div>
+          <span class="format-pill">60 SEC / PER-PARTICIPANT</span>
+        </div>
+        <div class="waveform-track">
+          <div class="waveform-heading">
+            <div class="waveform-track-title">
+              <span class="track-indicator" aria-hidden="true"></span>
+              <button id="microphoneMuteButton" class="button button-quiet meter-mute-button" type="button" aria-label="マイクをミュート" aria-pressed="false" disabled>MUTE</button>
+              <div>
+                <h3 id="waveformParticipant"></h3>
+              </div>
+            </div>
+            <div class="waveform-input-controls">
+              <label class="field waveform-device-field">
+                <span class="visually-hidden">録音マイク</span>
+                <select id="trackMicDevice" aria-label="録音マイク" aria-describedby="trackMicDeviceHint"><option value="">デバイスを確認しています…</option></select>
+              </label>
+              <span id="waveformState" class="waveform-state">録音待ち</span>
+            </div>
+          </div>
+          <p id="trackMicDeviceHint" class="waveform-device-hint" role="status"></p>
+          <div class="waveform-monitor-grid">
+            <div class="waveform-ruler-row">
+              <div class="waveform-ruler-spacer" aria-hidden="true"></div>
+              <div class="waveform-timeline">
+                <span id="waveMark0">00:00</span><span id="waveMark1">00:15</span><span id="waveMark2">00:30</span><span id="waveMark3">00:45</span><span id="waveMark4">01:00</span>
+              </div>
+            </div>
+            <div class="waveform-visual-row">
+              <div class="meter-block">
+                <div class="meter" role="meter" aria-orientation="vertical" aria-label="マイク入力レベル" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                  <div id="meterFill" class="meter-fill"></div>
+                </div>
+              </div>
+              <div class="waveform-visual">
+              <div class="waveform-canvas-wrap">
+                <canvas id="waveformCanvas" aria-label="自分のマイク入力の波形"></canvas>
+              </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="remoteWaveformTracks" class="remote-waveform-tracks"></div>
+        <template id="remoteWaveformTemplate">
+          <div class="waveform-track remote-waveform-track">
+            <div class="waveform-heading">
+              <div class="waveform-track-title">
+                <span class="track-indicator remote-track-indicator" aria-hidden="true"></span>
+                <div>
+                  <h3 class="remote-waveform-participant"></h3>
+                </div>
+              </div>
+              <div class="waveform-input-controls">
+                <label class="field waveform-device-field remote-waveform-device-field">
+                  <span class="visually-hidden">相手が選択中のマイク</span>
+                  <select class="remote-waveform-device" aria-label="相手が選択中のマイク" disabled><option value="">情報待ち</option></select>
+                </label>
+                <span class="waveform-state remote-waveform-state">音声待ち</span>
+              </div>
+            </div>
+            <div class="waveform-monitor-grid">
+              <div class="waveform-ruler-row remote-waveform-ruler-row">
+                <div class="waveform-ruler-control">
+                  <span class="remote-mute-state wait" aria-live="polite" aria-label="相手のミュート状態を確認中">WAIT</span>
+                </div>
+                <div class="waveform-timeline">
+                  <span>00:00</span><span>00:15</span><span>00:30</span><span>00:45</span><span>01:00</span>
+                </div>
+              </div>
+              <div class="waveform-visual-row remote-waveform-visual-row">
+                <div class="meter-block remote-meter-block">
+                  <div class="meter remote-waveform-meter" role="meter" aria-orientation="vertical" aria-label="相手のマイク入力レベル" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                    <div class="meter-fill remote-waveform-meter-fill"></div>
+                  </div>
+                </div>
+                <div class="waveform-visual">
+                <div class="waveform-canvas-wrap">
+                  <canvas class="remote-waveform-canvas" aria-label="相手のマイク入力の波形"></canvas>
+                </div>
+                </div>
+              </div>
+            </div>
+            </div>
+        </template>
+      </section>
+
         <aside class="panel storage-panel" aria-labelledby="storageHeading">
           <div class="panel-heading compact">
-            <span class="storage-icon" aria-hidden="true">▤</span>
+            <span class="terminal-section-code">05 // LOCAL FILE INVENTORY</span>
             <h2 id="storageHeading">端末の保存状況</h2>
           </div>
           <div class="saved-total"><span>このセッションの保存済み</span><strong id="sessionSaved">0.00 MB</strong></div>
@@ -158,57 +255,6 @@
           </section>
         </aside>
       </div>
-
-      <section class="panel waveform-panel" aria-labelledby="waveformHeading">
-        <h2 id="waveformHeading" class="visually-hidden">参加者ごとの音声波形</h2>
-        <div class="waveform-track">
-          <div class="waveform-heading">
-            <div class="waveform-track-title">
-              <span class="track-indicator" aria-hidden="true"></span>
-              <div>
-                <h3>自分のトラック</h3>
-                <p id="waveformParticipant">この端末の入力</p>
-              </div>
-            </div>
-            <div class="waveform-input-controls">
-              <label class="field waveform-device-field">
-                <span>自分の録音マイク（入力1 / L）</span>
-                <select id="trackMicDevice" aria-describedby="trackMicDeviceHint"><option value="">デバイスを確認しています…</option></select>
-              </label>
-              <span id="waveformState" class="waveform-state">録音待ち</span>
-            </div>
-          </div>
-          <p id="trackMicDeviceHint" class="waveform-device-hint" role="status"></p>
-          <div class="waveform-timeline">
-            <span id="waveMark0">00:00</span><span id="waveMark1">00:15</span><span id="waveMark2">00:30</span><span id="waveMark3">00:45</span><span id="waveMark4">01:00</span>
-          </div>
-          <div class="waveform-canvas-wrap">
-            <canvas id="waveformCanvas" aria-label="自分のマイク入力の波形"></canvas>
-          </div>
-        </div>
-
-        <div id="remoteWaveformTracks" class="remote-waveform-tracks"></div>
-        <template id="remoteWaveformTemplate">
-          <div class="waveform-track remote-waveform-track">
-            <div class="waveform-heading">
-              <div class="waveform-track-title">
-                <span class="track-indicator remote-track-indicator" aria-hidden="true"></span>
-                <div>
-                  <h3 class="remote-waveform-title"></h3>
-                  <p class="remote-waveform-participant"></p>
-                </div>
-              </div>
-              <span class="waveform-state remote-waveform-state">音声待ち</span>
-            </div>
-            <div class="waveform-timeline">
-              <span>00:00</span><span>00:15</span><span>00:30</span><span>00:45</span><span>01:00</span>
-            </div>
-            <div class="waveform-canvas-wrap">
-              <canvas class="remote-waveform-canvas" aria-label="相手のマイク入力の波形"></canvas>
-            </div>
-          </div>
-        </template>
-      </section>
 
     </section>
   </main>

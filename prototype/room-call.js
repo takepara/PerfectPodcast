@@ -1,6 +1,7 @@
 import { calculateIntervalStats } from './connection-stats.js';
 import { calculateClockSample, selectClockSample } from './clock-sync.js';
 import { RecordingTransfer } from './recording-transfer.js';
+import { appendAlignedWaveformPeak, resetWaveformHistory } from './waveform-history.js';
 
 const $ = (id) => document.getElementById(id);
 const ROOM_ID_PATTERN = /^[A-Za-z0-9_-]{43}$/;
@@ -248,6 +249,11 @@ export class RoomCall {
     this.remoteTransferProgress = null;
     this.socketReady = null;
     this.remoteWaveforms = new Map();
+    this.inputMonitorChannel = null;
+    this.lastInputMonitorSentAt = -Infinity;
+    this.lastInputMonitorSentState = null;
+    this.localInputMonitorState = { level: 0, muted: false, deviceLabel: '' };
+    this.remoteInputMonitorState = { level: 0, muted: null, deviceLabel: '' };
     this.waveformRecordingStartedAt = null;
     this.invitation = this.readInvitation();
     this.bindControls();
@@ -533,6 +539,116 @@ export class RoomCall {
 
   setCallState(message) {
     $('callState').textContent = message;
+  }
+
+  sendInputMonitorState(level, muted, deviceLabel) {
+    this.localInputMonitorState = {
+      level: Number.isFinite(level) ? Math.max(0, Math.min(1, level)) : 0,
+      muted: Boolean(muted),
+      deviceLabel: typeof deviceLabel === 'string' ? deviceLabel.slice(0, 120) : ''
+    };
+    const channel = this.inputMonitorChannel;
+    if (!channel || channel.readyState !== 'open' || channel.bufferedAmount > 4096) return;
+    const stateChanged = !this.lastInputMonitorSentState ||
+      this.lastInputMonitorSentState.muted !== this.localInputMonitorState.muted ||
+      this.lastInputMonitorSentState.deviceLabel !== this.localInputMonitorState.deviceLabel;
+    if (!stateChanged && performance.now() - this.lastInputMonitorSentAt < 100) return;
+    channel.send(JSON.stringify({ type: 'input-state', ...this.localInputMonitorState }));
+    this.lastInputMonitorSentAt = performance.now();
+    this.lastInputMonitorSentState = {
+      muted: this.localInputMonitorState.muted,
+      deviceLabel: this.localInputMonitorState.deviceLabel
+    };
+  }
+
+  setInputMonitorChannel(channel) {
+    this.inputMonitorChannel = channel;
+    channel.addEventListener('open', () => {
+      if (this.inputMonitorChannel !== channel) return;
+      this.lastInputMonitorSentAt = -Infinity;
+      this.lastInputMonitorSentState = null;
+      this.sendInputMonitorState(
+        this.localInputMonitorState.level,
+        this.localInputMonitorState.muted,
+        this.localInputMonitorState.deviceLabel
+      );
+    });
+    channel.addEventListener('message', ({ data }) => this.receiveInputMonitorMessage(data));
+    channel.addEventListener('close', () => {
+      if (this.inputMonitorChannel !== channel) return;
+      this.inputMonitorChannel = null;
+      this.lastInputMonitorSentAt = -Infinity;
+      this.lastInputMonitorSentState = null;
+      this.updateRemoteInputMonitor({ level: 0, muted: null, deviceLabel: '' });
+    });
+    channel.addEventListener('error', () => {
+      if (this.inputMonitorChannel === channel) {
+        this.setStatus('相手のマイク入力レベルを同期できません。', true);
+      }
+    });
+    if (channel.readyState === 'open') {
+      this.lastInputMonitorSentAt = -Infinity;
+      this.lastInputMonitorSentState = null;
+      this.sendInputMonitorState(
+        this.localInputMonitorState.level,
+        this.localInputMonitorState.muted,
+        this.localInputMonitorState.deviceLabel
+      );
+    }
+  }
+
+  receiveInputMonitorMessage(data) {
+    if (typeof data !== 'string' || data.length > 512) {
+      this.setStatus('相手のマイク情報の形式が不正です。', true);
+      return;
+    }
+    let message;
+    try {
+      message = JSON.parse(data);
+    } catch (error) {
+      this.setStatus(`相手のマイク情報を読み取れません: ${error.message}`, true);
+      return;
+    }
+    if (!message || message.type !== 'input-state' ||
+        !Number.isFinite(message.level) || message.level < 0 || message.level > 1 ||
+        typeof message.muted !== 'boolean' ||
+        typeof message.deviceLabel !== 'string' || message.deviceLabel.length > 120) {
+      this.setStatus('相手のマイク情報の形式が不正です。', true);
+      return;
+    }
+    this.updateRemoteInputMonitor({
+      level: message.level,
+      muted: message.muted,
+      deviceLabel: message.deviceLabel
+    });
+  }
+
+  updateRemoteInputMonitor(state) {
+    this.remoteInputMonitorState = state;
+    for (const waveform of this.remoteWaveforms.values()) {
+      const peak = state.muted ? 0 : state.level;
+      const db = peak > 0.0001 ? 20 * Math.log10(peak) : -Infinity;
+      const percent = Number.isFinite(db) ? Math.max(0, Math.min(100, ((db + 60) / 60) * 100)) : 0;
+      waveform.meterFill.style.height = `${percent}%`;
+      waveform.meterFill.className =
+        `meter-fill remote-waveform-meter-fill${peak >= 0.999 ? ' clipping' : db >= -6 ? ' near-clip' : db >= -40 ? ' good' : ''}`;
+      waveform.meter.setAttribute('aria-valuenow', String(Math.round(percent)));
+      const deviceLabel = `${state.deviceLabel || '情報待ち'}${state.muted ? ' · MUTE' : ''}`;
+      const option = waveform.device.options[0];
+      if (option && option.textContent !== deviceLabel) option.textContent = deviceLabel;
+      if (waveform.muteState) {
+        const muteState = state.muted === null ? 'wait' : state.muted ? 'muted' : 'unmuted';
+        waveform.muteState.textContent =
+          muteState === 'wait' ? 'WAIT' : muteState === 'muted' ? 'MUTED' : 'UNMUTED';
+        waveform.muteState.classList.toggle('muted', muteState === 'muted');
+        waveform.muteState.classList.toggle('unmuted', muteState === 'unmuted');
+        waveform.muteState.classList.toggle('wait', muteState === 'wait');
+        waveform.muteState.setAttribute('aria-label',
+          muteState === 'wait'
+            ? '相手のミュート状態を確認中'
+            : muteState === 'muted' ? '相手はミュート中' : '相手はミュートしていません');
+      }
+    }
   }
 
   updateReadinessUI() {
@@ -889,11 +1005,17 @@ export class RoomCall {
     this.stopRemoteWaveform(track.id);
 
     const element = $('remoteWaveformTemplate').content.firstElementChild.cloneNode(true);
+    const waveformStartedAt = this.waveformRecordingStartedAt;
+    const now = performance.now();
     const waveform = {
       id: track.id,
       element,
       track,
       canvas: element.querySelector('.remote-waveform-canvas'),
+      meter: element.querySelector('.remote-waveform-meter'),
+      meterFill: element.querySelector('.remote-waveform-meter-fill'),
+      device: element.querySelector('.remote-waveform-device'),
+      muteState: element.querySelector('.remote-mute-state'),
       state: element.querySelector('.remote-waveform-state'),
       labels: element.querySelectorAll('.waveform-timeline span'),
       audioContext: null,
@@ -902,20 +1024,20 @@ export class RoomCall {
       silentGain: null,
       samples: null,
       history: new Float32Array(600),
-      historyCount: this.waveformRecordingStartedAt === null
-        ? 0
-        : Math.min(600, Math.floor(Math.max(0, performance.now() - this.waveformRecordingStartedAt) / 100)),
+      historyCount: 0,
+      lastSampleIndex: -1,
+      recordingStartedAt: null,
       animationFrame: null,
-      sampledAt: this.waveformRecordingStartedAt ?? 0,
-      startedAt: this.waveformRecordingStartedAt ?? performance.now(),
+      sampledAt: now,
+      startedAt: now,
       rulerSecond: -1
     };
-    element.querySelector('.remote-waveform-title').textContent =
-      this.localRole === 'guest' ? 'ホストのトラック' : 'ゲストのトラック';
+    resetWaveformHistory(waveform, waveformStartedAt, now);
     element.querySelector('.remote-waveform-participant').textContent = participantName;
     waveform.canvas.setAttribute('aria-label', `${participantName}のマイク入力の波形`);
     $('remoteWaveformTracks').append(element);
     this.remoteWaveforms.set(waveform.id, waveform);
+    this.updateRemoteInputMonitor(this.remoteInputMonitorState);
 
     try {
       waveform.audioContext = new AudioContext();
@@ -927,8 +1049,12 @@ export class RoomCall {
       waveform.silentGain.gain.value = 0;
       waveform.source.connect(waveform.analyser);
       waveform.analyser.connect(waveform.silentGain).connect(waveform.audioContext.destination);
-      this.setRemoteWaveState(track.muted ? '音声待ち' : '波形準備中', false, track.id);
-      this.drawRemoteWaveform(waveform);
+      this.setRemoteWaveState(
+        track.muted ? '音声待ち' : waveformStartedAt === null ? '録音待ち' : '波形準備中',
+        false,
+        track.id
+      );
+      if (waveformStartedAt !== null) this.drawRemoteWaveform(waveform);
       if (waveform.audioContext.state === 'suspended') {
         void waveform.audioContext.resume().catch((error) => {
           this.setRemoteWaveState('波形停止', false, track.id);
@@ -945,28 +1071,28 @@ export class RoomCall {
     if (!Number.isFinite(startedAt)) throw new Error('波形の録音開始時刻が不正です。');
     this.waveformRecordingStartedAt = startedAt;
     for (const waveform of this.remoteWaveforms.values()) {
-      waveform.history.fill(0);
-      waveform.historyCount = 0;
-      waveform.sampledAt = startedAt;
-      waveform.startedAt = startedAt;
-      waveform.rulerSecond = -1;
+      resetWaveformHistory(waveform, startedAt, startedAt);
+      this.setRemoteWaveState(waveform.track.muted ? '音声待ち' : '波形準備中', false, waveform.id);
+      this.drawRemoteWaveform(waveform);
     }
   }
 
   endRecordingWaveform() {
     this.waveformRecordingStartedAt = null;
-    const startedAt = performance.now();
     for (const waveform of this.remoteWaveforms.values()) {
-      waveform.history.fill(0);
-      waveform.historyCount = 0;
-      waveform.sampledAt = startedAt;
-      waveform.startedAt = startedAt;
-      waveform.rulerSecond = -1;
+      if (waveform.animationFrame !== null) window.cancelAnimationFrame(waveform.animationFrame);
+      waveform.animationFrame = null;
+      resetWaveformHistory(waveform, null);
+      const context = waveform.canvas.getContext('2d');
+      if (context) context.clearRect(0, 0, waveform.canvas.width, waveform.canvas.height);
+      this.setRemoteWaveState(waveform.track.muted ? '音声待ち' : '録音待ち', false, waveform.id);
     }
   }
 
   drawRemoteWaveform(waveform) {
-    if (this.remoteWaveforms.get(waveform.id) !== waveform) return;
+    waveform.animationFrame = null;
+    if (this.remoteWaveforms.get(waveform.id) !== waveform ||
+        this.waveformRecordingStartedAt === null || waveform.recordingStartedAt === null) return;
     const canvas = waveform.canvas;
     const context = canvas.getContext('2d');
     if (!context || !canvas.parentElement) {
@@ -995,13 +1121,7 @@ export class RoomCall {
       waveform.analyser.getFloatTimeDomainData(waveform.samples);
       let peak = 0;
       for (const sample of waveform.samples) peak = Math.max(peak, Math.abs(sample));
-      if (waveform.historyCount === waveform.history.length) {
-        waveform.history.copyWithin(0, 1);
-        waveform.history[waveform.history.length - 1] = peak;
-      } else {
-        waveform.history[waveform.historyCount] = peak;
-        waveform.historyCount += 1;
-      }
+      appendAlignedWaveformPeak(waveform, peak, now);
       waveform.sampledAt = now;
       this.setRemoteWaveState('LIVE', true, waveform.id);
     } else if (waveform.track.muted) {
@@ -1035,7 +1155,9 @@ export class RoomCall {
       }
       waveform.rulerSecond = rulerSecond;
     }
-    waveform.animationFrame = window.requestAnimationFrame(() => this.drawRemoteWaveform(waveform));
+    if (this.waveformRecordingStartedAt !== null) {
+      waveform.animationFrame = window.requestAnimationFrame(() => this.drawRemoteWaveform(waveform));
+    }
   }
 
   stopRemoteWaveform(trackId = null) {
@@ -1272,6 +1394,9 @@ export class RoomCall {
         this.clearPendingStartEvents();
         for (const pending of this.pendingRecordingCommands.values()) window.clearTimeout(pending.timer);
         this.pendingRecordingCommands.clear();
+        this.inputMonitorChannel?.close();
+        this.inputMonitorChannel = null;
+        this.remoteInputMonitorState = { level: 0, muted: null, deviceLabel: '' };
         this.peerConnection?.close();
         this.peerConnection = null;
         this.localSender = null;
@@ -1500,8 +1625,21 @@ export class RoomCall {
     if (this.localRole === 'host') {
       const channel = this.peerConnection.createDataChannel('master-transfer-v1', { ordered: true });
       this.recordingTransfer.setChannel(channel);
+      this.setInputMonitorChannel(this.peerConnection.createDataChannel(
+        'input-monitor-v1',
+        { ordered: false, maxRetransmits: 0 }
+      ));
     } else {
       this.peerConnection.addEventListener('datachannel', ({ channel }) => {
+        if (channel.label === 'input-monitor-v1') {
+          if (channel.ordered || channel.maxRetransmits !== 0 || channel.maxPacketLifeTime !== null) {
+            channel.close();
+            this.setStatus('マイクレベル同期用DataChannelを拒否しました。', true);
+            return;
+          }
+          this.setInputMonitorChannel(channel);
+          return;
+        }
         if (channel.label !== 'master-transfer-v1' || !channel.ordered ||
             channel.maxRetransmits !== null || channel.maxPacketLifeTime !== null) {
           channel.close();
@@ -1557,15 +1695,15 @@ export class RoomCall {
             : '通話接続済み · 相手のマイク音声を待っています');
         }
       } else if (state === 'failed') {
-        this.stopConnectionStats('接続に失敗しました。再接続を試しています。');
+        this.stopConnectionStats();
         this.setCallState('接続に失敗しました。再接続またはローカル録音を続けてください。');
         this.scheduleIceRestart(0);
       } else if (state === 'disconnected') {
-        this.stopConnectionStats('再接続中のため統計は一時停止しています。');
+        this.stopConnectionStats();
         this.setCallState('接続が不安定です。再接続を試しています…');
         this.scheduleIceRestart();
       } else if (state === 'connecting' || state === 'new') {
-        this.stopConnectionStats('接続確立後に統計を表示します。');
+        this.stopConnectionStats();
       }
     });
     this.peerConnection.addEventListener('iceconnectionstatechange', () => {
@@ -1579,20 +1717,20 @@ export class RoomCall {
     this.previousTransferStats = null;
     this.transferSendMbps = null;
     $('connectionStats').hidden = false;
-    $('connectionStats').textContent = '接続統計を取得しています…';
+    $('connectionStats').textContent = '—';
     void this.updateConnectionStats();
     this.statsTimer = window.setInterval(() => { void this.updateConnectionStats(); }, 2000);
   }
 
-  stopConnectionStats(message) {
+  stopConnectionStats() {
     window.clearInterval(this.statsTimer);
     this.statsTimer = null;
     this.previousStats = null;
     this.previousTransferStats = null;
     this.transferSendMbps = null;
     const stats = $('connectionStats');
-    stats.hidden = !this.peerConnection;
-    stats.textContent = message;
+    stats.hidden = false;
+    stats.textContent = '—';
   }
 
   async updateConnectionStats() {
@@ -1654,22 +1792,12 @@ export class RoomCall {
       if (intervalStats.packetLossPercent !== null) {
         parts.push(`損失 ${intervalStats.packetLossPercent.toFixed(1)}%`);
       }
-      if (intervalStats.concealedSamples !== null) {
-        parts.push(`補間 ${intervalStats.concealedSamples} samples`);
-      }
       if (intervalStats.bitrateKbps !== null) {
         parts.push(`送信 ${Math.round(intervalStats.bitrateKbps)} kbps`);
       }
-      if (pair) {
-        const local = reports.get(pair.localCandidateId)?.candidateType;
-        const remote = reports.get(pair.remoteCandidateId)?.candidateType;
-        if (local || remote) parts.push(`経路 ${local || '?'} → ${remote || '?'}`);
-      } else if (reportList.some((report) => report.type === 'candidate-pair')) {
-        parts.push('選択ICE経路を取得できません');
-      }
       const stats = $('connectionStats');
       stats.hidden = false;
-      stats.textContent = parts.length ? parts.join(' · ') : 'このブラウザーでは接続統計を取得できません';
+      stats.textContent = parts.length ? parts.join(' · ') : '—';
     } catch (error) {
       if (this.peerConnection !== peerConnection) return;
       $('connectionStats').hidden = false;
@@ -1916,9 +2044,12 @@ export class RoomCall {
     const previousRole = this.localRole;
     const wasConnected = this.connected;
     this.recordingTransfer.close();
+    this.inputMonitorChannel?.close();
+    this.inputMonitorChannel = null;
+    this.remoteInputMonitorState = { level: 0, muted: null, deviceLabel: '' };
     this.peerConnection?.close();
     this.peerConnection = null;
-    this.stopConnectionStats('通話は未接続です');
+    this.stopConnectionStats();
     if (this.socket) {
       const socket = this.socket;
       this.socket = null;

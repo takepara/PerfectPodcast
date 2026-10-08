@@ -10,6 +10,7 @@ import { splitTransferBacklog, summarizeTransferChunks } from './transfer-progre
 import { monitorRecordingTrack } from './recording-track-monitor.js';
 import { makeRecordingFilename } from './recording-filename.js';
 import { connectFirstMicrophoneChannel } from './microphone-input.js';
+import { appendAlignedWaveformPeak, resetWaveformHistory } from './waveform-history.js';
 
 const TARGET_RATE = 48000;
 const BYTES_PER_FRAME = 3;
@@ -60,7 +61,7 @@ let previewAnalyserNode = null;
 let previewSilentGain = null;
 let previewSamples = null;
 let previewStream = null;
-let previewStartedAt = 0;
+let microphoneMuted = false;
 let recording = false;
 let finalizing = false;
 let starting = false;
@@ -80,10 +81,16 @@ let takeStartedAt = 0;
 let lastPeak = 0;
 let waveformSamples = null;
 let waveformFrame = null;
-let waveformHistory = new Float32Array(600);
-let waveformCount = 0;
-let lastWaveformSample = 0;
-let lastRulerSecond = -1;
+let meterFrame = null;
+const localWaveform = {
+  history: new Float32Array(600),
+  historyCount: 0,
+  lastSampleIndex: -1,
+  recordingStartedAt: null,
+  sampledAt: 0,
+  startedAt: 0,
+  rulerSecond: -1
+};
 let waveformElapsedSeconds = 0;
 let hostRecordingCommand = Promise.resolve();
 let lastHostRecordingState = null;
@@ -234,10 +241,66 @@ function updateMeter(peak) {
   const db = lastPeak > 0.0001 ? 20 * Math.log10(lastPeak) : -Infinity;
   const percent = Number.isFinite(db) ? Math.max(0, Math.min(100, ((db + 60) / 60) * 100)) : 0;
   const fill = $('meterFill');
-  fill.style.width = `${percent}%`;
+  fill.style.height = `${percent}%`;
   fill.className = `meter-fill${lastPeak >= 0.999 ? ' clipping' : db >= -6 ? ' near-clip' : db >= -40 ? ' good' : ''}`;
   meter.setAttribute('aria-valuenow', String(Math.round(percent)));
-  $('meterHint').textContent = lastPeak >= 0.999 ? '入力が大きすぎます' : db >= -40 ? '入力を検出中' : '小さな音を待っています';
+  roomCall?.sendInputMonitorState(peak, microphoneMuted, getLocalMicrophoneLabel());
+}
+
+function getLocalMicrophoneLabel() {
+  return (trackMicDevice.selectedOptions[0]?.textContent || micDevice.selectedOptions[0]?.textContent || '')
+    .trim()
+    .slice(0, 120);
+}
+
+function getLiveMicrophoneTracks() {
+  return [...new Set([mediaStream, previewStream]
+    .filter(Boolean)
+    .flatMap((stream) => stream.getAudioTracks()))]
+    .filter((track) => track.readyState === 'live');
+}
+
+function updateMicrophoneMuteButton() {
+  const button = $('microphoneMuteButton');
+  button.disabled = getLiveMicrophoneTracks().length === 0;
+  button.textContent = microphoneMuted ? 'UNMUTE' : 'MUTE';
+  button.setAttribute('aria-pressed', String(microphoneMuted));
+  button.setAttribute('aria-label', microphoneMuted ? 'マイクのミュートを解除' : 'マイクをミュート');
+}
+
+function toggleMicrophoneMute() {
+  const tracks = getLiveMicrophoneTracks();
+  if (!tracks.length) {
+    setMessage('ミュートするマイクが接続されていません。', true);
+    updateMicrophoneMuteButton();
+    return;
+  }
+  microphoneMuted = !microphoneMuted;
+  for (const track of tracks) track.enabled = !microphoneMuted;
+  if (microphoneMuted) lastPeak = 0;
+  updateMicrophoneMuteButton();
+  updateMeter(microphoneMuted ? 0 : lastPeak);
+}
+
+function samplePreviewMeter() {
+  meterFrame = null;
+  if (!previewStream || !previewAnalyserNode || !previewSamples || recording) return;
+  if (previewAudioContext?.state === 'running') {
+    previewAnalyserNode.getFloatTimeDomainData(previewSamples);
+    let peak = 0;
+    for (const sample of previewSamples) peak = Math.max(peak, Math.abs(sample));
+    updateMeter(peak);
+  }
+  meterFrame = window.requestAnimationFrame(samplePreviewMeter);
+}
+
+function startMeterMonitoring() {
+  if (meterFrame === null) meterFrame = window.requestAnimationFrame(samplePreviewMeter);
+}
+
+function stopMeterMonitoring() {
+  if (meterFrame !== null) window.cancelAnimationFrame(meterFrame);
+  meterFrame = null;
 }
 
 function setLocalWaveformState(text, live = false) {
@@ -248,12 +311,14 @@ function setLocalWaveformState(text, live = false) {
 function startLocalPreview(stream) {
   if (!stream || recording || starting || previewStream === stream) return;
   stopLocalPreview();
+  previewStream = stream;
+  for (const track of stream.getAudioTracks()) track.enabled = !microphoneMuted;
+  updateMicrophoneMuteButton();
   if (!window.AudioContext) {
     setLocalWaveformState('波形非対応');
     return;
   }
   try {
-    previewStream = stream;
     previewAudioContext = new AudioContext();
     previewSourceNode = previewAudioContext.createMediaStreamSource(stream);
     previewAnalyserNode = previewAudioContext.createAnalyser();
@@ -263,17 +328,19 @@ function startLocalPreview(stream) {
     previewSilentGain.gain.value = 0;
     previewInputChannelNode = connectFirstMicrophoneChannel(previewAudioContext, previewSourceNode, previewAnalyserNode);
     previewAnalyserNode.connect(previewSilentGain).connect(previewAudioContext.destination);
-    previewStartedAt = performance.now();
-    waveformHistory.fill(0);
-    waveformCount = 0;
-    lastWaveformSample = 0;
+    lastPeak = 0;
+    updateMeter(0);
     const context = previewAudioContext;
     if (context.state === 'running') {
-      setLocalWaveformState('LIVE', true);
+      setLocalWaveformState('録音待ち');
+      startMeterMonitoring();
     } else if (context.state === 'suspended') {
       setLocalWaveformState('波形準備中');
       void context.resume().then(() => {
-        if (previewAudioContext === context && !recording) setLocalWaveformState('LIVE', true);
+        if (previewAudioContext === context && !recording) {
+          setLocalWaveformState('録音待ち');
+          startMeterMonitoring();
+        }
       }).catch((error) => {
         if (previewAudioContext !== context) return;
         setLocalWaveformState('波形停止');
@@ -290,6 +357,7 @@ function startLocalPreview(stream) {
 }
 
 function stopLocalPreview() {
+  stopMeterMonitoring();
   previewSourceNode?.disconnect();
   previewInputChannelNode?.disconnect();
   previewAnalyserNode?.disconnect();
@@ -304,9 +372,21 @@ function stopLocalPreview() {
   previewSilentGain = null;
   previewSamples = null;
   previewStream = null;
+  updateMicrophoneMuteButton();
+}
+
+function stopWaveformRendering() {
+  if (waveformFrame !== null) window.cancelAnimationFrame(waveformFrame);
+  waveformFrame = null;
+  resetWaveformHistory(localWaveform, null);
+  waveformElapsedSeconds = 0;
+  const context = waveformCanvas.getContext('2d');
+  if (context) context.clearRect(0, 0, waveformCanvas.width, waveformCanvas.height);
 }
 
 function drawWaveform() {
+  waveformFrame = null;
+  if (!recording) return;
   const context = waveformCanvas.getContext('2d');
   if (!context || !waveformCanvas.parentElement) return;
   const bounds = waveformCanvas.parentElement.getBoundingClientRect();
@@ -326,37 +406,26 @@ function drawWaveform() {
   context.stroke();
 
   const now = performance.now();
-  if (recording) waveformElapsedSeconds = (now - takeStartedAt) / 1000;
-  else if (previewStream && previewAudioContext?.state === 'running') {
-    waveformElapsedSeconds = (now - previewStartedAt) / 1000;
-  }
+  waveformElapsedSeconds = (now - takeStartedAt) / 1000;
   const elapsedSeconds = waveformElapsedSeconds;
-  const currentAnalyser = recording ? analyserNode : previewAnalyserNode;
-  const currentSamples = recording ? waveformSamples : previewSamples;
-  const canSample = recording || Boolean(previewStream && previewAudioContext?.state === 'running');
-  if (currentAnalyser && currentSamples && canSample && now - lastWaveformSample >= 100) {
-    currentAnalyser.getFloatTimeDomainData(currentSamples);
+  if (analyserNode && waveformSamples && audioContext?.state === 'running' &&
+      now - localWaveform.sampledAt >= 100) {
+    analyserNode.getFloatTimeDomainData(waveformSamples);
     let peak = 0;
-    for (const sample of currentSamples) peak = Math.max(peak, Math.abs(sample));
-    if (waveformCount === waveformHistory.length) {
-      waveformHistory.copyWithin(0, 1);
-      waveformHistory[waveformHistory.length - 1] = peak;
-    } else {
-      waveformHistory[waveformCount] = peak;
-      waveformCount += 1;
-    }
-    lastWaveformSample = now;
+    for (const sample of waveformSamples) peak = Math.max(peak, Math.abs(sample));
+    appendAlignedWaveformPeak(localWaveform, peak, now);
+    localWaveform.sampledAt = now;
     setLocalWaveformState('LIVE', true);
   }
-  if (waveformCount > 0) {
+  if (localWaveform.historyCount > 0) {
     context.beginPath();
     context.lineWidth = Math.max(1, pixelRatio);
     context.strokeStyle = '#55d6b2';
     context.shadowColor = 'rgb(85 214 178 / 45%)';
     context.shadowBlur = 5 * pixelRatio;
-    for (let index = 0; index < waveformCount; index += 1) {
-      const x = (index / waveformHistory.length) * width;
-      const amplitude = Math.sqrt(Math.max(0, waveformHistory[index])) * height * 0.44;
+    for (let index = 0; index < localWaveform.historyCount; index += 1) {
+      const x = (index / localWaveform.history.length) * width;
+      const amplitude = Math.sqrt(Math.max(0, localWaveform.history[index])) * height * 0.44;
       context.moveTo(x, height / 2 - amplitude);
       context.lineTo(x, height / 2 + amplitude);
     }
@@ -364,14 +433,14 @@ function drawWaveform() {
     context.shadowBlur = 0;
   }
   const rulerSecond = Math.floor(elapsedSeconds);
-  if (rulerSecond !== lastRulerSecond) {
+  if (rulerSecond !== localWaveform.rulerSecond) {
     const firstMark = elapsedSeconds >= 60 ? elapsedSeconds - 60 : 0;
     for (let index = 0; index < 5; index += 1) {
       $('waveMark' + index).textContent = formatDuration(firstMark + index * 15);
     }
-    lastRulerSecond = rulerSecond;
+    localWaveform.rulerSecond = rulerSecond;
   }
-  waveformFrame = window.requestAnimationFrame(drawWaveform);
+  if (recording) waveformFrame = window.requestAnimationFrame(drawWaveform);
 }
 
 async function runRequest(storeName, method, ...args) {
@@ -774,6 +843,15 @@ function formatTransferMegabytes(bytes) {
   return `${(bytes / 1_000_000).toFixed(2)} MB`;
 }
 
+function formatTransferRatio(untransferredBytes, totalBytes) {
+  const total = Math.max(0, totalBytes);
+  const untransferred = Math.min(total, Math.max(0, untransferredBytes));
+  const completion = total > 0
+    ? `${Math.round((1 - untransferred / total) * 100)}%`
+    : '—';
+  return `${formatTransferMegabytes(untransferred)} / ${formatTransferMegabytes(total)} · 完了 ${completion}`;
+}
+
 function drawTransferGraph(now) {
   const canvas = $('transferGraph');
   const context = canvas.getContext?.('2d');
@@ -803,14 +881,6 @@ function drawTransferGraph(now) {
   }
   context.fillText('60秒前', left, height - 4);
   context.fillText('現在', right - 25, height - 4);
-
-  context.strokeStyle = '#e9b85b';
-  context.setLineDash([4, 4]);
-  context.beginPath();
-  context.moveTo(left, y(1.152));
-  context.lineTo(right, y(1.152));
-  context.stroke();
-  context.setLineDash([]);
 
   for (const [key, color] of [['sendMbps', '#59d6b2'], ['ackMbps', '#82aaff']]) {
     context.strokeStyle = color;
@@ -846,31 +916,32 @@ function updateTransferGraph(now, sendMbps, ackBytesPerSecond) {
   const sample = transferGraphSamples.at(-1);
   const sendText = sample.sendMbps === null ? '—' : `${sample.sendMbps.toFixed(2)} Mbps`;
   const ackText = sample.ackMbps === null ? '—' : `${sample.ackMbps.toFixed(2)} Mbps`;
-  $('transferGraphSummary').textContent =
-    `直近60秒: DataChannel送出 ${sendText} · ACK確定 ${ackText} · マスター生成基準 1.152 Mbps`;
+  $('transferGraphSummary').textContent = `送出 ${sendText} · 保存確認 ${ackText}`;
 }
 
 async function updateTransferProgress() {
   const card = $('transferProgressCard');
   const text = $('transferProgressText');
-  const details = $('transferProgressDetails');
-  const diagnostics = $('transferDiagnostics');
   const bar = $('transferProgressBar');
   const generation = roomCall?.authFields?.generation;
   if (!roomCall?.localRole || !generation) {
-    card.hidden = true;
     card.classList.remove('transfer-error');
-    diagnostics.open = false;
     previousTransferProgress = null;
     transferGraphSamples = [];
+    bar.value = 0;
+    text.textContent = '— / — · 完了 —';
+    $('networkProgressError').textContent = '—';
+    $('networkProgressErrorRow').hidden = true;
+    drawTransferGraph(performance.now());
+    $('transferGraphSummary').textContent = '送出 — · 保存確認 —';
     return;
   }
-  card.hidden = false;
   const progress = await getTransferProgress(generation);
   if (!progress) return;
   if (card.classList.contains('transfer-error')) {
     card.classList.remove('transfer-error');
-    diagnostics.open = false;
+    $('networkProgressError').textContent = '—';
+    $('networkProgressErrorRow').hidden = true;
   }
   const now = performance.now();
   const previous = previousTransferProgress?.generation === generation
@@ -905,48 +976,22 @@ async function updateTransferProgress() {
       sendMbps
     });
     updateTransferGraph(now, sendMbps, rate);
-    const pendingSeconds = progress.pendingFrames / TARGET_RATE;
-    const estimatedSeconds = rate > 0 ? progress.pendingBytes / rate : null;
     const totalStored = progress.bytes > 0
       ? Math.min(1, progress.hostStoredBytes / progress.bytes)
       : 0;
     bar.value = totalStored;
-    let state = 'ホストに保存済み';
-    if (progress.pendingBytes > 0) {
-      state = estimatedSeconds === null
-        ? `ホストへの転送待ち ${formatTransferMegabytes(progress.pendingBytes)}`
-        : `ホストへ転送中・残り約${Math.ceil(estimatedSeconds)}秒`;
-    } else if (recording) {
-      state = '録音中・現在の分はホストに保存済み';
-    } else if (progress.pending) {
-      state = '録音終了分の保存確認中';
-    }
-    text.textContent =
-      `この端末に保存済み ${formatTransferMegabytes(progress.bytes)} · ホストに保存済み ${formatTransferMegabytes(progress.hostStoredBytes)} · ${state}`;
-    details.textContent =
-      `未送信 ${formatTransferMegabytes(backlog.unsubmittedBytes)} · 送信中 ${formatTransferMegabytes(backlog.sendingBytes)} · 保存確認待ち ${formatTransferMegabytes(backlog.awaitingAckBytes)} · 未転送音声 ${pendingSeconds.toFixed(1)} 秒 · 保存確認速度 ${rate > 0 ? `${(rate * 8 / 1_000_000).toFixed(2)} Mbps` : '—'}`;
+    text.textContent = formatTransferRatio(progress.pendingBytes, progress.bytes);
     return;
   }
 
-  const audioSeconds = progress.frames / TARGET_RATE;
-  const saveRate = rate > 0 ? `${(rate * 8 / 1_000_000).toFixed(2)} Mbps` : '—';
   const guestProgress = roomCall.remoteTransferProgress;
   const guestIsFresh = guestProgress && now - guestProgress.receivedAt <= 6_000;
   const guestTotalBytes = guestIsFresh ? guestProgress.localBytes : 0;
   bar.value = guestTotalBytes > 0 ? Math.min(1, progress.bytes / guestTotalBytes) : 0;
-  let state = 'ゲストの録音データを待っています';
-  if (recording) state = 'ゲスト録音中・受信した音声を保存しています';
-  else if (progress.pending) state = '録音終了分の保存確認中';
-  else if (progress.bytes > 0) state = '受信・保存済み';
-  const totalLabel = guestIsFresh
-    ? ` / ゲスト録音済み ${formatTransferMegabytes(guestTotalBytes)}`
-    : '';
   updateTransferGraph(now, guestIsFresh ? guestProgress.sendMbps : null, rate);
-  text.textContent =
-    `この端末に保存済み ${formatTransferMegabytes(progress.bytes)}${totalLabel} · 音声 ${audioSeconds.toFixed(1)} 秒 · ${state}`;
-  details.textContent = guestIsFresh
-    ? `ゲスト端末の未送信 ${formatTransferMegabytes(guestProgress.unsubmittedBytes)} · 送信中 ${formatTransferMegabytes(guestProgress.sendingBytes)} · 保存確認待ち ${formatTransferMegabytes(guestProgress.awaitingAckBytes)} · 送出速度 ${guestProgress.sendMbps === null ? '—' : `${guestProgress.sendMbps.toFixed(2)} Mbps`} · 保存確認速度 ${saveRate} · manifest ${progress.completeTakes}/${progress.totalTakes}`
-    : `ゲスト端末の送信状況は未受信または更新停止中です · 保存確認速度 ${saveRate} · manifest ${progress.completeTakes}/${progress.totalTakes}`;
+  text.textContent = guestIsFresh
+    ? formatTransferRatio(Math.max(0, guestTotalBytes - progress.bytes), guestTotalBytes)
+    : '— / — · 完了 —';
 }
 
 async function markTransferManifestStored(takeId) {
@@ -1199,7 +1244,7 @@ async function renderTakes() {
       exportButton.textContent = take.status === 'recovered' ? '復旧 WAV を保存' : 'WAV を保存';
       exportButton.disabled = take.status === 'recording' || !take.chunks ||
         (take.remote && take.hostStored !== true);
-      exportButton.addEventListener('click', () => { void exportTake(take); });
+      exportButton.addEventListener('click', () => { void exportTake(take, exportButton); });
       actions.append(exportButton);
     }
     row.append(info, actions);
@@ -1213,16 +1258,12 @@ async function openSession(session) {
   $('studioTitle').textContent = roomCall?.inviteMode ? 'ゲスト収録' : session.name;
   $('participantLabel').textContent = session.participant;
   $('waveformParticipant').textContent = session.participant;
-  waveformHistory.fill(0);
-  waveformCount = 0;
-  waveformElapsedSeconds = 0;
-  lastRulerSecond = -1;
+  stopWaveformRendering();
   $('timer').textContent = '00:00';
   setupView.hidden = true;
   studioView.hidden = false;
   $('waveformState').textContent = '待機中';
   $('waveformState').classList.remove('live');
-  if (waveformFrame === null) drawWaveform();
   errorText.textContent = '';
   setStatus('録音を始める準備ができました');
   await renderTakes();
@@ -1370,6 +1411,7 @@ async function changeMicrophone() {
   try {
     if (roomCall?.connected) await roomCall.checkLocalReadiness();
     nextStream = await acquireMicrophoneStream(deviceId);
+    for (const track of nextStream.getAudioTracks()) track.enabled = !microphoneMuted;
     if (roomCall?.connected) await roomCall.attachLocalAudio(nextStream);
     const previousStream = mediaStream;
     mediaStream = nextStream;
@@ -1419,6 +1461,7 @@ async function releaseCaptureStream() {
   if (recording) return;
   mediaStream?.getTracks().forEach((track) => track.stop());
   mediaStream = null;
+  updateMicrophoneMuteButton();
 }
 
 async function commitChunk(samples, isFinal, startFrame) {
@@ -1478,7 +1521,12 @@ async function commitChunk(samples, isFinal, startFrame) {
   roomCall?.notifyChunkCommitted(chunk, take);
 }
 
-async function createTake({ scheduledStartAt = null, event = null } = {}) {
+async function createTake({
+  scheduledStartAt = null,
+  event = null,
+  preparedAudioContext = null,
+  preparedAudioContextResume = null
+} = {}) {
   errorText.textContent = '';
   if (!navigator.mediaDevices?.getUserMedia || !window.AudioWorkletNode) {
     throw new Error('AudioWorklet 録音に対応していません。Chrome または Edge を使用してください。');
@@ -1486,7 +1534,7 @@ async function createTake({ scheduledStartAt = null, event = null } = {}) {
   await stopDiagnostics({ stopCapture: !roomCall?.isActive });
   await ensureCaptureStream();
   stopLocalPreview();
-  audioContext = new AudioContext({ sampleRate: TARGET_RATE });
+  audioContext = preparedAudioContext || new AudioContext({ sampleRate: TARGET_RATE });
   if (audioContext.sampleRate !== TARGET_RATE) {
     throw new Error(`この端末のAudioContextは ${audioContext.sampleRate} Hzです。48,000 Hzが必要です。`);
   }
@@ -1522,10 +1570,8 @@ async function createTake({ scheduledStartAt = null, event = null } = {}) {
   capturedFrames = 0;
   $('chunkCount').textContent = '0';
   lastPeak = 0;
-  waveformHistory.fill(0);
-  waveformCount = 0;
+  resetWaveformHistory(localWaveform, null);
   waveformElapsedSeconds = 0;
-  lastWaveformSample = performance.now();
   updateMeter(0);
   pendingCommits = 0;
   commitError = null;
@@ -1548,6 +1594,7 @@ async function createTake({ scheduledStartAt = null, event = null } = {}) {
   silentGain.gain.value = 0;
   recorderNode.port.onmessage = ({ data }) => {
     if (data.type === 'started') {
+      if (!recording || finalizing) return;
       const timestamp = audioContext?.getOutputTimestamp?.();
       const observedAt = timestamp && Number.isFinite(timestamp.performanceTime) &&
         Number.isFinite(timestamp.contextTime)
@@ -1557,11 +1604,8 @@ async function createTake({ scheduledStartAt = null, event = null } = {}) {
         roomCall?.reportRecordingStarted(data.event, observedAt, data.frame);
       }
       takeStartedAt = observedAt;
-      waveformHistory.fill(0);
-      waveformCount = 0;
+      resetWaveformHistory(localWaveform, observedAt, observedAt);
       waveformElapsedSeconds = 0;
-      lastWaveformSample = observedAt;
-      lastRulerSecond = -1;
       roomCall?.beginRecordingWaveform(observedAt);
       scheduledRecordingStartAt = null;
       updateRecordingPreparation();
@@ -1569,6 +1613,7 @@ async function createTake({ scheduledStartAt = null, event = null } = {}) {
       if (roomCall?.isGuest) $('hostRecordingStatus').textContent = 'ホストに合わせて録音中です';
       $('waveformState').textContent = 'LIVE';
       $('waveformState').classList.add('live');
+      drawWaveform();
       return;
     }
     if (data.type === 'level') {
@@ -1602,11 +1647,9 @@ async function createTake({ scheduledStartAt = null, event = null } = {}) {
     isRecording: () => recording,
     onMuted: () => {
       setStatus('マイク入力が一時停止しています。復帰を待っています…');
-      $('meterHint').textContent = '入力一時停止 · 復帰待ち';
     },
     onUnmuted: () => {
       setStatus('録音中 · 端末へ順次保存しています', 'recording');
-      $('meterHint').textContent = '入力を検出中';
     },
     onEnded: () => {
       void stopRecording('マイク入力が終了しました。保存済みチャンクを復旧データとして残しました。')
@@ -1624,7 +1667,12 @@ async function createTake({ scheduledStartAt = null, event = null } = {}) {
         .catch((error) => setMessage(`録音を停止できませんでした: ${error.message}`, true));
     }
   });
-  await audioContext.resume();
+  if (preparedAudioContextResume) {
+    const resumeError = await preparedAudioContextResume;
+    if (resumeError) throw resumeError;
+  } else {
+    await audioContext.resume();
+  }
   if (track.readyState !== 'live') throw new Error('録音開始前にマイク入力が終了しました。デバイスを確認して再試行してください。');
   if (scheduledStartAt !== null && scheduledStartAt < performance.now() + 250) {
     throw new Error('同期開始の準備が間に合いませんでした。録音準備を確認して再試行してください。');
@@ -1677,6 +1725,7 @@ async function stopRecording(recoveryReason = null) {
   if (!activeTake || finalizing) return !recording && !finalizing;
   finalizing = true;
   recording = false;
+  stopWaveformRendering();
   updateRecordButtonAvailability();
   scheduledRecordingStartAt = null;
   updateRecordingPreparation();
@@ -1708,8 +1757,8 @@ async function stopRecording(recoveryReason = null) {
   } catch (error) {
     failure ||= `IndexedDB への保存に失敗しました: ${error.message}`;
   }
-  await stopDiagnostics({ stopCapture: !roomCall?.isActive });
-  if (roomCall?.isActive && mediaStream) startLocalPreview(mediaStream);
+  await stopDiagnostics({ stopCapture: false });
+  if (mediaStream) startLocalPreview(mediaStream);
   const status = failure ? 'recovered' : 'stopped';
   activeTake = {
     ...activeTake,
@@ -1754,21 +1803,15 @@ function audioContextTimeAtPerformanceTime(targetTime) {
   return audioContext.currentTime + (targetTime - performance.now()) / 1000;
 }
 
+function primeRecordingAudioContext() {
+  const context = new AudioContext({ sampleRate: TARGET_RATE });
+  const resume = context.resume().then(() => null, (error) => error);
+  return { context, resume };
+}
+
 async function startRecording(remoteSchedule = null) {
   if (recording) return true;
   if (finalizing || starting || switchingMicrophone || !activeSession) return false;
-  if (!roomCall?.isGuest) {
-    try {
-      if (!await getHostSession()) {
-        const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-        window.location.replace(`/index.html?returnTo=${encodeURIComponent(returnTo)}`);
-        return false;
-      }
-    } catch (error) {
-      errorText.textContent = `ホスト認証を確認できません: ${error.message}`;
-      return false;
-    }
-  }
   if (roomCall?.isActive && !roomCall.isGuest && !roomCall.canStartRecording) {
     errorText.textContent = '通話接続と双方の録音準備が完了してから録音を開始してください。';
     return false;
@@ -1779,7 +1822,22 @@ async function startRecording(remoteSchedule = null) {
   scheduledRecordingStartAt = remoteSchedule?.startAt ?? null;
   updateRecordingPreparation();
   recordButton.disabled = true;
+  let preparedAudioContext = null;
   try {
+    const prepared = primeRecordingAudioContext();
+    preparedAudioContext = prepared.context;
+    if (!roomCall?.isGuest) {
+      try {
+        if (!await getHostSession()) {
+          const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+          window.location.replace(`/index.html?returnTo=${encodeURIComponent(returnTo)}`);
+          return false;
+        }
+      } catch (error) {
+        errorText.textContent = `ホスト認証を確認できません: ${error.message}`;
+        return false;
+      }
+    }
     let schedule = remoteSchedule;
     if (roomCall?.isPeerReadyForRecording && !roomCall.isGuest && !schedule) {
       const clockOffsetMs = await roomCall.synchronizeClock();
@@ -1793,8 +1851,11 @@ async function startRecording(remoteSchedule = null) {
     }
     await createTake({
       scheduledStartAt: schedule?.startAt ?? null,
-      event: schedule?.event ?? null
+      event: schedule?.event ?? null,
+      preparedAudioContext: prepared.context,
+      preparedAudioContextResume: prepared.resume
     });
+    preparedAudioContext = null;
     if (recording && schedule) {
       if (!roomCall.isGuest) roomCall.setHostRecordingState(
         true,
@@ -1805,7 +1866,7 @@ async function startRecording(remoteSchedule = null) {
     }
     return recording;
   } catch (error) {
-    await stopDiagnostics({ stopCapture: !roomCall?.isActive });
+    await stopDiagnostics({ stopCapture: false });
     if (activeTake?.status === 'recording') {
       activeTake = { ...activeTake, status: 'recovered', endedAt: Date.now(), tailUnknown: true, recoveryReason: error.message };
       await persistTake(activeTake).catch((saveError) => { errorText.textContent = `${error.message} take の状態も保存できませんでした: ${saveError.message}`; });
@@ -1826,10 +1887,14 @@ async function startRecording(remoteSchedule = null) {
     scheduledRecordingStartAt = null;
     return false;
   } finally {
+    if (preparedAudioContext && preparedAudioContext !== audioContext &&
+        preparedAudioContext.state !== 'closed') {
+      await preparedAudioContext.close();
+    }
     starting = false;
     updateRecordingPreparation();
     updateRecordButtonAvailability();
-    if (roomCall?.isActive && !recording && mediaStream) startLocalPreview(mediaStream);
+    if (!recording && activeSession && !studioView.hidden && mediaStream) startLocalPreview(mediaStream);
   }
 }
 
@@ -1876,12 +1941,13 @@ async function getTakeChunks(takeId) {
   return chunks.sort((left, right) => left.sequence - right.sequence);
 }
 
-async function exportTake(take) {
+async function exportTake(take, exportButton) {
   const totalBytes = 44 + take.frames * BYTES_PER_FRAME;
   if (!Number.isSafeInteger(take.frames) || take.frames <= 0 || totalBytes > MAX_WAV_BYTES) {
     setMessage('WAV は1 GiB以下で書き出してください。', true);
     return;
   }
+  exportButton.disabled = true;
   try {
     const fileHandle = typeof window.showSaveFilePicker === 'function'
       ? await window.showSaveFilePicker({
@@ -1921,15 +1987,19 @@ async function exportTake(take) {
     const downloadLink = document.createElement('a');
     downloadLink.href = url;
     downloadLink.download = makeRecordingFilename(activeSession, take);
-    downloadLink.click();
+    downloadLink.className = 'take-action';
+    downloadLink.textContent = 'ダウンロード';
+    exportButton.replaceWith(downloadLink);
     window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-    setMessage('ブラウザーにWAVのダウンロードを要求しました。保存完了はダウンロード一覧で確認してください。');
+    setMessage('WAVを準備しました。録音一覧の「ダウンロード」を押して保存してください。');
   } catch (error) {
     if (error.name === 'AbortError') {
       setMessage('WAVの保存をキャンセルしました。');
       return;
     }
     setMessage(`WAV を書き出せませんでした: ${error.message}`, true);
+  } finally {
+    if (exportButton.isConnected) exportButton.disabled = false;
   }
 }
 
@@ -1981,6 +2051,7 @@ $('detectDevices').addEventListener('click', () => { void detectDevices(); });
 $('deleteSessionButton').addEventListener('click', () => { void deleteActiveSession(); });
 micDevice.addEventListener('change', () => { trackMicDevice.value = micDevice.value; updateRecordButtonAvailability(); });
 trackMicDevice.addEventListener('change', () => { void changeMicrophone(); });
+$('microphoneMuteButton').addEventListener('click', toggleMicrophoneMute);
 navigator.mediaDevices?.addEventListener('devicechange', () => { if (!switchingMicrophone) void detectDevices(false); });
 recordButton.addEventListener('click', () => {
   if (!roomCall?.isGuest) void startRecording();
@@ -2005,10 +2076,7 @@ $('backButton').addEventListener('click', async () => {
   await releaseCaptureStream();
   activeSession = null;
   updateRecordButtonAvailability();
-  if (waveformFrame !== null) {
-    window.cancelAnimationFrame(waveformFrame);
-    waveformFrame = null;
-  }
+  stopWaveformRendering();
   studioView.hidden = true;
   setupView.hidden = false;
   await refreshSessionList();
@@ -2096,11 +2164,9 @@ async function initialize() {
     transferProgressTimer = window.setInterval(() => {
       void updateTransferProgress().catch((error) => {
         const card = $('transferProgressCard');
-        card.hidden = false;
         card.classList.add('transfer-error');
-        $('transferProgressText').textContent = '音源の進捗を更新できません。通話の接続を確認してください。詳しいエラーは下に表示しています。';
-        $('transferProgressDetails').textContent = `エラーの詳細: ${error.message}`;
-        $('transferDiagnostics').open = true;
+        $('networkProgressError').textContent = error.message;
+        $('networkProgressErrorRow').hidden = false;
       });
     }, 1000);
   } catch (error) {
