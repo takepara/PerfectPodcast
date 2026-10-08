@@ -11,6 +11,7 @@ const primeRecordingAudioContextSource = source.slice(source.indexOf('function p
 const startRecordingSource = source.slice(source.indexOf('async function startRecording('), source.indexOf('\nfunction applyHostRecordingState'));
 const samplePreviewMeterSource = source.slice(source.indexOf('function samplePreviewMeter()'), source.indexOf('\nfunction startMeterMonitoring'));
 const microphoneMuteSource = source.slice(source.indexOf('function getLocalMicrophoneLabel()'), source.indexOf('\nfunction samplePreviewMeter'));
+const waveformStateSource = source.slice(source.indexOf('function setLocalWaveformState('), source.indexOf('\nfunction startLocalPreview'));
 
 function setupSession({ failure = false, recording = false, leaveDuringCapture = false } = {}) {
   const events = [];
@@ -49,11 +50,22 @@ test('starts microphone preview on session open without a call or device change'
   assert.equal(context.studioView.hidden, false);
 });
 
+test('hides waiting labels while preserving active waveform states', () => {
+  const element = { textContent: '', classList: { toggle() {} } };
+  const context = vm.createContext({ $: () => element });
+  vm.runInContext(waveformStateSource, context);
+
+  context.setLocalWaveformState('Waiting to record');
+  assert.equal(element.textContent, '');
+  context.setLocalWaveformState('LIVE', true);
+  assert.equal(element.textContent, 'LIVE');
+});
+
 test('keeps the session open and reports microphone acquisition failures', async () => {
   const { context, events } = setupSession({ failure: true });
   await context.openSession({ id: 'session', participant: 'Participant' });
   assert.equal(context.studioView.hidden, false);
-  assert.deepEqual(events, ['clear', 'capture', 'マイク待機中']);
+  assert.deepEqual(events, ['clear', 'capture', 'Waiting for microphone']);
   assert.match(context.errorText.textContent, /permission denied/);
 });
 
@@ -114,6 +126,22 @@ test('primes the recording AudioContext before asynchronous host checks', () => 
     startRecordingSource.indexOf('await getHostSession()'));
   assert.ok(startRecordingSource.indexOf('primeRecordingAudioContext()') <
     startRecordingSource.indexOf('await roomCall.synchronizeClock()'));
+});
+
+test('announces a synchronized start before local setup so the guest can prepare in parallel', () => {
+  const announceStart = startRecordingSource.indexOf('roomCall.setHostRecordingState(');
+  const prepareHost = startRecordingSource.indexOf('await createTake({');
+  assert.ok(announceStart >= 0 && announceStart < prepareHost);
+  assert.match(startRecordingSource, /if \(synchronizedStartAnnounced && !cancelRecordingStart\) roomCall\.setHostRecordingState\(false\)/);
+
+  const createTakeSource = source.slice(source.indexOf('async function createTake('), source.indexOf('\nasync function stopDiagnostics'));
+  assert.match(startRecordingSource, /scheduledStartedAt: schedule\?\.hostStartedAt/);
+  assert.match(startRecordingSource, /schedule\.hostStartedAt\s*\)/);
+  assert.match(createTakeSource, /startedAt: scheduledStartedAt \?\?/);
+  assert.match(createTakeSource, /activeTake\.startedAt = scheduledRecordingStartAt !== null && scheduledRecordingWallStartAt !== null/);
+  assert.ok(createTakeSource.indexOf('await persistTake(activeTake)') <
+    createTakeSource.indexOf('recorderNode.port.postMessage'));
+  assert.match(createTakeSource, /if \(cancelRecordingStart\)/);
 });
 
 test('toggles the microphone track and mute button state', () => {
@@ -207,7 +235,7 @@ for (const failure of ['acquire', 'replace']) {
     assert.equal(context.switchingMicrophone, false);
     assert.equal(events.includes('stop-old'), false);
     assert.equal(events.includes('stop-new'), failure === 'replace');
-    assert.match(hint.textContent, /マイクを変更できませんでした/);
+    assert.match(hint.textContent, /Unable to change microphone/);
   });
 }
 
@@ -259,7 +287,7 @@ test('explicit call replacement uses the new track without acquiring another str
 });
 
 test('rejects explicit call replacement before authentication', async () => {
-  await assert.rejects(RoomCall.prototype.attachLocalAudio.call({ connected: false }, {}), /認証済み/);
+  await assert.rejects(RoomCall.prototype.attachLocalAudio.call({ connected: false }, {}), /authenticated/u);
 });
 
 test('keeps initial call attachment using the shared capture stream', async () => {
@@ -280,8 +308,8 @@ test('keeps initial call attachment using the shared capture stream', async () =
 test('shows microphone selection only beside the local waveform and removes diagnostics', () => {
   const html = readFileSync(new URL('../prototype/recorder.html', import.meta.url), 'utf8');
   assert.equal(html.includes('audioTrackSettings'), false);
-  assert.equal(html.includes('マイク設定（トラック別）'), false);
-  assert.match(html, /<select id="trackMicDevice" aria-label="録音マイク" aria-describedby="trackMicDeviceHint">/);
+  assert.equal(html.includes('Microphone settings (per track)'), false);
+  assert.match(html, /<select id="trackMicDevice" aria-label="Recording microphone" aria-describedby="trackMicDeviceHint">/);
   assert.equal(html.includes('自分の録音マイク（入力1 / L）'), false);
   assert.match(html, /id="microphoneMuteButton"[^>]*>MUTE<\/button>/);
   assert.equal(html.includes('<span class="meter-label">入力レベル</span>'), false);

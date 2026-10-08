@@ -10,11 +10,11 @@ function writeText(view, offset, value) {
 
 export function makeWavHeader(frameCount) {
   if (!Number.isSafeInteger(frameCount) || frameCount <= 0) {
-    throw new RangeError('WAVのフレーム数が不正です。');
+    throw new RangeError('The WAV frame count is invalid.');
   }
   const dataBytes = frameCount * BYTES_PER_FRAME;
   if (44 + dataBytes > MAX_WAV_BYTES || dataBytes > 0xffffffff - 36) {
-    throw new RangeError('WAVが1 GiBの出力上限を超えています。');
+    throw new RangeError('The WAV exceeds the 1 GiB output limit.');
   }
   const buffer = new ArrayBuffer(44);
   const view = new DataView(buffer);
@@ -36,7 +36,7 @@ export function makeWavHeader(frameCount) {
 
 export function createPcm24Wav(samples) {
   if (!(samples instanceof Float32Array) || samples.length === 0) {
-    throw new TypeError('PCM24 WAVのサンプルが不正です。');
+    throw new TypeError('The PCM24 WAV sample is invalid.');
   }
   const data = new ArrayBuffer(samples.length * BYTES_PER_FRAME);
   const view = new DataView(data);
@@ -60,18 +60,18 @@ function validateChunkHeader(chunk, sequence, startFrame) {
       !Number.isSafeInteger(chunk.frames) || chunk.frames <= 0 ||
       !(chunk.wav instanceof Blob) || chunk.wav.size !== 44 + chunk.frames * BYTES_PER_FRAME ||
       chunk.byteLength !== chunk.wav.size) {
-    throw new Error(`保存チャンク ${sequence} の台帳またはサイズが不正です。`);
+    throw new Error(`The ledger or size of saved chunk ${sequence} is invalid.`);
   }
 }
 
 export async function writePcm24Wav(take, chunks, writable) {
   if (!take || !Number.isSafeInteger(take.frames) || take.frames <= 0 ||
       !Array.isArray(chunks) || !writable || typeof writable.write !== 'function') {
-    throw new TypeError('WAV出力データまたは書き込み先が不正です。');
+    throw new TypeError('The WAV output data or write destination is invalid.');
   }
   const totalBytes = 44 + take.frames * BYTES_PER_FRAME;
   if (totalBytes > MAX_WAV_BYTES || totalBytes > 0xffffffff) {
-    throw new RangeError('WAVが1 GiBの出力上限を超えています。');
+    throw new RangeError('The WAV exceeds the 1 GiB output limit.');
   }
 
   await writable.write(makeWavHeader(take.frames));
@@ -91,12 +91,12 @@ export async function writePcm24Wav(take, chunks, writable) {
         header.getUint32(40, true) !== chunk.frames * BYTES_PER_FRAME ||
         header.getUint16(20, true) !== 1 || header.getUint16(22, true) !== 1 ||
         header.getUint32(24, true) !== SAMPLE_RATE || header.getUint16(34, true) !== 24) {
-      throw new Error(`保存チャンク ${sequence} のWAV形式が不正です。`);
+      throw new Error(`The WAV format of saved chunk ${sequence} is invalid.`);
     }
     await writable.write(await chunk.wav.slice(44).arrayBuffer());
     writtenFrames += chunk.frames;
   }
   if (writtenFrames !== take.frames) {
-    throw new Error('take 台帳と保存チャンクのフレーム数が一致しません。');
+    throw new Error('The frame count in the take ledger does not match the saved chunks.');
   }
 }

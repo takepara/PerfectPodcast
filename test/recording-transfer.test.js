@@ -21,7 +21,7 @@ class FakeDataChannel extends EventTarget {
 test('restores missing legacy transfer participant from its session', () => {
   const take = { id: 'take-id', status: 'stopped' };
   assert.deepEqual(takeWithTransferParticipant(take, 'Guest'), { ...take, participant: 'Guest' });
-  assert.throws(() => takeWithTransferParticipant(take, ''), /参加者名/u);
+  assert.throws(() => takeWithTransferParticipant(take, ''), /participant name/u);
 });
 
 test('transfers a verified WAV chunk and waits for the host manifest ACK', async () => {

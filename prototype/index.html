@@ -1,17 +1,17 @@
 <!doctype html>
-<html lang="ja">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#101318">
-  <title>PerfectPodcast — ログイン</title>
+  <title>PerfectPodcast — Log In</title>
   <link rel="stylesheet" href="./recorder.css">
 </head>
 <body>
   <div class="top-rule" aria-hidden="true"></div>
   <main class="shell">
     <header class="topbar">
-      <a class="brand" href="./index.html" aria-label="PerfectPodcast ホーム">
+      <a class="brand" href="./index.html" aria-label="PerfectPodcast home">
         <span class="brand-mark" aria-hidden="true">P</span>
         <span>perfect<span class="brand-light">podcast</span></span>
       </a>
@@ -23,25 +23,25 @@
         </svg>
         <span class="login-eyebrow">PerfectPodcast</span>
       </div>
-      <h1 id="loginHeading" class="login-heading">高音質ポッドキャスト収録</h1>
-      <p class="login-description">参加者ごとの音声を24-bit / 48 kHzで端末に録音。通話音声とは別に、WAVで保存できます。</p>
-      <div class="login-features" aria-label="収録機能">
-        <span>ゲストを招待</span><span>端末に録音</span><span>WAVで保存</span>
+      <h1 id="loginHeading" class="login-heading">High-Quality Podcast Recording</h1>
+      <p class="login-description">Record each participant locally in 24-bit / 48 kHz. Save separate WAV files, independent of call audio.</p>
+      <div class="login-features" aria-label="Recording features">
+        <span>Invite guests</span><span>Record locally</span><span>Save as WAV</span>
       </div>
       <div class="login-action">
-        <h2>スタジオを開く</h2>
-        <p>ホストとして収録を始めるには、ログインしてください。</p>
-        <p id="status" class="login-status" role="status" aria-live="polite">認証設定を確認しています…</p>
-        <button id="loginButton" class="button button-primary" type="button" hidden>ログイン</button>
+        <h2>Open Your Studio</h2>
+        <p>Log in to start a recording session as the host.</p>
+        <p id="status" class="login-status" role="status" aria-live="polite">Checking authentication settings…</p>
+        <button id="loginButton" class="button button-primary" type="button" hidden>Log In</button>
       </div>
-      <p class="login-guest-note">ゲストの方は、ホストから届いた招待リンクで参加できます。ログインは不要です。</p>
+      <p class="login-guest-note">Guests can join using the invitation link from the host. No login is required.</p>
     </section>
   </main>
   <script>
     window.setTimeout(() => {
       const status = document.getElementById('status');
-      if (status?.textContent === '認証設定を確認しています…') {
-        status.textContent = '認証の初期化がタイムアウトしました。通信状態を確認してページを再読み込みしてください。';
+      if (status?.textContent === 'Checking authentication settings…') {
+        status.textContent = 'Authentication initialization timed out. Check your connection and reload the page.';
         status.dataset.kind = 'error';
       }
     }, 12000);
@@ -72,7 +72,7 @@
     async function initializeLogin() {
       let client;
       try {
-        client = await waitFor(getAuth0Client(), 'Auth0設定の読み込みがタイムアウトしました。');
+        client = await waitFor(getAuth0Client(), 'Loading Auth0 settings timed out.');
       } catch (error) {
         setStatus(error.message, true);
         return;
@@ -83,23 +83,23 @@
           const description = params.get('error_description');
           const details = [code, description].filter(Boolean).join(': ').slice(0, 360);
           throw new Error(details
-            ? `Auth0からエラーが返されました: ${details}`
-            : 'Auth0から詳細のないエラーが返されました。');
+            ? `Auth0 returned an error: ${details}`
+            : 'Auth0 returned an error without details.');
         }
         if (params.has('code') && params.has('state')) {
           const { appState } = await waitFor(
             client.handleRedirectCallback(),
-            'Auth0のcallback処理がタイムアウトしました。',
+            'Processing the Auth0 callback timed out.',
             10000
           );
           await waitFor(
             establishHostSession(client),
-            'Workerへの認証セッション作成がタイムアウトしました。'
+            'Creating an authenticated session with the Worker timed out.'
           );
           window.location.replace(safeReturnTo(appState?.returnTo));
           return;
         }
-        if (await waitFor(getHostSession(), 'Workerの認証状態確認がタイムアウトしました。')) {
+        if (await waitFor(getHostSession(), 'Checking the Worker authentication status timed out.')) {
           window.location.replace(safeReturnTo(params.get('returnTo')));
           return;
         }
@@ -107,7 +107,7 @@
         setStatus(error.message, true);
       }
       if (!status.dataset.kind || status.dataset.kind !== 'error') {
-        if (params.get('logout') === '1') setStatus('ログアウトしました。');
+        if (params.get('logout') === '1') setStatus('You have been logged out.');
         else setStatus('');
       }
       loginButton.hidden = false;

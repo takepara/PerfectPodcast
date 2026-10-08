@@ -3,7 +3,7 @@ const SAMPLE_INTERVAL_MS = 100;
 export function resetWaveformHistory(waveform, startedAt = null, now = performance.now()) {
   if (!waveform || !(waveform.history instanceof Float32Array) || waveform.history.length === 0 ||
       (startedAt !== null && !Number.isFinite(startedAt)) || !Number.isFinite(now)) {
-    throw new TypeError('波形履歴の初期化データが不正です。');
+    throw new TypeError('The waveform history initialization data is invalid.');
   }
   const elapsedSamples = startedAt === null
     ? 0
@@ -20,7 +20,7 @@ export function resetWaveformHistory(waveform, startedAt = null, now = performan
 export function appendAlignedWaveformPeak(waveform, peak, now) {
   if (!waveform || !(waveform.history instanceof Float32Array) ||
       !Number.isFinite(peak) || peak < 0 || !Number.isFinite(now)) {
-    throw new TypeError('波形サンプルが不正です。');
+    throw new TypeError('The waveform sample is invalid.');
   }
   if (waveform.recordingStartedAt === null) return false;
 

@@ -35,6 +35,7 @@ const micDevice = $('micDevice');
 const trackMicDevice = $('trackMicDevice');
 const sessionList = $('sessionList');
 const takeList = $('takeList');
+const studioTitleInput = $('studioTitle');
 const recordButton = $('recordButton');
 const stopButton = $('stopButton');
 const recordingPreparation = $('recordingPreparation');
@@ -42,9 +43,12 @@ const errorText = $('errorText');
 const notice = $('notice');
 const meter = document.querySelector('[role="meter"]');
 const waveformCanvas = $('waveformCanvas');
+const networkEventLogStartedAt = performance.now();
 
 let database;
 let activeSession = null;
+let studioTitleSavePromise = Promise.resolve(true);
+let studioTitleSaveFailed = false;
 let roomCall = null;
 let activeTake = null;
 let audioContext = null;
@@ -65,6 +69,7 @@ let microphoneMuted = false;
 let recording = false;
 let finalizing = false;
 let starting = false;
+let cancelRecordingStart = false;
 let sessionLimitReached = false;
 let pendingCommits = 0;
 let commitChain = Promise.resolve();
@@ -75,6 +80,7 @@ let takeFrameLimit = 0;
 let elapsedTimer = null;
 let preparationTimer = null;
 let scheduledRecordingStartAt = null;
+let scheduledRecordingWallStartAt = null;
 let takeRefreshTimer = null;
 let noticeTimer = null;
 let takeStartedAt = 0;
@@ -95,7 +101,6 @@ let waveformElapsedSeconds = 0;
 let hostRecordingCommand = Promise.resolve();
 let lastHostRecordingState = null;
 const receivedTransferFrames = new Map();
-let previousTransferProgress = null;
 let transferProgressTimer = null;
 let transferProgressCache = null;
 let transferGraphSamples = [];
@@ -104,6 +109,7 @@ let switchingMicrophone = false;
 let detectingDevices = false;
 let deletingSession = false;
 let participantNameEdited = false;
+let networkEventCount = 0;
 const selectedSessionIds = new Set();
 
 const requestResult = (request) => new Promise((resolve, reject) => {
@@ -122,7 +128,7 @@ function transactionComplete(transaction) {
 function openDatabase() {
   return new Promise((resolve, reject) => {
     if (!('indexedDB' in window)) {
-      reject(new Error('このブラウザーでは IndexedDB を利用できません。Chrome または Edge を使用してください。'));
+      reject(new Error('IndexedDB is not available in this browser. Use Chrome or Edge.'));
       return;
     }
     const request = indexedDB.open(DB_NAME, DB_VERSION);
@@ -148,8 +154,8 @@ function openDatabase() {
       }
     });
     request.addEventListener('success', () => resolve(request.result), { once: true });
-    request.addEventListener('error', () => reject(request.error || new Error('ローカル録音データベースを開けませんでした。')), { once: true });
-    request.addEventListener('blocked', () => reject(new Error('別タブがデータベース更新を妨げています。録音タブを閉じて再読み込みしてください。')), { once: true });
+    request.addEventListener('error', () => reject(request.error || new Error('Unable to open the local recording database.')), { once: true });
+    request.addEventListener('blocked', () => reject(new Error('Another tab is blocking the database update. Close the recording tab and reload the page.')), { once: true });
   });
 }
 
@@ -168,6 +174,23 @@ function formatDuration(seconds) {
   return `${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`;
 }
 
+function appendNetworkEvent(event, details = '') {
+  const log = $('networkEventLog');
+  if (!log) return;
+  const wasAtBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 8;
+  const elapsed = (performance.now() - networkEventLogStartedAt).toFixed(1).padStart(9, ' ');
+  const detailText = details ? ` ${details}` : '';
+  log.setRangeText(
+    `${new Date().toISOString()} +${elapsed} ms | ${event}${detailText}\n`,
+    log.value.length,
+    log.value.length,
+    'preserve'
+  );
+  networkEventCount += 1;
+  $('networkEventCount').textContent = `${networkEventCount} EVENTS`;
+  if (wasAtBottom) log.scrollTop = log.scrollHeight;
+}
+
 function setStatus(text, kind = 'ready') {
   $('statusText').textContent = text;
   $('statusDot').className = `status-dot${kind === 'recording' ? ' live' : kind === 'saved' ? ' saved' : ''}`;
@@ -178,16 +201,16 @@ function updateRecordingPreparation() {
   if (scheduledRecordingStartAt !== null) {
     const seconds = Math.ceil((scheduledRecordingStartAt - performance.now()) / 1000);
     message = seconds > 0
-      ? `録音開始まであと ${seconds} 秒です。録音中の表示に切り替わるまで話し始めずにお待ちください。`
-      : '録音開始を確認しています。録音中の表示に切り替わるまでお待ちください。';
+      ? `Recording starts in ${seconds} seconds. Please wait until the recording indicator appears before speaking.`
+      : 'Confirming recording start. Please wait until the recording indicator appears.';
   } else if (starting) {
-    message = '録音準備中です。開始時刻と録音環境を確認しています。録音中の表示に切り替わるまで話し始めずにお待ちください。';
+    message = 'Preparing to record and checking the start time and recording setup. Please wait until the recording indicator appears before speaking.';
   }
   if (!message) {
     recordingPreparation.hidden = true;
     window.clearInterval(preparationTimer);
     preparationTimer = null;
-    if (recording && !finalizing) setStatus('録音中 · 端末へ順次保存しています', 'recording');
+    if (recording && !finalizing) setStatus('Recording · Saving to this device', 'recording');
     return;
   }
   recordingPreparation.hidden = false;
@@ -238,8 +261,8 @@ function updateTimer() {
   if (elapsed >= takeFrameLimit / TARGET_RATE * 1000) {
     void stopRecording().then((saved) => setMessage(
       saved
-        ? 'このセッションの2時間上限に達したため、録音を停止して保存しました。'
-        : 'このセッションの2時間上限に達したため録音を停止しました。保存状態を確認してください。',
+        ? 'Recording stopped and saved because this session reached its 2-hour limit.'
+        : 'Recording stopped because this session reached its 2-hour limit. Check the save status.',
       !saved
     ));
   }
@@ -274,13 +297,13 @@ function updateMicrophoneMuteButton() {
   button.disabled = getLiveMicrophoneTracks().length === 0;
   button.textContent = microphoneMuted ? 'UNMUTE' : 'MUTE';
   button.setAttribute('aria-pressed', String(microphoneMuted));
-  button.setAttribute('aria-label', microphoneMuted ? 'マイクのミュートを解除' : 'マイクをミュート');
+  button.setAttribute('aria-label', microphoneMuted ? 'Unmute microphone' : 'Mute microphone');
 }
 
 function toggleMicrophoneMute() {
   const tracks = getLiveMicrophoneTracks();
   if (!tracks.length) {
-    setMessage('ミュートするマイクが接続されていません。', true);
+    setMessage('No microphone is connected to mute.', true);
     updateMicrophoneMuteButton();
     return;
   }
@@ -313,7 +336,7 @@ function stopMeterMonitoring() {
 }
 
 function setLocalWaveformState(text, live = false) {
-  $('waveformState').textContent = text;
+  $('waveformState').textContent = /^Waiting\b/i.test(text) ? '' : text;
   $('waveformState').classList.toggle('live', live);
 }
 
@@ -324,7 +347,7 @@ function startLocalPreview(stream) {
   for (const track of stream.getAudioTracks()) track.enabled = !microphoneMuted;
   updateMicrophoneMuteButton();
   if (!window.AudioContext) {
-    setLocalWaveformState('波形非対応');
+    setLocalWaveformState('Waveform unavailable');
     return;
   }
   try {
@@ -341,27 +364,27 @@ function startLocalPreview(stream) {
     updateMeter(0);
     const context = previewAudioContext;
     if (context.state === 'running') {
-      setLocalWaveformState('録音待ち');
+      setLocalWaveformState('Waiting to record');
       startMeterMonitoring();
     } else if (context.state === 'suspended') {
-      setLocalWaveformState('波形準備中');
+      setLocalWaveformState('Preparing waveform');
       void context.resume().then(() => {
         if (previewAudioContext === context && !recording) {
-          setLocalWaveformState('録音待ち');
+          setLocalWaveformState('Waiting to record');
           startMeterMonitoring();
         }
       }).catch((error) => {
         if (previewAudioContext !== context) return;
-        setLocalWaveformState('波形停止');
-        setMessage(`自分の波形を開始できませんでした: ${error.message}`, true);
+        setLocalWaveformState('Waveform stopped');
+        setMessage(`Unable to start your waveform: ${error.message}`, true);
       });
     } else {
-      setLocalWaveformState('波形停止');
+      setLocalWaveformState('Waveform stopped');
     }
   } catch (error) {
     stopLocalPreview();
-    setLocalWaveformState('波形エラー');
-    setMessage(`自分の波形を開始できませんでした: ${error.message}`, true);
+    setLocalWaveformState('Waveform error');
+    setMessage(`Unable to start your waveform: ${error.message}`, true);
   }
 }
 
@@ -471,6 +494,32 @@ async function persistSession(session) {
   await done;
 }
 
+function saveStudioSessionName() {
+  const session = activeSession;
+  if (!session || roomCall?.isGuest === true) return Promise.resolve(true);
+  const name = studioTitleInput.value.trim();
+  if (!name) return studioTitleSavePromise;
+  if (name === session.name && !studioTitleSaveFailed) return studioTitleSavePromise;
+
+  session.name = name;
+  const sessionToSave = { ...session };
+  studioTitleSaveFailed = false;
+  studioTitleSavePromise = studioTitleSavePromise
+    .then(() => persistSession(sessionToSave))
+    .then(() => {
+      studioTitleSaveFailed = false;
+      if (errorText.textContent.startsWith('Unable to save session name:')) errorText.textContent = '';
+      roomCall?.setSessionName(sessionToSave.name);
+      return true;
+    })
+    .catch((error) => {
+      studioTitleSaveFailed = true;
+      errorText.textContent = `Unable to save session name: ${error.message}`;
+      return false;
+    });
+  return studioTitleSavePromise;
+}
+
 async function deleteSessionsAndRecordings(sessionIds) {
   const uniqueSessionIds = [...new Set(sessionIds)];
   const transaction = database.transaction(['sessions', 'takes', 'chunks'], 'readwrite');
@@ -509,6 +558,13 @@ async function persistTake(take) {
   const transaction = database.transaction('takes', 'readwrite');
   const done = transactionComplete(transaction);
   transaction.objectStore('takes').put(take);
+  await done;
+}
+
+async function deleteUnstartedTake(takeId) {
+  const transaction = database.transaction('takes', 'readwrite');
+  const done = transactionComplete(transaction);
+  transaction.objectStore('takes').delete(takeId);
   await done;
 }
 
@@ -685,7 +741,7 @@ async function loadTakeChunks(takeId) {
 }
 
 async function getTransferInventory(generation) {
-  if (!generation) throw new Error('転送inventoryの接続世代がありません。');
+  if (!generation) throw new Error('The transfer inventory has no connection generation.');
   transferProgressCache = null;
   const range = IDBKeyRange.only(generation);
   if (roomCall?.localRole === 'guest') {
@@ -700,12 +756,12 @@ async function getTransferInventory(generation) {
       for (const item of take.hostStoredChunks || []) {
         if (!Number.isSafeInteger(item.sequence) || item.sequence < 0 ||
             !/^[0-9a-f]{64}$/u.test(item.sha256 || '')) {
-          throw new Error(`take ${take.id} の送信済みチャンク台帳が不正です。`);
+          throw new Error(`The sent chunk ledger for take ${take.id} is invalid.`);
         }
         const key = `${take.id}:${item.sequence}`;
         const existing = chunkItemsByKey.get(key);
         if (existing && existing.sha256 !== item.sha256) {
-          throw new Error(`take ${take.id} のチャンク ${item.sequence + 1} で保存hashが一致しません。`);
+          throw new Error(`The saved hash does not match for chunk ${item.sequence + 1} of take ${take.id}.`);
         }
         chunkItemsByKey.set(key, {
           kind: 'chunk',
@@ -720,7 +776,7 @@ async function getTransferInventory(generation) {
       .map((take) => ({ kind: 'manifest', takeId: take.id }));
     return [...chunkItemsByKey.values(), ...manifests];
   }
-  if (roomCall?.localRole !== 'host') throw new Error('この端末は転送inventoryのホストではありません。');
+  if (roomCall?.localRole !== 'host') throw new Error('This device is not the host for the transfer inventory.');
   const takes = await findIndexValues('takes', 'transferGeneration', IDBKeyRange.only(generation), (take) =>
     take.remote && take.transferGeneration === generation);
   if (!takes.length) return [];
@@ -754,7 +810,7 @@ async function getTransferInventory(generation) {
       try {
         await verifyIncomingStoredTake(take, savedChunks);
       } catch (error) {
-        roomCall.setStatus(`IndexedDB内の受信音源を検証できず、該当takeを再回収します: ${error.message}`, true);
+        roomCall.setStatus(`Unable to verify received audio in IndexedDB. Recovering the affected take: ${error.message}`, true);
         continue;
       }
     } else {
@@ -763,17 +819,17 @@ async function getTransferInventory(generation) {
             !Number.isSafeInteger(chunk.startFrame) || chunk.startFrame < 0 ||
             !Number.isSafeInteger(chunk.frames) || chunk.frames < 1 ||
             !/^[0-9a-f]{64}$/u.test(chunk.sha256 || '') || chunk.sourceTakeId !== take.sourceTakeId) {
-          roomCall.setStatus('ホストの部分take台帳に不正な行があり、該当チャンクを再回収します。', true);
+          roomCall.setStatus('The host partial-take ledger contains an invalid entry. Recovering the affected chunk.', true);
           continue;
         }
         try {
           const storedChunk = savedChunksBySequence.get(chunk.sequence);
           await verifyIncomingStoredChunk(take, storedChunk, chunk.sequence, chunk.startFrame);
           if (storedChunk.sha256 !== chunk.sha256 || storedChunk.frames !== chunk.frames) {
-            throw new Error('チャンク台帳とWAVの内容が一致しません。');
+            throw new Error('The chunk ledger does not match the WAV contents.');
           }
         } catch (error) {
-          roomCall.setStatus(`IndexedDB内のチャンクを再検証できず、再回収します: ${error.message}`, true);
+          roomCall.setStatus(`Unable to re-verify the chunk in IndexedDB. Recovering it: ${error.message}`, true);
           continue;
         }
         inventory.push({
@@ -812,7 +868,7 @@ async function reconcileGuestTransferInventory(generation, hostItems) {
   for (const chunks of confirmedChunks) {
     for (const chunk of chunks) {
       if (!hostChunkKeys.has(`${chunk.takeId}:${chunk.sequence}`)) {
-        throw new Error(`ホストに保存済みのチャンク ${chunk.sequence + 1} が見つかりません。ゲスト端末では削除済みのため再送できません。`);
+        throw new Error(`Saved chunk ${chunk.sequence + 1} was not found on the host. It was deleted from the guest device and cannot be sent again.`);
       }
     }
   }
@@ -967,7 +1023,7 @@ function formatTransferRatio(untransferredBytes, totalBytes) {
   const completion = total > 0
     ? `${Math.round((1 - untransferred / total) * 100)}%`
     : '—';
-  return `${formatTransferMegabytes(untransferred)} / ${formatTransferMegabytes(total)} · 完了 ${completion}`;
+  return `${formatTransferMegabytes(untransferred)} / ${formatTransferMegabytes(total)} · ${completion} complete`;
 }
 
 function drawTransferGraph(now) {
@@ -977,30 +1033,39 @@ function drawTransferGraph(now) {
   const width = canvas.width;
   const height = canvas.height;
   const left = 38;
-  const right = width - 8;
+  const right = width - 38;
   const top = 8;
   const bottom = height - 20;
-  const maxMbps = Math.max(1.5, ...transferGraphSamples.flatMap((sample) =>
-    [sample.sendMbps, sample.ackMbps].filter(Number.isFinite)));
+  const maxMbps = Math.max(1.5, ...transferGraphSamples
+    .map((sample) => sample.sendMbps)
+    .filter(Number.isFinite));
   const y = (value) => bottom - Math.min(maxMbps, value) / maxMbps * (bottom - top);
+  const percentY = (value) => bottom - Math.min(100, Math.max(0, value)) / 100 * (bottom - top);
   context.clearRect(0, 0, width, height);
   context.font = '10px sans-serif';
   context.fillStyle = '#aeb8c2';
   context.strokeStyle = '#303a44';
   context.lineWidth = 1;
   context.setLineDash([]);
-  for (const value of [0, maxMbps / 2, maxMbps]) {
-    const lineY = y(value);
+  for (const [value, label] of [[0, '0%'], [50, '50%'], [100, '100%']]) {
+    const lineY = percentY(value);
     context.beginPath();
     context.moveTo(left, lineY);
     context.lineTo(right, lineY);
     context.stroke();
-    context.fillText(value.toFixed(1), 2, lineY + 3);
+    context.textAlign = 'left';
+    context.fillText(`${(maxMbps * value / 100).toFixed(1)} Mbps`, 2, lineY + 3);
+    context.textAlign = 'right';
+    context.fillText(label, width - 2, lineY + 3);
   }
-  context.fillText('60秒前', left, height - 4);
-  context.fillText('現在', right - 25, height - 4);
+  context.textAlign = 'left';
+  context.fillText('60 sec ago', left, height - 4);
+  context.fillText('Now', right - 25, height - 4);
 
-  for (const [key, color] of [['sendMbps', '#59d6b2'], ['ackMbps', '#82aaff']]) {
+  for (const [key, color, valueY] of [
+    ['sendMbps', '#59d6b2', y],
+    ['savePercent', '#82aaff', percentY]
+  ]) {
     context.strokeStyle = color;
     context.lineWidth = 2;
     context.beginPath();
@@ -1011,7 +1076,7 @@ function drawTransferGraph(now) {
         continue;
       }
       const x = left + Math.max(0, sample.at - (now - 60_000)) / 60_000 * (right - left);
-      const pointY = y(sample[key]);
+      const pointY = valueY(sample[key]);
       if (started) context.lineTo(x, pointY);
       else context.moveTo(x, pointY);
       started = true;
@@ -1020,21 +1085,18 @@ function drawTransferGraph(now) {
   }
 }
 
-function updateTransferGraph(now, sendMbps, ackBytesPerSecond) {
-  const ackMbps = Number.isFinite(ackBytesPerSecond)
-    ? ackBytesPerSecond * 8 / 1_000_000
-    : null;
+function updateTransferGraph(now, sendMbps, savePercent) {
   transferGraphSamples.push({
     at: now,
     sendMbps: Number.isFinite(sendMbps) ? sendMbps : null,
-    ackMbps
+    savePercent: Number.isFinite(savePercent) ? Math.min(100, Math.max(0, savePercent)) : null
   });
   transferGraphSamples = transferGraphSamples.filter((sample) => now - sample.at <= 60_000).slice(-61);
   drawTransferGraph(now);
   const sample = transferGraphSamples.at(-1);
   const sendText = sample.sendMbps === null ? '—' : `${sample.sendMbps.toFixed(2)} Mbps`;
-  const ackText = sample.ackMbps === null ? '—' : `${sample.ackMbps.toFixed(2)} Mbps`;
-  $('transferGraphSummary').textContent = `送出 ${sendText} · 保存確認 ${ackText}`;
+  const saveText = sample.savePercent === null ? '—' : `${Math.round(sample.savePercent)}%`;
+  $('transferGraphSummary').textContent = `Upload ${sendText} · Save Rate ${saveText}`;
 }
 
 async function updateTransferProgress() {
@@ -1044,14 +1106,13 @@ async function updateTransferProgress() {
   const generation = roomCall?.authFields?.generation;
   if (!roomCall?.localRole || !generation) {
     card.classList.remove('transfer-error');
-    previousTransferProgress = null;
     transferGraphSamples = [];
     bar.value = 0;
-    text.textContent = '— / — · 完了 —';
+    text.textContent = '— / — · — complete';
     $('networkProgressError').textContent = '—';
     $('networkProgressErrorRow').hidden = true;
     drawTransferGraph(performance.now());
-    $('transferGraphSummary').textContent = '送出 — · 保存確認 —';
+    $('transferGraphSummary').textContent = 'Upload — · Save Rate —';
     return;
   }
   const progress = await getTransferProgress(generation);
@@ -1062,21 +1123,6 @@ async function updateTransferProgress() {
     $('networkProgressErrorRow').hidden = true;
   }
   const now = performance.now();
-  const previous = previousTransferProgress?.generation === generation
-    ? previousTransferProgress
-    : null;
-  const confirmed = progress.role === 'guest' ? progress.hostStoredBytes : progress.bytes;
-  let rate = previous?.rate ?? null;
-  let rateAt = previous?.rateAt ?? now;
-  if (previous && now > previous.at && confirmed > previous.confirmed) {
-    const sampleRate = (confirmed - previous.confirmed) / ((now - previous.at) / 1000);
-    rate = rate === null ? sampleRate : rate * 0.6 + sampleRate * 0.4;
-    rateAt = now;
-  } else if (now - rateAt > 10_000) {
-    rate = null;
-  }
-  previousTransferProgress = { generation, at: now, confirmed, rate, rateAt };
-
   if (progress.role === 'guest') {
     const sending = roomCall.recordingTransfer.getSendProgress();
     const backlog = splitTransferBacklog(progress.pendingBytes, sending);
@@ -1093,11 +1139,11 @@ async function updateTransferProgress() {
       bufferedBytes: sending.bufferedBytes,
       sendMbps
     });
-    updateTransferGraph(now, sendMbps, rate);
     const totalStored = progress.bytes > 0
       ? Math.min(1, progress.hostStoredBytes / progress.bytes)
       : 0;
     bar.value = totalStored;
+    updateTransferGraph(now, sendMbps, totalStored * 100);
     text.textContent = formatTransferRatio(progress.pendingBytes, progress.bytes);
     return;
   }
@@ -1105,11 +1151,14 @@ async function updateTransferProgress() {
   const guestProgress = roomCall.remoteTransferProgress;
   const guestIsFresh = guestProgress && now - guestProgress.receivedAt <= 6_000;
   const guestTotalBytes = guestIsFresh ? guestProgress.localBytes : 0;
-  bar.value = guestTotalBytes > 0 ? Math.min(1, progress.bytes / guestTotalBytes) : 0;
-  updateTransferGraph(now, guestIsFresh ? guestProgress.sendMbps : null, rate);
+  const savePercent = guestIsFresh
+    ? guestTotalBytes > 0 ? Math.min(100, progress.bytes / guestTotalBytes * 100) : 0
+    : null;
+  bar.value = savePercent === null ? 0 : savePercent / 100;
+  updateTransferGraph(now, guestIsFresh ? guestProgress.sendMbps : null, savePercent);
   text.textContent = guestIsFresh
     ? formatTransferRatio(Math.max(0, guestTotalBytes - progress.bytes), guestTotalBytes)
-    : '— / — · 完了 —';
+    : '— / — · — complete';
 }
 
 async function markTransferManifestStored(takeId) {
@@ -1136,7 +1185,7 @@ function incomingTakeId(generation, takeId) {
 async function storeIncomingTransferChunk(metadata, wav, sha256) {
   if (roomCall?.localRole !== 'host' || !activeSession ||
       metadata.generation !== roomCall.authFields?.generation) {
-    throw new Error('受信したtakeのセッションまたは接続が一致しません。');
+    throw new Error('The session or connection for the received take does not match.');
   }
   const takeId = incomingTakeId(metadata.generation, metadata.takeId);
   const existingTake = await runRequest('takes', 'get', takeId);
@@ -1144,7 +1193,7 @@ async function storeIncomingTransferChunk(metadata, wav, sha256) {
   if (existingChunk) {
     if (!existingTake || existingChunk.sha256 !== sha256 ||
         existingChunk.startFrame !== metadata.startFrame || existingChunk.frames !== metadata.frames) {
-      throw new Error('同じチャンク番号に異なる音源hashが届きました。');
+      throw new Error('Different audio hashes were received for the same chunk number.');
     }
     try {
       await verifyIncomingStoredChunk(existingTake, existingChunk, metadata.sequence, metadata.startFrame);
@@ -1171,7 +1220,7 @@ async function storeIncomingTransferChunk(metadata, wav, sha256) {
         .reduce((total, item) => total + item.frames, 0);
     }
     if (totalReceivedFrames + metadata.frames > MAX_SESSION_FRAMES) {
-      throw new Error('この参加者の受信音源が2時間上限を超えました。');
+      throw new Error('Received audio from this participant exceeds the 2-hour limit.');
     }
   }
   const take = existingTake || {
@@ -1201,7 +1250,7 @@ async function storeIncomingTransferChunk(metadata, wav, sha256) {
       take.transferGeneration !== metadata.generation || take.participant !== metadata.participant ||
       take.number !== metadata.takeNumber || take.startedAt !== metadata.startedAt ||
       !validChunkPosition) {
-    throw new Error('受信チャンクが既存takeの順序またはメタデータと一致しません。');
+    throw new Error('The received chunk does not match the existing take order or metadata.');
   }
   const chunk = {
     takeId,
@@ -1248,14 +1297,14 @@ async function storeIncomingTransferChunk(metadata, wav, sha256) {
 async function storeIncomingTransferManifest(manifest) {
   if (roomCall?.localRole !== 'host' || !activeSession ||
       manifest.generation !== roomCall.authFields?.generation) {
-    throw new Error('受信したmanifestのセッションまたは接続が一致しません。');
+    throw new Error('The session or connection for the received manifest does not match.');
   }
   const takeId = incomingTakeId(manifest.generation, manifest.takeId);
   const take = await runRequest('takes', 'get', takeId);
   if (!take || take.frames !== manifest.frames || take.chunks !== manifest.chunks ||
       take.sourceTakeId !== manifest.takeId || take.participant !== manifest.participant ||
       take.startedAt !== manifest.startedAt || take.number !== manifest.takeNumber) {
-    throw new Error('manifestとホスト保存済みチャンクの内容が一致しません。');
+    throw new Error('The manifest does not match the chunks saved on the host.');
   }
   const savedChunks = await loadTakeChunks(takeId);
   await verifyIncomingStoredTake(take, savedChunks);
@@ -1291,7 +1340,7 @@ function scheduleTakeRefresh() {
       await renderTakes();
       await updateSessionSavedSize();
     })().catch((error) => {
-      errorText.textContent = `録音一覧を更新できませんでした: ${error.message}`;
+      errorText.textContent = `Unable to refresh the recording list: ${error.message}`;
     });
   }, 2000);
 }
@@ -1317,15 +1366,15 @@ async function refreshSessionList() {
   deleteSelectedSessionsButton.hidden = visibleSessions.length === 0;
   deleteSelectedSessionsButton.disabled = deletingSession || Boolean(activeSession) ||
     Boolean(roomCall?.isActive) || selectedSessionIds.size === 0;
-  deleteSelectedSessionsButton.textContent = 'セッション削除';
+  deleteSelectedSessionsButton.textContent = 'Delete Sessions';
   deleteSelectedSessionsButton.title = guestMode
-    ? '未保存の録音を選択して削除すると、この端末だけにある音源も失われます。'
+    ? 'Deleting selected recordings that are not saved on the host will permanently remove audio stored only on this device.'
     : '';
   sessionList.replaceChildren();
   if (!visibleSessions.length) {
     sessionList.innerHTML = guestMode
-      ? '<p class="empty-state">この端末に保存されたゲスト録音はありません。</p>'
-      : '<p class="empty-state">保存済みのセッションはありません。</p>';
+      ? '<p class="empty-state">No guest recordings are saved on this device.</p>'
+      : '<p class="empty-state">No saved sessions.</p>';
     return;
   }
   for (const session of visibleSessions) {
@@ -1342,7 +1391,7 @@ async function refreshSessionList() {
     const totalBytes = sessionTakes.reduce((sum, take) => sum + (take.bytes || 0), 0);
     const stored = guestTakesAreStored(sessionTakes);
     meta.textContent = guestMode
-      ? `${session.participant} · ${sessionTakes.length} take · ${formatBytes(totalBytes)} · ${stored ? 'ホスト保存済み' : '未保存分あり'}`
+      ? `${session.participant} · ${sessionTakes.length} takes · ${formatBytes(totalBytes)} · ${stored ? 'Saved on host' : 'Unsaved audio'}`
       : `${session.participant} · ${sessionTakes.length} take · ${formatBytes(totalBytes)}`;
     info.append(name, meta);
     const selectionLabel = document.createElement('label');
@@ -1350,7 +1399,7 @@ async function refreshSessionList() {
     const selection = document.createElement('input');
     selection.type = 'checkbox';
     selection.checked = selectedSessionIds.has(session.id);
-    selection.setAttribute('aria-label', `${session.name} を削除対象に選択`);
+    selection.setAttribute('aria-label', `Select ${session.name} for deletion`);
     selection.addEventListener('change', () => {
       if (selection.checked) selectedSessionIds.add(session.id);
       else selectedSessionIds.delete(session.id);
@@ -1364,7 +1413,7 @@ async function refreshSessionList() {
       const openButton = document.createElement('button');
       openButton.className = 'session-open';
       openButton.type = 'button';
-      openButton.textContent = '開く →';
+      openButton.textContent = 'Open →';
       openButton.addEventListener('click', () => { void openSession(session); });
       row.append(selectionLabel, info, openButton);
     }
@@ -1395,7 +1444,7 @@ async function deleteSelectedSessions() {
         (!guestMode || isGuestLocalSession(session, takesBySession.get(session.id) || [])))
       .sort((left, right) => left.name.localeCompare(right.name));
     if (!selectedSessions.length) {
-      $('statusMessage').textContent = '削除するセッションを選択してください。';
+      $('statusMessage').textContent = 'Select sessions to delete.';
       return;
     }
     const unconfirmedCount = selectedSessions.filter((session) =>
@@ -1403,23 +1452,23 @@ async function deleteSelectedSessions() {
     const selectedIds = selectedSessions
       .map((session) => session.id);
     const warning = guestMode && unconfirmedCount > 0
-      ? `\n\n選択した${unconfirmedCount}セッションにはホスト未保存の音源があります。削除するとこの端末だけにある音源も失われ、復元できません。`
+      ? `\n\n${unconfirmedCount} selected session(s) contain audio not saved on the host. Deleting them will permanently remove audio stored only on this device.`
       : '';
     const prompt = guestMode
-      ? `選択した${selectedIds.length}セッションのゲスト録音をこの端末から一括削除します。ホストに保存済みの音源は削除されません。${warning}\n\nこの操作は取り消せません。`
-      : `選択した${selectedIds.length}セッションと、それらに保存された録音・受信音声を一括削除します。この操作は取り消せません。`;
+      ? `Delete guest recordings from ${selectedIds.length} selected session(s) on this device. Audio already saved on the host will not be deleted.${warning}\n\nThis action cannot be undone.`
+      : `Delete ${selectedIds.length} selected session(s) and all recordings and received audio saved in them. This action cannot be undone.`;
     if (!window.confirm(prompt)) return;
     await deleteSessionsAndRecordings(selectedIds);
     for (const sessionId of selectedIds) selectedSessionIds.delete(sessionId);
     $('statusMessage').textContent = '';
   } catch (error) {
-    $('statusMessage').textContent = `選択したセッションを一括削除できませんでした: ${error.message}`;
+    $('statusMessage').textContent = `Unable to delete the selected sessions: ${error.message}`;
   } finally {
     deletingSession = false;
     try {
       await refreshSessionList();
     } catch (error) {
-      $('statusMessage').textContent = `セッション一覧を更新できませんでした: ${error.message}`;
+      $('statusMessage').textContent = `Unable to refresh the session list: ${error.message}`;
     }
   }
 }
@@ -1431,7 +1480,7 @@ async function renderTakes() {
     .sort((left, right) => left.startedAt - right.startedAt);
   takeList.replaceChildren();
   if (!takes.length) {
-    takeList.innerHTML = '<p class="empty-state">録音したtakeがここに表示されます。</p>';
+    takeList.innerHTML = '<p class="empty-state">Your recorded takes will appear here.</p>';
     return;
   }
   for (const take of takes) {
@@ -1455,7 +1504,7 @@ async function renderTakes() {
       const exportButton = document.createElement('button');
       exportButton.className = 'take-action';
       exportButton.type = 'button';
-      exportButton.textContent = take.status === 'recovered' ? '復旧 WAV を保存' : 'WAV を保存';
+      exportButton.textContent = take.status === 'recovered' ? 'Save Recovered WAV' : 'Save WAV';
       exportButton.disabled = take.status === 'recording' || !take.chunks ||
         (take.remote && take.hostStored !== true);
       exportButton.addEventListener('click', () => { void exportTake(take, exportButton); });
@@ -1467,19 +1516,37 @@ async function renderTakes() {
 }
 
 async function openSession(session) {
+  if (roomCall?.isGuest && roomCall.remoteSessionName) {
+    session.name = roomCall.remoteSessionName;
+  }
   activeSession = session;
   updateRecordButtonAvailability();
-  $('studioTitle').textContent = roomCall?.inviteMode ? 'ゲスト収録' : session.name;
+  $('studioTitle').value = session.name;
+  const guestView = roomCall?.isGuest === true;
+  $('studioTitle').hidden = guestView;
+  $('studioTitle').readOnly = guestView;
+  $('guestStudioTitle').textContent = session.name;
+  $('guestStudioTitle').hidden = !guestView;
+  studioTitleSaveFailed = false;
   $('participantLabel').textContent = session.participant;
   $('waveformParticipant').textContent = session.participant;
   stopWaveformRendering();
   $('timer').textContent = '00:00';
   setupView.hidden = true;
   studioView.hidden = false;
-  $('waveformState').textContent = '待機中';
+  $('waveformState').textContent = '';
   $('waveformState').classList.remove('live');
   errorText.textContent = '';
-  setStatus('録音を始める準備ができました');
+  if (roomCall?.isGuest && roomCall.remoteSessionName) {
+    try {
+      await persistSession({ ...session });
+    } catch (error) {
+      errorText.textContent = `Unable to save the session name received from the host: ${error.message}`;
+    }
+  } else {
+    roomCall?.setSessionName(session.name);
+  }
+  setStatus('Ready to start recording');
   await renderTakes();
   const takes = (await loadAll('takes'))
     .filter((take) => take.sessionId === session.id)
@@ -1488,7 +1555,7 @@ async function openSession(session) {
     .reduce((total, take) => total + (take.frames || 0), 0);
   sessionLimitReached = savedFrames >= MAX_SESSION_FRAMES;
   updateRecordButtonAvailability();
-  if (sessionLimitReached) setStatus('このセッションは2時間の録音上限に達しています');
+  if (sessionLimitReached) setStatus('This session has reached the 2-hour recording limit.');
   $('chunkCount').textContent = String(takes.at(-1)?.chunks || 0);
   await updateSessionSavedSize();
   if (!recording && !starting) {
@@ -1498,8 +1565,8 @@ async function openSession(session) {
       else if (!activeSession && !roomCall?.isActive) await releaseCaptureStream();
     } catch (error) {
       if (activeSession === session) {
-        setLocalWaveformState('マイク待機中');
-        errorText.textContent = `マイクの波形を開始できませんでした: ${error.message}`;
+        setLocalWaveformState('Waiting for microphone');
+        errorText.textContent = `Unable to start the microphone waveform: ${error.message}`;
       }
     }
   }
@@ -1509,8 +1576,9 @@ async function deleteActiveSession() {
   const session = activeSession;
   if (!session || roomCall?.isGuest || $('deleteSessionButton').disabled) return;
   if (!window.confirm(
-    `「${session.name}」と、このセッションに保存された録音・受信音声をすべて削除します。この操作は取り消せません。`
+    `Delete "${session.name}" and all recordings and received audio saved in this session. This action cannot be undone.`
   )) return;
+  if (!await saveStudioSessionName()) return;
 
   deletingSession = true;
   updateRecordButtonAvailability();
@@ -1523,17 +1591,16 @@ async function deleteActiveSession() {
     activeSession = null;
     sessionLimitReached = false;
     transferProgressCache = null;
-    previousTransferProgress = null;
     transferGraphSamples = [];
     studioView.hidden = true;
     setupView.hidden = false;
     await refreshSessionList();
     await updateSessionSavedSize();
-    setMessage('セッションと録音を削除しました。');
+    setMessage('Session and recordings deleted.');
   } catch (error) {
     errorText.textContent = deleted
-      ? `セッションは削除されましたが、画面を更新できませんでした: ${error.message}`
-      : `セッションを削除できませんでした: ${error.message}`;
+      ? `Session deleted, but the view could not be refreshed: ${error.message}`
+      : `Unable to delete the session: ${error.message}`;
   } finally {
     deletingSession = false;
     updateRecordButtonAvailability();
@@ -1546,12 +1613,12 @@ async function detectDevices(requestPermission = true) {
   detectingDevices = true;
   updateRecordButtonAvailability();
   button.disabled = true;
-  button.textContent = '確認中…';
+  button.textContent = 'Detecting…';
   $('statusMessage').textContent = '';
   try {
-    if (!navigator.mediaDevices?.enumerateDevices) throw new Error('デバイス一覧を取得できません。HTTPS または localhost で開いてください。');
+    if (!navigator.mediaDevices?.enumerateDevices) throw new Error('Unable to list devices. Open this page over HTTPS or localhost.');
     if (requestPermission) {
-      if (!navigator.mediaDevices.getUserMedia) throw new Error('マイク取得に対応していません。Chrome または Edge を使用してください。');
+      if (!navigator.mediaDevices.getUserMedia) throw new Error('Microphone access is not supported. Use Chrome or Edge.');
       const temporaryStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       temporaryStream.getTracks().forEach((track) => track.stop());
     }
@@ -1561,29 +1628,29 @@ async function detectDevices(requestPermission = true) {
     const selectedLabel = micDevice.selectedOptions[0]?.textContent;
     micDevice.replaceChildren();
     if (!microphones.length) {
-      micDevice.add(new Option('マイクが見つかりません', ''));
-      $('statusMessage').textContent = '利用可能なマイクが見つかりませんでした。';
+      micDevice.add(new Option('No microphone found', ''));
+      $('statusMessage').textContent = 'No available microphone was found.';
     } else {
       for (const [index, device] of microphones.entries()) {
-        micDevice.add(new Option(device.label || `マイク ${index + 1}`, device.deviceId));
+        micDevice.add(new Option(device.label || `Microphone ${index + 1}`, device.deviceId));
       }
       if (microphones.some((device) => device.deviceId === selectedDevice)) micDevice.value = selectedDevice;
     }
     if (selectedDevice && !microphones.some((device) => device.deviceId === selectedDevice) && mediaStream) {
-      micDevice.add(new Option(`${selectedLabel || '選択中のマイク'}（未接続）`, selectedDevice));
+      micDevice.add(new Option(`${selectedLabel || 'Selected microphone'} (not connected)`, selectedDevice));
       micDevice.value = selectedDevice;
     }
   } catch (error) {
     $('statusMessage').textContent = error.name === 'NotAllowedError'
-      ? 'マイクの使用が許可されませんでした。ブラウザーのサイト設定を確認してください。'
-      : `デバイスを検出できませんでした: ${error.message}`;
+      ? 'Microphone access was denied. Check your browser site settings.'
+      : `Unable to detect devices: ${error.message}`;
   } finally {
     trackMicDevice.replaceChildren(...Array.from(micDevice.options, (option) => option.cloneNode(true)));
     trackMicDevice.value = micDevice.value;
     detectingDevices = false;
     updateRecordButtonAvailability();
     button.disabled = false;
-    button.textContent = 'デバイスを検出';
+    button.textContent = 'Detect Devices';
   }
 }
 
@@ -1591,7 +1658,7 @@ async function ensureCaptureStream() {
   if (mediaStream?.getAudioTracks().some((track) => track.readyState === 'live')) {
     return mediaStream;
   }
-  if (!navigator.mediaDevices?.getUserMedia) throw new Error('マイク取得に対応していません。Chrome または Edge を使用してください。');
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone access is not supported. Use Chrome or Edge.');
   mediaStream = await acquireMicrophoneStream(micDevice.value);
   return mediaStream;
 }
@@ -1615,7 +1682,7 @@ async function changeMicrophone() {
   }
   switchingMicrophone = true;
   updateRecordButtonAvailability();
-  $('trackMicDeviceHint').textContent = 'マイクを切り替えています…';
+  $('trackMicDeviceHint').textContent = 'Switching microphone…';
   let nextStream = null;
   try {
     if (roomCall?.connected) await roomCall.checkLocalReadiness();
@@ -1628,11 +1695,11 @@ async function changeMicrophone() {
     micDevice.value = deviceId;
     startLocalPreview(mediaStream);
     previousStream?.getTracks().forEach((track) => track.stop());
-    $('trackMicDeviceHint').textContent = 'マイクを切り替えました。';
+    $('trackMicDeviceHint').textContent = 'Microphone changed.';
   } catch (error) {
     nextStream?.getTracks().forEach((track) => track.stop());
     trackMicDevice.value = previousDevice;
-    $('trackMicDeviceHint').textContent = `マイクを変更できませんでした: ${error.message}`;
+    $('trackMicDeviceHint').textContent = `Unable to change microphone: ${error.message}`;
   } finally {
     switchingMicrophone = false;
     updateRecordButtonAvailability();
@@ -1641,16 +1708,16 @@ async function changeMicrophone() {
 }
 
 async function checkRecordingReadiness() {
-  if (switchingMicrophone) throw new Error('マイクを切り替えています。');
+  if (switchingMicrophone) throw new Error('The microphone is being switched.');
   const stream = mediaStream || await ensureCaptureStream();
   const track = stream.getAudioTracks()[0];
   if (!track || track.readyState !== 'live' || track.muted) {
-    throw new Error('有効なマイク入力がありません。');
+    throw new Error('No active microphone input is available.');
   }
-  if (!window.AudioContext) throw new Error('AudioContextを利用できません。');
+  if (!window.AudioContext) throw new Error('AudioContext is not available.');
   const context = new AudioContext({ sampleRate: TARGET_RATE });
   try {
-    if (context.sampleRate !== TARGET_RATE) throw new Error('48 kHzのAudioContextを作成できません。');
+    if (context.sampleRate !== TARGET_RATE) throw new Error('Unable to create a 48 kHz AudioContext.');
     await context.audioWorklet.addModule('./recorder-worklet.js');
   } finally {
     if (context.state !== 'closed') await context.close();
@@ -1676,10 +1743,10 @@ async function releaseCaptureStream() {
 async function commitChunk(samples, isFinal, startFrame) {
   if (!activeTake || samples.length === 0) return;
   if (startFrame !== capturedFrames) {
-    throw new Error(`録音フレームが不連続です（期待 ${capturedFrames} / 取得 ${startFrame}）。不明区間を正常音声として扱わず録音を停止しました。`);
+    throw new Error(`Recording frames are discontinuous (expected ${capturedFrames} / received ${startFrame}). Recording stopped rather than treating the unknown interval as valid audio.`);
   }
   if (!canQueueRecordingCommit(pendingCommits, isFinal)) {
-    throw new Error('IndexedDBへの保存待ちが60秒分に達しました。データ欠落を防ぐため録音を停止しました。');
+    throw new Error('The IndexedDB save queue has reached 60 seconds. Recording stopped to prevent data loss.');
   }
   const sequence = nextSequence++;
   capturedFrames += samples.length;
@@ -1724,7 +1791,7 @@ async function commitChunk(samples, isFinal, startFrame) {
   });
   await commitChain;
   const take = activeTake;
-  if (!take) throw new Error('保存済み録音takeが見つかりません。');
+  if (!take) throw new Error('The saved recording take was not found.');
   if (chunk.transferGeneration) {
     updateTransferProgressCache(chunk.transferGeneration, 'guest', (progress) => ({
       bytes: progress.bytes + wav.size,
@@ -1740,20 +1807,21 @@ async function commitChunk(samples, isFinal, startFrame) {
 
 async function createTake({
   scheduledStartAt = null,
+  scheduledStartedAt = null,
   event = null,
   preparedAudioContext = null,
   preparedAudioContextResume = null
 } = {}) {
   errorText.textContent = '';
   if (!navigator.mediaDevices?.getUserMedia || !window.AudioWorkletNode) {
-    throw new Error('AudioWorklet 録音に対応していません。Chrome または Edge を使用してください。');
+    throw new Error('AudioWorklet recording is not supported. Use Chrome or Edge.');
   }
   await stopDiagnostics({ stopCapture: !roomCall?.isActive });
   await ensureCaptureStream();
   stopLocalPreview();
   audioContext = preparedAudioContext || new AudioContext({ sampleRate: TARGET_RATE });
   if (audioContext.sampleRate !== TARGET_RATE) {
-    throw new Error(`この端末のAudioContextは ${audioContext.sampleRate} Hzです。48,000 Hzが必要です。`);
+    throw new Error(`This device’s AudioContext is ${audioContext.sampleRate} Hz. 48,000 Hz is required.`);
   }
   const sessionTakes = (await loadAll('takes'))
     .filter((take) => take.sessionId === activeSession.id && !take.remote);
@@ -1762,7 +1830,7 @@ async function createTake({
   if (takeFrameLimit === 0) {
     sessionLimitReached = true;
     updateRecordButtonAvailability();
-    throw new Error('このセッションは2時間の録音上限に達しています。新しいセッションを作成してください。');
+    throw new Error('This session has reached the 2-hour recording limit. Create a new session.');
   }
   sessionLimitReached = false;
   activeTake = {
@@ -1773,16 +1841,14 @@ async function createTake({
     status: 'recording',
     transferGeneration: roomCall?.localRole === 'guest' ? roomCall.authFields?.generation : null,
     hostStored: roomCall?.localRole === 'guest' ? false : null,
-    startedAt: scheduledStartAt === null
-      ? Date.now()
-      : Date.now() + (scheduledStartAt - performance.now()),
+    startedAt: scheduledStartedAt ??
+      (scheduledStartAt === null ? Date.now() : Date.now() + (scheduledStartAt - performance.now())),
     endedAt: null,
     frames: 0,
     chunks: 0,
     bytes: 0,
     tailUnknown: false
   };
-  await persistTake(activeTake);
   nextSequence = 0;
   capturedFrames = 0;
   $('chunkCount').textContent = '0';
@@ -1821,13 +1887,20 @@ async function createTake({
         roomCall?.reportRecordingStarted(data.event, observedAt, data.frame);
       }
       takeStartedAt = observedAt;
+      activeTake.startedAt = scheduledRecordingStartAt !== null && scheduledRecordingWallStartAt !== null
+        ? scheduledRecordingWallStartAt + (observedAt - scheduledRecordingStartAt)
+        : Date.now() + (observedAt - performance.now());
+      void persistTake({ ...activeTake }).catch((error) => {
+        errorText.textContent = `Unable to save the actual recording start time: ${error.message}`;
+      });
       resetWaveformHistory(localWaveform, observedAt, observedAt);
       waveformElapsedSeconds = 0;
       roomCall?.beginRecordingWaveform(observedAt);
       scheduledRecordingStartAt = null;
+      scheduledRecordingWallStartAt = null;
       updateRecordingPreparation();
-      setStatus('録音中 · 端末へ順次保存しています', 'recording');
-      if (roomCall?.isGuest) $('hostRecordingStatus').textContent = 'ホストに合わせて録音中です';
+      setStatus('Recording · Saving to this device', 'recording');
+      if (roomCall?.isGuest) $('hostRecordingStatus').textContent = 'Recording in sync with the host';
       $('waveformState').textContent = 'LIVE';
       $('waveformState').classList.add('live');
       drawWaveform();
@@ -1840,7 +1913,7 @@ async function createTake({
     if (data.type === 'audio') {
       if (commitError) return;
       void commitChunk(data.samples, data.final, data.startFrame).catch((error) => {
-        errorText.textContent = error.message || `チャンクを保存できませんでした: ${error}`;
+        errorText.textContent = error.message || `Unable to save chunk: ${error}`;
         void stopRecording(errorText.textContent);
       });
       return;
@@ -1848,8 +1921,8 @@ async function createTake({
     if (data.type === 'limit-reached' && recording) {
       void stopRecording().then((saved) => setMessage(
         saved
-          ? 'このセッションの2時間上限に達したため、録音を停止して保存しました。'
-          : 'このセッションの2時間上限に達したため録音を停止しました。保存状態を確認してください。',
+          ? 'Recording stopped and saved because this session reached its 2-hour limit.'
+          : 'Recording stopped because this session reached its 2-hour limit. Check the save status.',
         !saved
       ));
     }
@@ -1858,30 +1931,30 @@ async function createTake({
   analyserNode.connect(recorderNode);
   recorderNode.connect(silentGain).connect(audioContext.destination);
   const track = mediaStream.getAudioTracks()[0];
-  if (!track) throw new Error('有効なマイク入力がありません。');
+  if (!track) throw new Error('No active microphone input is available.');
   clearRecordingTrackMonitor();
   const trackMonitor = monitorRecordingTrack(track, {
     isRecording: () => recording,
     onMuted: () => {
-      setStatus('マイク入力が一時停止しています。復帰を待っています…');
+      setStatus('Microphone input is paused. Waiting for it to resume…');
     },
     onUnmuted: () => {
-      setStatus('録音中 · 端末へ順次保存しています', 'recording');
+      setStatus('Recording · Saving to this device', 'recording');
     },
     onEnded: () => {
-      void stopRecording('マイク入力が終了しました。保存済みチャンクを復旧データとして残しました。')
-        .catch((error) => setMessage(`録音を停止できませんでした: ${error.message}`, true));
+      void stopRecording('Microphone input ended. Saved chunks are available for recovery.')
+        .catch((error) => setMessage(`Unable to stop recording: ${error.message}`, true));
     },
     onMuteTimeout: () => {
-      setStatus('マイク入力が一時停止中です · 録音を継続しています');
-      setMessage('マイク入力の一時停止が続いています。入力が復帰するまで録音を継続します。', true);
+      setStatus('Microphone input is paused · Recording continues');
+      setMessage('Microphone input remains paused. Recording will continue until input resumes.', true);
     }
   });
   cleanupRecordingTrackMonitor = trackMonitor.cleanup;
   audioContext.addEventListener('statechange', () => {
     if (recording && audioContext?.state === 'closed') {
-      void stopRecording('AudioContext が閉じられました。保存済みチャンクを復旧データとして残しました。')
-        .catch((error) => setMessage(`録音を停止できませんでした: ${error.message}`, true));
+      void stopRecording('AudioContext was closed. Saved chunks are available for recovery.')
+        .catch((error) => setMessage(`Unable to stop recording: ${error.message}`, true));
     }
   });
   if (preparedAudioContextResume) {
@@ -1890,9 +1963,18 @@ async function createTake({
   } else {
     await audioContext.resume();
   }
-  if (track.readyState !== 'live') throw new Error('録音開始前にマイク入力が終了しました。デバイスを確認して再試行してください。');
+  if (track.readyState !== 'live') throw new Error('Microphone input ended before recording started. Check the device and try again.');
   if (scheduledStartAt !== null && scheduledStartAt < performance.now() + 250) {
-    throw new Error('同期開始の準備が間に合いませんでした。録音準備を確認して再試行してください。');
+    throw new Error('The synchronized start could not be prepared in time. Check recording readiness and try again.');
+  }
+  if (cancelRecordingStart) {
+    throw new Error('The synchronized recording start was canceled because the other participant could not prepare.');
+  }
+  await persistTake(activeTake);
+  if (cancelRecordingStart) {
+    await deleteUnstartedTake(activeTake.id);
+    activeTake = null;
+    throw new Error('The synchronized recording start was canceled because the other participant could not prepare.');
   }
   const startAt = scheduledStartAt === null
     ? null
@@ -1911,8 +1993,8 @@ async function createTake({
   recordButton.disabled = true;
   stopButton.disabled = false;
   const scheduled = scheduledStartAt !== null;
-  setStatus(scheduled ? '録音開始を予約しました · 端末へ順次保存します' : '録音中 · 端末へ順次保存しています', scheduled ? 'ready' : 'recording');
-  $('waveformState').textContent = scheduled ? '準備中' : 'LIVE';
+  setStatus(scheduled ? 'Recording scheduled · Saving to this device' : 'Recording · Saving to this device', scheduled ? 'ready' : 'recording');
+  $('waveformState').textContent = scheduled ? 'Preparing' : 'LIVE';
   $('waveformState').classList.toggle('live', !scheduled);
   if (!scheduled) updateRecordingPreparation();
 }
@@ -1945,6 +2027,7 @@ async function stopRecording(recoveryReason = null) {
   stopWaveformRendering();
   updateRecordButtonAvailability();
   scheduledRecordingStartAt = null;
+  scheduledRecordingWallStartAt = null;
   updateRecordingPreparation();
   roomCall?.endRecordingWaveform();
   roomCall?.setHostRecordingState(false);
@@ -1953,7 +2036,7 @@ async function stopRecording(recoveryReason = null) {
   takeRefreshTimer = null;
   recordButton.disabled = true;
   stopButton.disabled = true;
-  setStatus(recoveryReason ? '保存済みチャンクから復旧しています…' : '末尾チャンクを保存しています…');
+  setStatus(recoveryReason ? 'Recovering from saved chunks…' : 'Saving final chunk…');
   if (recorderNode) {
     recorderNode.port.postMessage({ type: 'stop' });
     await new Promise((resolve) => {
@@ -1972,7 +2055,7 @@ async function stopRecording(recoveryReason = null) {
   try {
     await commitChain;
   } catch (error) {
-    failure ||= `IndexedDB への保存に失敗しました: ${error.message}`;
+    failure ||= `Unable to save to IndexedDB: ${error.message}`;
   }
   await stopDiagnostics({ stopCapture: false });
   if (mediaStream) startLocalPreview(mediaStream);
@@ -1987,17 +2070,17 @@ async function stopRecording(recoveryReason = null) {
   try {
     await persistTake(activeTake);
   } catch (error) {
-    failure ||= `take の完了状態を保存できませんでした: ${error.message}`;
+    failure ||= `Unable to save the take completion status: ${error.message}`;
   }
   if (activeTake.transferGeneration) roomCall?.notifyTakeFinalized(activeTake);
   $('timer').textContent = formatDuration(activeTake.frames / TARGET_RATE);
   stopButton.disabled = true;
   finalizing = false;
   takeFrameLimit = 0;
-  setStatus(failure ? '復旧用データを保存しました。未確定の末尾は含まれません。' : '録音データ保存済み · WAVを書き出せます', failure ? 'ready' : 'saved');
-  $('waveformState').textContent = '待機中';
+  setStatus(failure ? 'Recovery data saved. The unconfirmed final section is not included.' : 'Recording saved · Ready to export WAV', failure ? 'ready' : 'saved');
+  $('waveformState').textContent = '';
   $('waveformState').classList.remove('live');
-  if (failure) errorText.textContent = `${failure} 保存済みチャンクは一覧から復旧 WAV として書き出せます。`;
+  if (failure) errorText.textContent = `${failure} Saved chunks can be exported as a recovered WAV from the list.`;
   activeTake = null;
   await renderTakes();
   const sessionFrames = (await loadAll('takes'))
@@ -2005,10 +2088,10 @@ async function stopRecording(recoveryReason = null) {
     .reduce((total, take) => total + (take.frames || 0), 0);
   sessionLimitReached = sessionFrames >= MAX_SESSION_FRAMES;
   updateRecordButtonAvailability();
-  if (sessionLimitReached) setStatus('このセッションは2時間の録音上限に達しています');
+  if (sessionLimitReached) setStatus('This session has reached the 2-hour recording limit.');
   await updateSessionSavedSize();
   await refreshSessionList();
-  if (!failure) setMessage('録音データ（WAVチャンク）をブラウザー内に保存しました。音声ファイルとして保存するには「WAVを保存」を押してください。');
+  if (!failure) setMessage('Recording data (WAV chunks) has been saved in the browser. Select “Save WAV” to save an audio file.');
   return !failure;
 }
 
@@ -2030,16 +2113,19 @@ async function startRecording(remoteSchedule = null) {
   if (recording) return true;
   if (finalizing || starting || switchingMicrophone || !activeSession) return false;
   if (roomCall?.isActive && !roomCall.isGuest && !roomCall.canStartRecording) {
-    errorText.textContent = '通話接続と双方の録音準備が完了してから録音を開始してください。';
+    errorText.textContent = 'Connect the call and confirm both participants are ready before starting to record.';
     return false;
   }
   if (switchingMicrophone) return false;
   starting = true;
+  cancelRecordingStart = false;
   updateRecordButtonAvailability();
   scheduledRecordingStartAt = remoteSchedule?.startAt ?? null;
+  scheduledRecordingWallStartAt = remoteSchedule?.hostStartedAt ?? null;
   updateRecordingPreparation();
   recordButton.disabled = true;
   let preparedAudioContext = null;
+  let synchronizedStartAnnounced = false;
   try {
     const prepared = primeRecordingAudioContext();
     preparedAudioContext = prepared.context;
@@ -2051,57 +2137,88 @@ async function startRecording(remoteSchedule = null) {
           return false;
         }
       } catch (error) {
-        errorText.textContent = `ホスト認証を確認できません: ${error.message}`;
+        errorText.textContent = `Unable to verify host authentication: ${error.message}`;
         return false;
       }
     }
     let schedule = remoteSchedule;
     if (roomCall?.isPeerReadyForRecording && !roomCall.isGuest && !schedule) {
       const clockOffsetMs = await roomCall.synchronizeClock();
+      const startAt = performance.now() + 5000;
       schedule = {
-        startAt: performance.now() + 5000,
+        startAt,
+        hostStartedAt: Date.now() + (startAt - performance.now()),
         clockOffsetMs,
         event: { eventId: crypto.randomUUID(), sequence: roomCall.recordingSequence + 1 }
       };
       scheduledRecordingStartAt = schedule.startAt;
+      scheduledRecordingWallStartAt = schedule.hostStartedAt;
       updateRecordingPreparation();
+    }
+    if (schedule && roomCall?.localRole === 'host') {
+      const command = roomCall.setHostRecordingState(
+        true,
+        schedule.startAt,
+        schedule.clockOffsetMs,
+        schedule.event.eventId,
+        schedule.hostStartedAt
+      );
+      if (!command) throw new Error('Unable to send the synchronized recording start to the guest.');
+      synchronizedStartAnnounced = true;
     }
     await createTake({
       scheduledStartAt: schedule?.startAt ?? null,
+      scheduledStartedAt: schedule?.hostStartedAt ?? null,
       event: schedule?.event ?? null,
       preparedAudioContext: prepared.context,
       preparedAudioContextResume: prepared.resume
     });
     preparedAudioContext = null;
-    if (recording && schedule) {
-      if (!roomCall.isGuest) roomCall.setHostRecordingState(
-        true,
-        schedule.startAt,
-        schedule.clockOffsetMs,
-        schedule.event.eventId
-      );
-    }
     return recording;
   } catch (error) {
     await stopDiagnostics({ stopCapture: false });
+    if (synchronizedStartAnnounced && !cancelRecordingStart) roomCall.setHostRecordingState(false);
     if (activeTake?.status === 'recording') {
-      activeTake = { ...activeTake, status: 'recovered', endedAt: Date.now(), tailUnknown: true, recoveryReason: error.message };
-      await persistTake(activeTake).catch((saveError) => { errorText.textContent = `${error.message} take の状態も保存できませんでした: ${saveError.message}`; });
-      activeTake = null;
-      await renderTakes();
+      if (cancelRecordingStart && !recording) {
+        const cancelledTake = activeTake;
+        activeTake = null;
+        try {
+          await deleteUnstartedTake(cancelledTake.id);
+        } catch (deleteError) {
+          activeTake = {
+            ...cancelledTake,
+            status: 'recovered',
+            endedAt: Date.now(),
+            tailUnknown: true,
+            recoveryReason: error.message
+          };
+          await persistTake(activeTake).catch((saveError) => {
+            errorText.textContent = `${error.message} Unable to save canceled take recovery data: ${saveError.message}`;
+          });
+          activeTake = null;
+          errorText.textContent ||= `Unable to discard canceled take: ${deleteError.message}`;
+          await renderTakes();
+        }
+      } else {
+        activeTake = { ...activeTake, status: 'recovered', endedAt: Date.now(), tailUnknown: true, recoveryReason: error.message };
+        await persistTake(activeTake).catch((saveError) => { errorText.textContent = `${error.message} Unable to save take status: ${saveError.message}`; });
+        activeTake = null;
+        await renderTakes();
+      }
     }
     const errorDetails = [error.name, error.constraint || error.constraintName, error.message]
       .filter(Boolean)
       .join(' · ') || String(error);
     errorText.textContent ||= error.name === 'NotAllowedError'
-      ? 'マイクの使用が許可されませんでした。ブラウザーのサイト設定を確認してください。'
+      ? 'Microphone access was denied. Check your browser site settings.'
       : error.name === 'OverconstrainedError' && (error.constraint || error.constraintName) === 'deviceId'
-        ? '選択中のマイクが見つからないか利用できません。「デバイスを検出」で一覧を更新し、使用する入力を選び直してください。'
-        : `録音を開始できませんでした: ${errorDetails}`;
-    setStatus('録音を開始できませんでした');
+        ? 'The selected microphone was not found or is unavailable. Select “Detect Devices” to refresh the list and choose another input.'
+        : `Unable to start recording: ${errorDetails}`;
+    setStatus('Unable to start recording');
     recordButton.disabled = false;
     stopButton.disabled = true;
     scheduledRecordingStartAt = null;
+    scheduledRecordingWallStartAt = null;
     return false;
   } finally {
     if (preparedAudioContext && preparedAudioContext !== audioContext &&
@@ -2109,6 +2226,7 @@ async function startRecording(remoteSchedule = null) {
       await preparedAudioContext.close();
     }
     starting = false;
+    cancelRecordingStart = false;
     updateRecordingPreparation();
     updateRecordButtonAvailability();
     if (!recording && activeSession && !studioView.hidden && mediaStream) startLocalPreview(mediaStream);
@@ -2116,34 +2234,35 @@ async function startRecording(remoteSchedule = null) {
 }
 
 function applyHostRecordingState(isRecording, schedule = null) {
+  if (!isRecording && starting && !recording) cancelRecordingStart = true;
   const previousState = lastHostRecordingState;
   lastHostRecordingState = isRecording;
   hostRecordingCommand = hostRecordingCommand.then(async () => {
     if (isRecording) {
-      $('hostRecordingStatus').textContent = 'ホストの録音に合わせて録音を開始しています…';
+      $('hostRecordingStatus').textContent = 'Starting recording in sync with the host…';
       const started = recording || await startRecording(schedule);
       $('hostRecordingStatus').textContent = recording
         ? scheduledRecordingStartAt !== null
-          ? 'ホストの録音開始を待っています。開始表示が切り替わるまでお待ちください。'
-          : 'ホストに合わせて録音中です'
-        : 'この端末では録音を開始できませんでした。下のエラーを確認してください。';
+          ? 'Waiting for the host to start recording. Wait until the recording indicator changes.'
+          : 'Recording in sync with the host'
+        : 'Unable to start recording on this device. Check the error below.';
       return started;
     }
     if (recording) {
-      $('hostRecordingStatus').textContent = 'ホストの停止に合わせて保存しています…';
+      $('hostRecordingStatus').textContent = 'Saving in sync with the host’s stop…';
       const stopped = await stopRecording();
       $('hostRecordingStatus').textContent = stopped
-        ? 'ホストに合わせて停止し、この端末に保存しました'
-        : '停止または保存を確認できませんでした。エラーを確認してください。';
+        ? 'Stopped in sync with the host and saved on this device'
+        : 'Unable to confirm the stop or save. Check the error.';
       return stopped;
     }
     $('hostRecordingStatus').textContent = previousState
-      ? 'ホストに合わせて停止し、この端末に保存しました'
-      : 'ホストの録音を待っています';
+      ? 'Stopped in sync with the host and saved on this device'
+      : 'Waiting for the host to record';
     return true;
   }).catch((error) => {
-    errorText.textContent = `ホストの録音状態を反映できませんでした: ${error.message}`;
-    $('hostRecordingStatus').textContent = '録音状態を反映できませんでした。エラーを確認してください。';
+    errorText.textContent = `Unable to apply the host recording status: ${error.message}`;
+    $('hostRecordingStatus').textContent = 'Unable to apply recording status. Check the error.';
     return false;
   });
   return hostRecordingCommand;
@@ -2161,7 +2280,7 @@ async function getTakeChunks(takeId) {
 async function exportTake(take, exportButton) {
   const totalBytes = 44 + take.frames * BYTES_PER_FRAME;
   if (!Number.isSafeInteger(take.frames) || take.frames <= 0 || totalBytes > MAX_WAV_BYTES) {
-    setMessage('WAV は1 GiB以下で書き出してください。', true);
+    setMessage('Export WAV files no larger than 1 GiB.', true);
     return;
   }
   exportButton.disabled = true;
@@ -2182,15 +2301,15 @@ async function exportTake(take, exportButton) {
         try {
           await writable.abort(error);
         } catch (abortError) {
-          throw new AggregateError([error, abortError], 'WAVの書き込みと中断処理の両方に失敗しました。');
+          throw new AggregateError([error, abortError], 'Both writing the WAV and aborting the write failed.');
         }
         throw error;
       }
-      setMessage('PCM24 WAVを保存先へ書き出しました。');
+      setMessage('PCM24 WAV exported to the selected destination.');
       return;
     }
     if (totalBytes > BLOB_DOWNLOAD_LIMIT) {
-      setMessage('このブラウザーでは256 MBを超えるWAVを安全に保存できません。対応するChromeまたはEdgeで保存先を選択してください。', true);
+      setMessage('This browser cannot safely save WAV files larger than 256 MB. Use a supported version of Chrome or Edge and select a destination.', true);
       return;
     }
     const blobParts = [];
@@ -2205,16 +2324,16 @@ async function exportTake(take, exportButton) {
     downloadLink.href = url;
     downloadLink.download = makeRecordingFilename(activeSession, take);
     downloadLink.className = 'take-action';
-    downloadLink.textContent = 'ダウンロード';
+    downloadLink.textContent = 'Download';
     exportButton.replaceWith(downloadLink);
     window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-    setMessage('WAVを準備しました。録音一覧の「ダウンロード」を押して保存してください。');
+    setMessage('WAV is ready. Select “Download” in the recording list to save it.');
   } catch (error) {
     if (error.name === 'AbortError') {
-      setMessage('WAVの保存をキャンセルしました。');
+      setMessage('WAV save canceled.');
       return;
     }
-    setMessage(`WAV を書き出せませんでした: ${error.message}`, true);
+    setMessage(`Unable to export WAV: ${error.message}`, true);
   } finally {
     if (exportButton.isConnected) exportButton.disabled = false;
   }
@@ -2229,10 +2348,10 @@ async function recoverInterruptedTakes() {
       status: 'recovered',
       endedAt: Date.now(),
       tailUnknown: true,
-      recoveryReason: 'タブまたはブラウザーが録音終了前に閉じられました。最後の確定チャンクまでを復旧対象にしています。'
+      recoveryReason: 'The tab or browser closed before recording ended. Recovery includes only confirmed chunks.'
     });
   }
-  if (interrupted.length) setMessage(`${interrupted.length} 件の中断 take を復旧用として読み込みました。`);
+  if (interrupted.length) setMessage(`Loaded ${interrupted.length} interrupted take(s) for recovery.`);
 }
 
 async function stopDiagnosticsOnUnload() {
@@ -2243,7 +2362,7 @@ setupForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const participant = participantNameInput.value.trim();
   if (!participant || !micDevice.value) {
-    $('statusMessage').textContent = '名前と録音マイクを指定してください。';
+    $('statusMessage').textContent = 'Enter your name and select a recording microphone.';
     return;
   }
   const createdAt = Date.now();
@@ -2256,7 +2375,7 @@ setupForm.addEventListener('submit', async (event) => {
   });
   const session = {
     id: crypto.randomUUID(),
-    name: `収録 ${sessionName}`,
+    name: `Recording ${sessionName}`,
     participant,
     createdAt,
     guestSession: roomCall?.isGuest === true
@@ -2266,7 +2385,7 @@ setupForm.addEventListener('submit', async (event) => {
     activeSession = session;
     await openSession(session);
   } catch (error) {
-    $('statusMessage').textContent = `セッションを保存できませんでした: ${error.message}`;
+    $('statusMessage').textContent = `Unable to save the session: ${error.message}`;
   }
 });
 
@@ -2274,6 +2393,10 @@ participantNameInput.addEventListener('beforeinput', () => {
   participantNameEdited = true;
 });
 $('detectDevices').addEventListener('click', () => { void detectDevices(); });
+studioTitleInput.addEventListener('input', () => { void saveStudioSessionName(); });
+studioTitleInput.addEventListener('blur', () => {
+  if (activeSession) studioTitleInput.value = activeSession.name;
+});
 $('deleteSessionButton').addEventListener('click', () => { void deleteActiveSession(); });
 $('deleteSelectedSessionsButton').addEventListener('click', () => { void deleteSelectedSessions(); });
 micDevice.addEventListener('change', () => { trackMicDevice.value = micDevice.value; updateRecordButtonAvailability(); });
@@ -2288,17 +2411,18 @@ stopButton.addEventListener('click', () => {
 });
 $('backButton').addEventListener('click', async () => {
   if (recording || finalizing) {
-    setMessage('録音を停止して保存してからセッション一覧へ戻ってください。', true);
+    setMessage('Stop and save the recording before returning to the session list.', true);
     return;
   }
   if (roomCall?.isActive) {
-    setMessage('通話または招待を終了してからセッション一覧へ戻ってください。', true);
+    setMessage('End the call or invitation before returning to the session list.', true);
     return;
   }
   if (switchingMicrophone) {
-    setMessage('マイクの切り替えが完了してからセッション一覧へ戻ってください。', true);
+    setMessage('Wait for the microphone switch to complete before returning to the session list.', true);
     return;
   }
+  if (!await saveStudioSessionName()) return;
   stopLocalPreview();
   await releaseCaptureStream();
   activeSession = null;
@@ -2322,7 +2446,7 @@ async function initialize() {
     try {
       authSession = await getHostSession();
     } catch (error) {
-      $('statusMessage').textContent = `ホスト認証を確認できません: ${error.message}`;
+      $('statusMessage').textContent = `Unable to verify host authentication: ${error.message}`;
       setupForm.querySelector('button[type="submit"]').disabled = true;
       return;
     }
@@ -2337,18 +2461,18 @@ async function initialize() {
     $('logoutButton').hidden = false;
     $('logoutButton').addEventListener('click', async () => {
       if (recording || finalizing) {
-        $('statusMessage').textContent = '録音を停止して保存してからログアウトしてください。';
+        $('statusMessage').textContent = 'Stop and save the recording before logging out.';
         return;
       }
       if (roomCall?.isActive) {
-        $('statusMessage').textContent = '通話または招待を終了してからログアウトしてください。';
+        $('statusMessage').textContent = 'End the call or invitation before logging out.';
         return;
       }
       $('logoutButton').disabled = true;
       try {
         await signOut(await getAuth0Client());
       } catch (error) {
-        $('statusMessage').textContent = `ログアウトできません: ${error.message}`;
+        $('statusMessage').textContent = `Unable to log out: ${error.message}`;
         $('logoutButton').disabled = false;
       }
     });
@@ -2365,6 +2489,18 @@ async function initialize() {
       checkReadiness: checkRecordingReadiness,
       onReadinessState: () => updateRecordButtonAvailability(),
       onRecordingState: applyHostRecordingState,
+      onNetworkEvent: appendNetworkEvent,
+      onSessionName: async (name) => {
+        if (roomCall?.isGuest !== true || !activeSession) return;
+        activeSession.name = name;
+        $('guestStudioTitle').textContent = name;
+        try {
+          await persistSession({ ...activeSession });
+          await refreshSessionList();
+        } catch (error) {
+          errorText.textContent = `Unable to save the session name received from the host: ${error.message}`;
+        }
+      },
       getNextTransferChunk,
       prepareTransferChunk,
       markTransferChunkStored: markTransferChunkStored,
@@ -2380,7 +2516,7 @@ async function initialize() {
           startLocalPreview(stream);
         } else {
           stopLocalPreview();
-          if (!recording) setLocalWaveformState('待機中');
+          if (!recording) setLocalWaveformState('Waiting');
         }
       },
       onError: (error) => { errorText.textContent = error.message; }
@@ -2397,7 +2533,7 @@ async function initialize() {
       });
     }, 1000);
   } catch (error) {
-    $('statusMessage').textContent = `ローカル保存を初期化できませんでした: ${error.message}`;
+    $('statusMessage').textContent = `Unable to initialize local storage: ${error.message}`;
     setupForm.querySelector('button[type="submit"]').disabled = true;
   }
 }

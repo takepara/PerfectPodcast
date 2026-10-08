@@ -18,12 +18,12 @@ test('login and recorder use identical brand markup and a shared stylesheet', ()
 });
 
 test('login explains the studio and guest access with a plain login button', () => {
-  assert.match(index, /id="loginButton"[^>]*>ログイン<\/button>/);
-  assert.equal(index.includes('Auth0でログイン'), false);
-  assert.match(index, /id="loginHeading" class="login-heading">高音質ポッドキャスト収録<\/h1>/);
-  assert.match(index, /参加者ごとの音声を24-bit \/ 48 kHzで端末に録音。/);
-  assert.match(index, /ホストとして収録を始めるには/);
-  assert.match(index, /ゲストの方は、ホストから届いた招待リンク/);
+  assert.match(index, /id="loginButton"[^>]*>Log In<\/button>/);
+  assert.equal(index.includes('Log in with Auth0'), false);
+  assert.match(index, /id="loginHeading" class="login-heading">High-Quality Podcast Recording<\/h1>/);
+  assert.match(index, /Record each participant locally in 24-bit \/ 48 kHz/);
+  assert.match(index, /Log in to start a recording session as the host/);
+  assert.match(index, /Guests can join using the invitation link from the host/);
   assert.match(index, /class="login-art" aria-hidden="true"/);
 });
 
@@ -31,11 +31,24 @@ test('removes recorder instructions but retains live statuses and errors', () =>
   for (const id of ['setupTitle', 'setupInstructions', 'roomInstructions', 'localStorageNotice', 'transferProgressDescription']) {
     assert.equal(recorder.includes(`id="${id}"`), false);
   }
-  assert.equal(index.includes('許可されたAuth0アカウント'), false);
+  assert.equal(index.includes('authorized Auth0 account'), false);
   for (const id of ['statusMessage', 'roomStatus', 'errorText', 'recordingPreparation', 'trackMicDeviceHint', 'transferGraphSummary']) {
     assert.ok(recorder.includes(`id="${id}"`));
   }
   assert.match(recorder, /id="trackMicDeviceHint"[^>]*><\/p>/);
+});
+
+test('shows a scrollable terminal log for studio network events below the studio panels', () => {
+  const studio = recorder.slice(recorder.indexOf('<section id="studioView"'), recorder.indexOf('<div id="notice"'));
+  assert.match(studio, /class="panel network-event-panel"[\s\S]*id="networkEventCount"[\s\S]*id="networkEventLog"[^>]*readonly[^>]*wrap="off"/);
+  assert.ok(studio.indexOf('class="panel network-event-panel"') > studio.indexOf('class="studio-grid terminal-grid"'));
+  const source = readPrototype('recorder.js');
+  assert.match(source, /function appendNetworkEvent\(event, details = ''\)/);
+  assert.match(source, /log\.setRangeText\([\s\S]*new Date\(\)\.toISOString\(\)/);
+  assert.match(source, /if \(wasAtBottom\) log\.scrollTop = log\.scrollHeight/);
+  assert.match(source, /onNetworkEvent: appendNetworkEvent/);
+  const css = readPrototype('recorder.css');
+  assert.match(css, /\.terminal-ui \.network-event-log \{ height: 320px;[^}]*background: #050906;[^}]*font-size: 11px;/);
 });
 
 test('hides the requested redundant session labels while preserving accessible headings', () => {
@@ -46,11 +59,30 @@ test('hides the requested redundant session labels while preserving accessible h
   }
 });
 
+test('allows editing and persists the studio session name for the session list', () => {
+  assert.match(recorder, /<h1><input id="studioTitle" class="studio-title-input" type="text" maxlength="120" aria-label="Session name"/);
+  assert.match(recorder, /<span id="guestStudioTitle" class="studio-title-display" hidden><\/span>/);
+  const source = readPrototype('recorder.js');
+  const saveName = source.slice(source.indexOf('function saveStudioSessionName()'), source.indexOf('\nasync function deleteSessionsAndRecordings'));
+  const openSession = source.slice(source.indexOf('async function openSession('), source.indexOf('\nasync function deleteActiveSession'));
+  const sessionList = source.slice(source.indexOf('async function refreshSessionList()'), source.indexOf('\nfunction isGuestLocalSession'));
+  assert.match(saveName, /session\.name = name;[\s\S]*persistSession\(sessionToSave\)/);
+  assert.match(saveName, /roomCall\?\.setSessionName\(sessionToSave\.name\)/);
+  assert.match(saveName, /roomCall\?\.isGuest === true/);
+  assert.match(source, /studioTitleInput\.addEventListener\('input', \(\) => \{ void saveStudioSessionName\(\); \}\)/);
+  assert.match(source, /if \(!await saveStudioSessionName\(\)\) return;/);
+  assert.match(openSession, /\$\('studioTitle'\)\.value = session\.name;[\s\S]*?const guestView = roomCall\?\.isGuest === true;[\s\S]*?\$\('studioTitle'\)\.hidden = guestView;[\s\S]*?\$\('guestStudioTitle'\)\.textContent = session\.name;[\s\S]*?\$\('guestStudioTitle'\)\.hidden = !guestView/);
+  assert.match(openSession, /roomCall\?\.isGuest && roomCall\.remoteSessionName/);
+  assert.match(sessionList, /name\.textContent = session\.name/);
+  assert.match(source, /onSessionName: async \(name\) => \{[\s\S]*?\$\('guestStudioTitle'\)\.textContent = name;[\s\S]*?persistSession\(\{ \.\.\.activeSession \}\)/);
+  assert.match(source, /name: `Recording \$\{sessionName\}`/);
+});
+
 test('removes the placeholder avatar and offers checkbox-based bulk session deletion', () => {
   assert.equal(recorder.includes('class="avatar"'), false);
   assert.match(recorder, /<div class="participant-chip">[\s\S]*?<span id="participantLabel">Participant<\/span><\/div>\s*<button id="deleteSessionButton"/);
-  assert.doesNotMatch(recorder, /id="setupFormTitle"|保存したセッション|この端末のゲスト録音/);
-  assert.match(recorder, /<div class="panel-heading compact">[\s\S]*?<button id="deleteSelectedSessionsButton"[^>]*>\s*セッション削除/);
+  assert.doesNotMatch(recorder, /id="setupFormTitle"|Saved sessions|Guest recordings on this device/);
+  assert.match(recorder, /<div class="panel-heading compact">[\s\S]*?<button id="deleteSelectedSessionsButton"[^>]*>\s*Delete Sessions/);
   const source = readFileSync(new URL('../prototype/recorder.js', import.meta.url), 'utf8');
   assert.match(source, /deleteSessionButton\.hidden = !activeSession \|\| roomCall\?\.isGuest === true/);
   assert.match(source, /deleteSessionButton\.disabled = recording \|\| starting \|\| finalizing \|\| switchingMicrophone \|\|/);
@@ -58,11 +90,12 @@ test('removes the placeholder avatar and offers checkbox-based bulk session dele
   assert.match(source, /function guestTakesAreStored\(takes\)/);
   assert.match(source, /function deleteSelectedSessions\(\)/);
   assert.match(source, /deleteSessionsAndRecordings\(selectedIds\)/);
-  assert.match(source, /選択した.*セッション.*一括削除/);
-  assert.match(source, /復元できません/);
-  assert.doesNotMatch(source, /選択したセッションと録音を一括削除しました/);
+  assert.match(source, /Delete guest recordings from/);
+  assert.match(source, /selected session/);
+  assert.match(source, /permanently remove/);
+  assert.doesNotMatch(source, /Selected sessions and recordings deleted/);
   assert.match(source, /selection\.type = 'checkbox'/);
-  assert.match(source, /このセッションに保存された録音・受信音声をすべて削除します/);
+  assert.match(source, /Delete .*all recordings and received audio saved in this session/);
   assert.match(source, /database\.transaction\(\['sessions', 'takes', 'chunks'\], 'readwrite'\)/);
   const css = readFileSync(new URL('../prototype/recorder.css', import.meta.url), 'utf8');
   assert.match(css, /\.terminal-ui \.recent-panel \.panel-heading \{ display: flex; align-items: center; justify-content: space-between;/);
@@ -74,7 +107,9 @@ test('places compact name-and-sequence WAV rows inside the device storage panel'
   const storagePanelStart = recorder.indexOf('<aside class="panel storage-panel"');
   const storagePanelEnd = recorder.indexOf('</aside>', storagePanelStart);
   const storagePanel = recorder.slice(storagePanelStart, storagePanelEnd);
-  assert.match(storagePanel, /<section class="storage-recordings" aria-label="このセッションの録音">/);
+  assert.match(storagePanel, /<h2 id="storageHeading" class="terminal-section-code">LOCAL FILE INVENTORY<\/h2>/);
+  assert.doesNotMatch(storagePanel, />Local Storage</);
+  assert.match(storagePanel, /<section class="storage-recordings" aria-label="Recordings in this session">/);
   assert.match(storagePanel, /id="takeList" class="take-list"/);
   assert.equal(storagePanel.includes('takesHeading'), false);
   assert.equal(storagePanel.includes('takeCount'), false);
@@ -127,7 +162,7 @@ test('arranges capture, room, and network details in three desktop columns', () 
   assert.match(networkPanel, /id="networkProgressErrorRow" hidden/);
   assert.match(networkPanel, /id="transferGraph" width="600" height="96"/);
   assert.equal((networkPanel.match(/<tr>/g) || []).length, 2);
-  assert.match(networkPanel, /未転送 \/ 総量/);
+  assert.match(networkPanel, /Remaining \/ Total/);
   assert.doesNotMatch(networkPanel, /networkUnsubmitted|networkSending|networkAwaitingAck|networkManifest|manifest/);
   assert.match(recorder, /class="studio-grid terminal-grid"/);
   const css = readPrototype('recorder.css');
@@ -137,13 +172,27 @@ test('arranges capture, room, and network details in three desktop columns', () 
   assert.match(css, /\.terminal-ui \.network-panel \{ grid-area: network;/);
   assert.match(css, /\.terminal-ui \.record-panel, \.terminal-ui \.room-panel, \.terminal-ui \.network-panel \{ align-self: stretch; \}/);
   assert.match(css, /\.terminal-ui \.storage-panel \{ align-self: start; \}/);
-  assert.match(css, /\.terminal-ui \.network-heading \.terminal-section-code \{[^}]*color: var\(--yellow\);/);
-  assert.match(css, /\.terminal-ui \.storage-panel \.terminal-section-code \{[^}]*color: var\(--yellow\);/);
+  assert.match(css, /\.terminal-ui \.network-heading \.terminal-section-code \{[^}]*color: var\(--teal\);/);
+  assert.match(css, /\.terminal-ui \.storage-panel \.terminal-section-code \{[^}]*color: var\(--teal\);/);
+  assert.match(css, /\.terminal-ui \.setup-panel \.panel-heading::before \{[^}]*color: var\(--teal\);/);
+  assert.match(css, /\.terminal-ui \.terminal-breadcrumb \{[^}]*color: var\(--teal\);/);
+  assert.match(css, /\.terminal-ui \.terminal-section-code \{[^}]*color: var\(--teal\);/);
   assert.match(css, /\.transfer-progress \{[^}]*padding: 0;[^}]*border: 0;[^}]*background: transparent;/);
   assert.match(css, /\.terminal-ui \.network-metrics \{ font-size: 11px; line-height: 1\.35; \}/);
   assert.match(css, /\.terminal-ui \.waveform-panel \{ grid-area: wave;/);
   assert.match(css, /\.terminal-ui \.storage-panel \{ grid-area: storage;/);
   assert.match(css, /@media \(max-width: 860px\) \{[\s\S]*?\.terminal-ui \.studio-grid \{ grid-template-columns: 1fr; grid-template-areas: "record" "room" "network" "wave" "storage"; \}/);
+});
+
+test('places the recording format label at the capture panel top right without decorative curves', () => {
+  const recordPanel = recorder.slice(recorder.indexOf('class="panel record-panel"'), recorder.indexOf('id="roomPanel"'));
+  assert.match(recordPanel, /class="capture-heading">[\s\S]*?CAPTURE[\s\S]*?<span class="format-pill">24-bit \/ 48 kHz WAV<\/span>/);
+  for (const title of ['ROOM LINK', 'NETWORK', 'TRACK MONITOR']) {
+    assert.ok(recorder.includes(`class="terminal-section-code">${title}</span>`));
+  }
+  assert.doesNotMatch(recorder, /class="terminal-section-code">0[1-5]\s*\/\/|00\s*\/\/ INITIALIZE/);
+  assert.doesNotMatch(readPrototype('recorder.css'), /\.record-panel::after/);
+  assert.match(readPrototype('recorder.css'), /\.capture-heading \{[^}]*justify-content: space-between;/);
 });
 
 test('formats transfer progress as remaining bytes, total bytes, and completion percentage', () => {
@@ -153,10 +202,42 @@ test('formats transfer progress as remaining bytes, total bytes, and completion 
   const context = {};
   runInNewContext(`${source.slice(start, end)}\nglobalThis.formatTransferRatio = formatTransferRatio;`, context);
 
-  assert.equal(context.formatTransferRatio(1_000_000, 4_000_000), '1.00 MB / 4.00 MB · 完了 75%');
-  assert.equal(context.formatTransferRatio(0, 4_000_000), '0.00 MB / 4.00 MB · 完了 100%');
-  assert.equal(context.formatTransferRatio(9_000_000, 4_000_000), '4.00 MB / 4.00 MB · 完了 0%');
-  assert.equal(context.formatTransferRatio(0, 0), '0.00 MB / 0.00 MB · 完了 —');
+  assert.equal(context.formatTransferRatio(1_000_000, 4_000_000), '1.00 MB / 4.00 MB · 75% complete');
+  assert.equal(context.formatTransferRatio(0, 4_000_000), '0.00 MB / 4.00 MB · 100% complete');
+  assert.equal(context.formatTransferRatio(9_000_000, 4_000_000), '4.00 MB / 4.00 MB · 0% complete');
+  assert.equal(context.formatTransferRatio(0, 0), '0.00 MB / 0.00 MB · — complete');
+});
+
+test('plots saved-audio completion on a percentage axis at the right of the transfer graph', () => {
+  const source = readPrototype('recorder.js');
+  const start = source.indexOf('function drawTransferGraph(');
+  const end = source.indexOf('\nasync function updateTransferProgress(', start);
+  const labels = [];
+  const strokes = [];
+  let path = [];
+  const canvasContext = {
+    clearRect() {},
+    setLineDash() {},
+    beginPath() { path = []; },
+    moveTo(x, y) { path.push([x, y]); },
+    lineTo(x, y) { path.push([x, y]); },
+    stroke() { strokes.push({ color: this.strokeStyle, points: [...path] }); },
+    fillText(text, x, y) { labels.push({ text, x, y, align: this.textAlign || 'left' }); }
+  };
+  const summary = {};
+  const context = {
+    transferGraphSamples: [],
+    $: (id) => id === 'transferGraph'
+      ? { width: 600, height: 96, getContext: () => canvasContext }
+      : summary
+  };
+  runInNewContext(source.slice(start, end), context);
+  context.updateTransferGraph(60_000, 1.2, 75);
+
+  assert.ok(labels.some(({ text, x, align }) => text === '100%' && x === 598 && align === 'right'));
+  assert.ok(labels.some(({ text }) => text === '1.5 Mbps'));
+  assert.deepEqual(strokes.find(({ color }) => color === '#82aaff').points, [[562, 25]]);
+  assert.equal(summary.textContent, 'Upload 1.20 Mbps · Save Rate 75%');
 });
 
 test('uses readable text sizes throughout the session screen', () => {
@@ -175,6 +256,17 @@ test('uses readable text sizes on setup and saved-session lists', () => {
   assert.match(css, /\.terminal-ui \.session-entry-name \{ font-size: 14px;/);
   assert.match(css, /\.terminal-ui \.session-entry-meta \{[^}]*font-size: 12px;/);
   assert.match(css, /\.terminal-ui \.session-open \{[^}]*font-size: 12px;/);
+});
+
+test('matches the Detect Devices button height to the microphone selector', () => {
+  const css = readPrototype('recorder.css');
+  assert.match(css, /\.terminal-ui \.device-row \.field select, \.terminal-ui \.device-row \.device-action \{ height: 42px; \}/);
+});
+
+test('places the guest join name above the approval and decline buttons', () => {
+  const css = readPrototype('recorder.css');
+  assert.match(css, /\.guest-request-card \{[^}]*grid-template-columns: minmax\(0, 1fr\);/);
+  assert.match(css, /\.guest-request-actions \{[^}]*justify-content: start;/);
 });
 
 test('places the vertical input meter beside the local waveform', () => {
@@ -236,10 +328,10 @@ test('role UI works with removed instruction elements and keeps invalid invitati
       RoomCall.prototype.applyRoleUI.call({
         inviteMode, invitation: null, setRemoteWaveState() {}, setStatus() {}
       });
-      assert.equal(elements.get('roleBadge').textContent, inviteMode ? 'ゲスト' : 'ホスト');
+      assert.equal(elements.get('roleBadge').textContent, inviteMode ? 'Guest' : 'Host');
       assert.equal(elements.get('recentPanel').hidden, false);
     }
-    assert.match(elements.get('statusMessage').textContent, /招待リンクが正しくありません/);
+    assert.match(elements.get('statusMessage').textContent, /invitation link is invalid/i);
     assert.equal(elements.get('openStudioButton').disabled, true);
   } finally {
     if (originalDocument === undefined) delete globalThis.document;

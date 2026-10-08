@@ -3,7 +3,7 @@ export function summarizeTransferChunks(chunks) {
     if (!Number.isSafeInteger(chunk.bytes) || chunk.bytes < 0 ||
         !Number.isSafeInteger(chunk.frames) || chunk.frames < 0 ||
         typeof chunk.hostStored !== 'boolean') {
-      throw new Error('転送進捗を集計するチャンク情報が不正です。');
+      throw new Error('Invalid chunk information for calculating transfer progress.');
     }
     summary.bytes += chunk.bytes;
     summary.frames += chunk.frames;
@@ -29,7 +29,7 @@ export function splitTransferBacklog(pendingBytes, activeSend) {
   if (!Number.isSafeInteger(pendingBytes) || pendingBytes < 0 ||
       !activeSend || !['idle', 'sending', 'awaiting-ack'].includes(activeSend.state) ||
       !Number.isSafeInteger(activeSend.bytes) || activeSend.bytes < 0) {
-    throw new Error('転送待ち状況が不正です。');
+    throw new Error('The transfer queue status is invalid.');
   }
   const activeBytes = activeSend.state === 'idle'
     ? 0

@@ -19,6 +19,6 @@ test('selects the valid sample with the lowest round-trip time', () => {
 });
 
 test('rejects insufficient or invalid clock samples', () => {
-  assert.throws(() => selectClockSample([], 3), /不足/u);
-  assert.throws(() => calculateClockSample(100, 100, 121, 110), /不正/u);
+  assert.throws(() => selectClockSample([], 3), /not enough valid/u);
+  assert.throws(() => calculateClockSample(100, 100, 121, 110), /invalid/u);
 });

@@ -11,7 +11,7 @@ export function monitorRecordingTrack(track, {
       typeof onUnmuted !== 'function' || typeof onEnded !== 'function' ||
       typeof onMuteTimeout !== 'function' ||
       !Number.isSafeInteger(muteGraceMs) || muteGraceMs < 0) {
-    throw new Error('マイク入力の監視設定が不正です。');
+    throw new Error('The microphone input monitoring configuration is invalid.');
   }
 
   let muteTimer = null;

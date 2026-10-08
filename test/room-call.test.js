@@ -122,7 +122,8 @@ test('only the host can relay valid recording-state messages', async () => {
       sequence: 1,
       generation: '0123456789abcdefghij_-',
       startAt: 1000,
-      clockOffsetMs: 0
+      clockOffsetMs: 0,
+      hostStartedAt: Date.now()
     };
     await signaling.onMessage(host, { data: JSON.stringify(recordingState) });
     assert.deepEqual(guest.messages, [recordingState]);
@@ -141,6 +142,72 @@ test('only the host can relay valid recording-state messages', async () => {
     await signaling.onMessage(guest, { data: JSON.stringify({ type: 'recording-state', recording: false }) });
     assert.equal(guest.readyState, 3);
     assert.equal(host.messages.some((message) => message.type === 'recording-state'), false);
+  } finally {
+    if (originalWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = originalWebSocket;
+  }
+});
+
+test('relays session names from the authenticated host and rejects guest changes', async () => {
+  const originalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = { OPEN: 1 };
+  const makeSocket = () => ({
+    readyState: 1,
+    messages: [],
+    send(message) { this.messages.push(JSON.parse(message)); },
+    close() { this.readyState = 3; }
+  });
+  try {
+    const host = makeSocket();
+    const guest = makeSocket();
+    const signaling = new RoomSignaling({});
+    signaling.peers.set(host, 'host');
+    signaling.peers.set(guest, 'guest');
+    signaling.authenticatedSubjects.set(host, {
+      sub: 'auth0|host-session-name',
+      exp: Math.floor(Date.now() / 1000) + 600
+    });
+
+    const update = { type: 'session-name', name: 'Recording 10/08 21:52' };
+    await signaling.onMessage(host, { data: JSON.stringify(update) });
+    assert.deepEqual(guest.messages, [update]);
+
+    await signaling.onMessage(guest, {
+      data: JSON.stringify({ type: 'session-name', name: 'Guest override' })
+    });
+    assert.equal(guest.readyState, 3);
+    assert.deepEqual(host.messages, [{ type: 'peer-left' }]);
+  } finally {
+    if (originalWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = originalWebSocket;
+  }
+});
+
+test('rejects empty and oversized host session names', async () => {
+  const originalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = { OPEN: 1 };
+  const makeSocket = () => ({
+    readyState: 1,
+    messages: [],
+    send(message) { this.messages.push(JSON.parse(message)); },
+    close() { this.readyState = 3; }
+  });
+  try {
+    for (const name of ['', 'x'.repeat(121)]) {
+      const host = makeSocket();
+      const guest = makeSocket();
+      const signaling = new RoomSignaling({});
+      signaling.peers.set(host, 'host');
+      signaling.peers.set(guest, 'guest');
+      signaling.authenticatedSubjects.set(host, {
+        sub: 'auth0|host-session-name',
+        exp: Math.floor(Date.now() / 1000) + 600
+      });
+
+      await signaling.onMessage(host, { data: JSON.stringify({ type: 'session-name', name }) });
+      assert.equal(host.readyState, 3);
+      assert.deepEqual(guest.messages, []);
+    }
   } finally {
     if (originalWebSocket === undefined) delete globalThis.WebSocket;
     else globalThis.WebSocket = originalWebSocket;
@@ -562,6 +629,66 @@ test('processes readiness only after an earlier asynchronous auth message comple
   ]);
 });
 
+test('sends host session-name updates to a connected guest and applies them on the guest', async () => {
+  const sent = [];
+  const host = Object.create(RoomCall.prototype);
+  Object.assign(host, {
+    inviteMode: false,
+    localRole: 'host',
+    sessionName: null,
+    pendingGuest: {},
+    peerConnection: {},
+    send(message) { sent.push(message); }
+  });
+  host.setSessionName('Recording 10/08 21:52');
+  assert.deepEqual(sent, [{ type: 'session-name', name: 'Recording 10/08 21:52' }]);
+
+  const received = [];
+  const guest = Object.create(RoomCall.prototype);
+  Object.assign(guest, {
+    inviteMode: true,
+    localRole: 'guest',
+    remoteSessionName: null,
+    onSessionName: async (name) => received.push(name)
+  });
+  await guest.processMessage(sent[0]);
+  assert.equal(guest.remoteSessionName, 'Recording 10/08 21:52');
+  assert.deepEqual(received, ['Recording 10/08 21:52']);
+  guest.setSessionName('Guest override');
+  assert.deepEqual(received, ['Recording 10/08 21:52']);
+});
+
+test('logs signaling messages with timing fields but without arbitrary payloads', () => {
+  const originalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = { OPEN: 1 };
+  try {
+    const sent = [];
+    const events = [];
+    const call = Object.create(RoomCall.prototype);
+    Object.assign(call, {
+      socket: { readyState: 1, send: (message) => sent.push(JSON.parse(message)) },
+      onNetworkEvent: (event, details) => events.push({ event, details })
+    });
+    call.send({
+      type: 'recording-state',
+      eventId: '123e4567-e89b-42d3-a456-426614174000',
+      sequence: 4,
+      recording: true,
+      startAt: 12345.5,
+      clockOffsetMs: -2.25,
+      secret: 'must-not-be-logged'
+    });
+    assert.equal(sent.length, 1);
+    assert.deepEqual(events, [{
+      event: 'Signal TX',
+      details: 'type=recording-state eventId=123e4567-e89b-42d3-a456-426614174000 sequence=4 recording=true startAt=12345.5 clockOffsetMs=-2.25'
+    }]);
+  } finally {
+    if (originalWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = originalWebSocket;
+  }
+});
+
 test('resets remote waveform history to the local recording start time', () => {
   const canvasClears = [];
   const waveform = {
@@ -597,14 +724,37 @@ test('resets remote waveform history to the local recording start time', () => {
   assert.equal(waveform.startedAt, 100);
   assert.equal(waveform.rulerSecond, -1);
   assert.deepEqual(drawn, [waveform]);
-  assert.deepEqual(states, [['波形準備中', false, 'track']]);
+  assert.deepEqual(states, [['Preparing waveform', false, 'track']]);
 
   call.endRecordingWaveform();
   assert.equal(call.waveformRecordingStartedAt, null);
   assert.equal(waveform.historyCount, 0);
   assert.equal(waveform.recordingStartedAt, null);
   assert.deepEqual(canvasClears, [[0, 0, 100, 50]]);
-  assert.deepEqual(states.at(-1), ['録音待ち', false, 'track']);
+  assert.deepEqual(states.at(-1), ['Waiting to record', false, 'track']);
+});
+
+test('hides waiting labels from the remote waveform state', () => {
+  const call = Object.create(RoomCall.prototype);
+  const classes = new Set();
+  const state = {
+    textContent: '',
+    classList: {
+      toggle(name, enabled) {
+        if (enabled) classes.add(name);
+        else classes.delete(name);
+      }
+    }
+  };
+  call.remoteWaveforms = new Map([['track', { state }]]);
+
+  call.setRemoteWaveState('Waiting to record');
+  assert.equal(state.textContent, '');
+  call.setRemoteWaveState('Awaiting approval');
+  assert.equal(state.textContent, '');
+  call.setRemoteWaveState('LIVE', true);
+  assert.equal(state.textContent, 'LIVE');
+  assert.equal(classes.has('remote-live'), true);
 });
 
 test('host recording requires both readiness checks and an active peer connection', () => {
@@ -680,6 +830,52 @@ test('guest does not start recording before readiness and transport checks pass'
   assert.equal(resolved, true);
 });
 
+test('passes the host wall-clock start timestamp to the guest recorder', async () => {
+  const originalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = { OPEN: 1 };
+  try {
+    const received = [];
+    const sent = [];
+    const generation = '0123456789abcdefghij_-';
+    const hostStartedAt = Date.now() + 5000;
+    const call = Object.create(RoomCall.prototype);
+    Object.assign(call, {
+      localRole: 'guest',
+      connected: true,
+      localReady: true,
+      remoteReady: true,
+      socket: { readyState: 1 },
+      peerConnection: { connectionState: 'connected' },
+      authFields: { generation },
+      guestRecordingCommands: new Map(),
+      lastGuestRecordingSequence: 0,
+      pendingGuestRecordingCommand: null,
+      onRecordingState: async (_recording, schedule) => {
+        received.push(schedule);
+        return true;
+      },
+      send(message) { sent.push(message); },
+      setStatus() {}
+    });
+
+    await call.receiveRecordingState({
+      eventId: '123e4567-e89b-42d3-a456-426614174000',
+      sequence: 1,
+      generation,
+      recording: true,
+      startAt: performance.now() + 5000,
+      clockOffsetMs: 20,
+      hostStartedAt
+    });
+
+    assert.equal(received[0].hostStartedAt, hostStartedAt);
+    assert.equal(sent[0].type, 'recording-ack');
+  } finally {
+    if (originalWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = originalWebSocket;
+  }
+});
+
 test('confirms both actual recording starts after converting the guest clock', () => {
   const originalWindow = globalThis.window;
   globalThis.window = { clearTimeout() {} };
@@ -709,7 +905,7 @@ test('confirms both actual recording starts after converting the guest clock', (
       frame: 0
     });
     assert.equal(call.pendingStartEvents.size, 0);
-    assert.match(call.status.message, /開始差 0 ms/u);
+    assert.match(call.status.message, /difference 0 ms/u);
     assert.equal(call.status.isError, false);
   } finally {
     if (originalWindow === undefined) delete globalThis.window;
@@ -761,7 +957,7 @@ test('does not stop recording when a peer start confirmation is late', () => {
     timeoutCallback();
 
     assert.equal(stopCount, 0);
-    assert.match(status, /録音は継続/u);
+    assert.match(status, /Recording continues/u);
     assert.equal(call.pendingStartEvents.size, 0);
   } finally {
     if (originalWindow === undefined) delete globalThis.window;
@@ -913,10 +1109,10 @@ test('accepts only matching host TURN responses and installs relayed credentials
 
     test('renders the other participant microphone name in the read-only selector', () => {
       const call = Object.create(RoomCall.prototype);
-      const option = { textContent: '情報待ち' };
+      const option = { textContent: 'Waiting for information' };
       const muteClasses = new Set();
       const muteState = {
-        textContent: 'WAIT',
+        textContent: '',
         classList: {
           toggle(name, enabled) {
             if (enabled) muteClasses.add(name);
@@ -936,19 +1132,19 @@ test('accepts only matching host TURN responses and installs relayed credentials
       call.remoteWaveforms = new Map([['track', waveform]]);
 
       call.updateRemoteInputMonitor({ level: 0, muted: null, deviceLabel: '' });
-      assert.equal(muteState.textContent, 'WAIT');
+      assert.equal(muteState.textContent, '');
 
       call.updateRemoteInputMonitor({ level: 0.5, muted: true, deviceLabel: 'USB Microphone' });
       assert.equal(option.textContent, 'USB Microphone · MUTE');
       assert.equal(muteState.textContent, 'MUTED');
-      assert.equal(muteState['aria-label'], '相手はミュート中');
+      assert.equal(muteState['aria-label'], 'The other participant is muted');
       assert.equal(muteClasses.has('muted'), true);
       assert.equal(waveform.meter['aria-valuenow'], '0');
       assert.equal(waveform.meterFill.style.height, '0%');
 
       call.updateRemoteInputMonitor({ level: 0.5, muted: false, deviceLabel: 'USB Microphone' });
       assert.equal(muteState.textContent, 'UNMUTED');
-      assert.equal(muteState['aria-label'], '相手はミュートしていません');
+      assert.equal(muteState['aria-label'], 'The other participant is not muted');
       assert.equal(muteClasses.has('muted'), false);
       assert.equal(muteClasses.has('unmuted'), true);
     });
@@ -1087,7 +1283,7 @@ test('reports missing TURN API configuration without exposing an API secret', as
     });
     assert.equal(host.messages.at(-1).type, 'turn-error');
     assert.deepEqual(guest.messages.at(-1), host.messages.at(-1));
-    assert.match(host.messages.at(-1).message, /未設定/u);
+    assert.match(host.messages.at(-1).message, /not configured/u);
     assert.equal(host.messages.at(-1).message.includes('Bearer'), false);
   } finally {
     if (originalWebSocket === undefined) delete globalThis.WebSocket;
@@ -1151,7 +1347,7 @@ test('requires Auth0 host authentication before issuing TURN test credentials', 
     ROOMS: { getByName() { assert.fail('Unauthenticated requests must not reach the room object.'); } }
   });
   assert.equal(response.status, 401);
-  assert.match((await response.json()).message, /ログイン/u);
+  assert.match((await response.json()).message, /Log in/u);
 });
 
 test('rejects cross-origin TURN test credential requests', async () => {

@@ -25,13 +25,13 @@ export async function verifyIncomingStoredChunk(take, chunk, sequence, startFram
       !Number.isSafeInteger(chunk.frames) || chunk.frames < 1 || chunk.frames > MAX_CHUNK_FRAMES ||
       !(chunk.wav instanceof Blob) || chunk.wav.size !== WAV_HEADER_BYTES + chunk.frames * BYTES_PER_FRAME ||
       chunk.byteLength !== chunk.wav.size || !/^[0-9a-f]{64}$/u.test(chunk.sha256 || '')) {
-    throw new Error(`IndexedDB内の受信チャンク${sequence + 1}の台帳が不正です。`);
+    throw new Error(`The ledger for received chunk ${sequence + 1} in IndexedDB is invalid.`);
   }
   const bytes = await chunk.wav.arrayBuffer();
   const header = makeWavHeader(chunk.frames);
   if (!bytesEqual(bytes.slice(0, WAV_HEADER_BYTES), header) ||
       await sha256Hex(bytes) !== chunk.sha256) {
-    throw new Error(`IndexedDB内の受信チャンク${sequence + 1}を検証できません。`);
+    throw new Error(`Unable to verify received chunk ${sequence + 1} in IndexedDB.`);
   }
   return chunk;
 }
@@ -40,7 +40,7 @@ export async function verifyIncomingStoredTake(take, chunks) {
   if (!take || !Array.isArray(chunks) || !Number.isSafeInteger(take.chunks) ||
       take.chunks < 1 || chunks.length !== take.chunks ||
       !Number.isSafeInteger(take.frames) || take.frames < 1) {
-    throw new Error('IndexedDB内の受信takeとチャンク数が一致しません。');
+    throw new Error('The number of received takes and chunks in IndexedDB does not match.');
   }
   const orderedChunks = [...chunks].sort((left, right) => left.sequence - right.sequence);
   let frames = 0;
@@ -50,7 +50,7 @@ export async function verifyIncomingStoredTake(take, chunks) {
     frames += chunk.frames;
   }
   if (frames !== take.frames) {
-    throw new Error('IndexedDB内の受信takeとチャンクのframe数が一致しません。');
+    throw new Error('The frame count of the received take and chunks in IndexedDB does not match.');
   }
   return orderedChunks;
 }

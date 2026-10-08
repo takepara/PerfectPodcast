@@ -13,6 +13,6 @@ test('always queues the final chunk so pending audio can be saved on stop', () =
 });
 
 test('rejects invalid pending chunk counts', () => {
-  assert.throws(() => canQueueRecordingCommit(-1, false), /保存待ち数が不正/u);
-  assert.throws(() => canQueueRecordingCommit(0.5, false), /保存待ち数が不正/u);
+  assert.throws(() => canQueueRecordingCommit(-1, false), /number of pending recording chunks is invalid/u);
+  assert.throws(() => canQueueRecordingCommit(0.5, false), /number of pending recording chunks is invalid/u);
 });

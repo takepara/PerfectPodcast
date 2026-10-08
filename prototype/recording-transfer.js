@@ -79,7 +79,7 @@ function validManifest(message) {
 export function takeWithTransferParticipant(take, fallbackParticipant) {
   const participant = take.participant ?? fallbackParticipant;
   if (typeof participant !== 'string' || !participant.trim() || participant.length > 60) {
-    throw new Error('転送する録音の参加者名を復元できません。');
+    throw new Error('Unable to restore the participant name for the recording being transferred.');
   }
   return take.participant === participant ? take : { ...take, participant };
 }
@@ -106,7 +106,8 @@ export class RecordingTransfer {
     reconcileTransferInventory,
     storeChunk,
     storeManifest,
-    onStatus
+    onStatus,
+    onNetworkEvent
   }) {
     this.role = role;
     this.isAuthorized = isAuthorized;
@@ -121,6 +122,7 @@ export class RecordingTransfer {
     this.storeChunk = storeChunk;
     this.storeManifest = storeManifest;
     this.onStatus = onStatus;
+    this.onNetworkEvent = onNetworkEvent;
     this.channel = null;
     this.pendingAcks = new Map();
     this.currentChunk = null;
@@ -133,11 +135,11 @@ export class RecordingTransfer {
     this.receivedInventory = null;
     this.inventoryTimer = null;
     this.boundOpen = () => this.wake();
-    this.boundClose = () => this.rejectPending(new Error('回収DataChannelが切断されました。'));
+    this.boundClose = () => this.rejectPending(new Error('The recovery DataChannel was disconnected.'));
     this.boundMessage = (event) => {
       this.receiveChain = this.receiveChain
         .then(() => this.receive(event.data))
-        .catch((error) => this.onStatus(`音源回収を処理できませんでした: ${error.message}`, true));
+        .catch((error) => this.onStatus(`Unable to process audio recovery: ${error.message}`, true));
     };
   }
 
@@ -179,11 +181,45 @@ export class RecordingTransfer {
     this.receivedInventory = null;
     window.clearTimeout(this.inventoryTimer);
     this.inventoryTimer = null;
-    this.rejectPending(new Error('回収DataChannelが切断されました。'));
+    this.rejectPending(new Error('The recovery DataChannel was disconnected.'));
   }
 
   isOpen() {
     return this.channel?.readyState === 'open' && this.isAuthorized?.() === true;
+  }
+
+  sendData(data) {
+    this.channel.send(data);
+    if (typeof data !== 'string') {
+      const byteLength = data instanceof ArrayBuffer
+        ? data.byteLength
+        : ArrayBuffer.isView(data)
+          ? data.byteLength
+          : data instanceof Blob
+            ? data.size
+            : 0;
+      this.onNetworkEvent?.('DataChannel TX', `master-transfer-v1 binary bytes=${byteLength}`);
+      return;
+    }
+    let message;
+    try {
+      message = JSON.parse(data);
+    } catch {
+      this.onNetworkEvent?.('DataChannel TX', `master-transfer-v1 text bytes=${new TextEncoder().encode(data).byteLength}`);
+      return;
+    }
+    const type = typeof message?.type === 'string' && /^[a-z0-9-]{1,60}$/iu.test(message.type)
+      ? message.type
+      : 'unknown';
+    const fields = [];
+    for (const key of ['takeId', 'sequence', 'startFrame', 'frames', 'totalBytes', 'count', 'accepted', 'startedAt']) {
+      const value = message[key];
+      if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value)) ||
+          (typeof value === 'string' && /^[0-9a-f-]{36}$/iu.test(value))) {
+        fields.push(`${key}=${value}`);
+      }
+    }
+    this.onNetworkEvent?.('DataChannel TX', `master-transfer-v1 type=${type}${fields.length ? ` ${fields.join(' ')}` : ''}`);
   }
 
   wake() {
@@ -197,7 +233,7 @@ export class RecordingTransfer {
     }
     if (this.role !== 'guest' || !this.inventoryReady || this.transferTask) return;
     this.transferTask = this.drain().catch((error) => {
-      this.onStatus(`音源をホストへ転送できませんでした: ${error.message}`, true);
+      this.onStatus(`Unable to transfer audio to the host: ${error.message}`, true);
     }).finally(() => {
       this.transferTask = null;
       if (this.workRequested) this.wake();
@@ -228,7 +264,7 @@ export class RecordingTransfer {
         chunk.wav.size !== WAV_HEADER_BYTES + chunk.frames * CHUNK_BYTES_PER_FRAME ||
         !Number.isSafeInteger(chunk.sequence) || chunk.sequence < 0 ||
         !Number.isSafeInteger(chunk.startFrame) || chunk.startFrame < 0) {
-      throw new Error('送信WAVチャンクの形式またはサイズ上限が不正です。');
+      throw new Error('The WAV chunk format or size limit for sending is invalid.');
     }
     const bytes = await chunk.wav.arrayBuffer();
     const sha256 = await sha256Hex(bytes);
@@ -246,9 +282,9 @@ export class RecordingTransfer {
       takeNumber: take.number,
       startedAt: take.startedAt
     };
-    if (!validChunkMetadata(metadata)) throw new Error('送信チャンクの台帳情報が不正です。');
+    if (!validChunkMetadata(metadata)) throw new Error('The ledger information for the chunk to send is invalid.');
     const id = transferId(take.id, chunk.sequence);
-    if (!this.prepareChunk) throw new Error('転送前のチャンクhashを保存できません。');
+    if (!this.prepareChunk) throw new Error('Unable to save the chunk hash before transfer.');
     await this.prepareChunk(take.id, chunk.sequence, sha256);
     let lastError;
     for (let attempt = 0; attempt < MAX_SEND_ATTEMPTS; attempt += 1) {
@@ -260,14 +296,14 @@ export class RecordingTransfer {
         for (let offset = 0; offset < bytes.byteLength; offset += MESSAGE_BYTES) {
           const part = bytes.slice(offset, Math.min(offset + MESSAGE_BYTES, bytes.byteLength));
           await this.waitForBufferSpace(part.byteLength);
-          this.channel.send(part);
+          this.sendData(part);
           await new Promise((resolve) => window.setTimeout(resolve, 65));
         }
         this.activeSendProgress = { state: 'awaiting-ack', bytes: bytes.byteLength };
         const response = await ack;
-        if (!response.accepted) throw new Error(response.message || 'ホストがチャンクを保存できませんでした。');
+        if (!response.accepted) throw new Error(response.message || 'The host could not save the chunk.');
         await this.markChunkStored(take.id, chunk.sequence, sha256);
-        this.onStatus(`ホスト端末への保存を確認しました · ${take.participant} · チャンク ${chunk.sequence + 1}`);
+        this.onStatus(`Saved on the host device · ${take.participant} · chunk ${chunk.sequence + 1}`);
         return;
       } catch (error) {
         lastError = error;
@@ -277,7 +313,7 @@ export class RecordingTransfer {
         this.activeSendProgress = { state: 'idle', bytes: 0 };
       }
     }
-    throw lastError || new Error('ホストからチャンク保存確認が届きません。');
+    throw lastError || new Error('No chunk save confirmation was received from the host.');
   }
 
   getSendProgress() {
@@ -300,7 +336,7 @@ export class RecordingTransfer {
       status: take.status,
       tailUnknown: Boolean(take.tailUnknown)
     };
-    if (!validManifest(message)) throw new Error('take manifestが不正です。');
+    if (!validManifest(message)) throw new Error('The take manifest is invalid.');
     const id = `manifest:${take.id}`;
     let lastError;
     for (let attempt = 0; attempt < MAX_SEND_ATTEMPTS; attempt += 1) {
@@ -309,9 +345,9 @@ export class RecordingTransfer {
         void ack.catch(() => {});
         this.sendControl(message);
         const response = await ack;
-        if (!response.accepted) throw new Error(response.message || 'ホストがtake manifestを保存できませんでした。');
+        if (!response.accepted) throw new Error(response.message || 'The host could not save the take manifest.');
         await this.markManifestStored(take.id);
-        this.onStatus(`ホスト端末で全チャンクの保存を確認しました · ${take.participant}`);
+        this.onStatus(`All chunks saved on the host device · ${take.participant}`);
         return;
       } catch (error) {
         lastError = error;
@@ -319,7 +355,7 @@ export class RecordingTransfer {
         if (!this.isOpen()) break;
       }
     }
-    throw lastError || new Error('ホストから最終保存確認が届きません。');
+    throw lastError || new Error('No final save confirmation was received from the host.');
   }
 
   async waitForBufferSpace(bytes) {
@@ -337,18 +373,18 @@ export class RecordingTransfer {
         };
         const onClose = () => {
           cleanup();
-          reject(new Error('回収DataChannelが切断されました。'));
+          reject(new Error('The recovery DataChannel was disconnected.'));
         };
         const timer = window.setTimeout(() => {
           cleanup();
-          reject(new Error('回収DataChannelの送信bufferが解放されません。'));
+          reject(new Error('The recovery DataChannel send buffer was not released.'));
         }, 10_000);
         channel.addEventListener('bufferedamountlow', onLow, { once: true });
         channel.addEventListener('close', onClose, { once: true });
         if (channel.bufferedAmount + bytes <= BUFFERED_BYTES_LIMIT) onLow();
       });
     }
-    if (!this.isOpen()) throw new Error('回収DataChannelが接続されていません。');
+    if (!this.isOpen()) throw new Error('The recovery DataChannel is not connected.');
   }
 
   waitForAck(id, sha256, type) {
@@ -356,7 +392,7 @@ export class RecordingTransfer {
     return new Promise((resolve, reject) => {
       const timer = window.setTimeout(() => {
         this.pendingAcks.delete(id);
-        reject(new Error('ホストから保存確認が届きません。'));
+        reject(new Error('No save confirmation was received from the host.'));
       }, ACK_TIMEOUT_MS);
       this.pendingAcks.set(id, { sha256, type, resolve, reject, timer });
     });
@@ -379,17 +415,17 @@ export class RecordingTransfer {
   }
 
   sendControl(message) {
-    if (!this.isOpen()) throw new Error('回収DataChannelが接続されていません。');
-    this.channel.send(JSON.stringify(message));
+    if (!this.isOpen()) throw new Error('The recovery DataChannel is not connected.');
+    this.sendData(JSON.stringify(message));
   }
 
   async sendInventorySnapshot() {
     const requestId = crypto.randomUUID();
     try {
-      if (!this.getTransferInventory) throw new Error('転送inventoryを読み出せません。');
+      if (!this.getTransferInventory) throw new Error('Unable to read the transfer inventory.');
       const items = await this.getTransferInventory(this.generation());
       if (!Array.isArray(items) || items.length > MAX_INVENTORY_ITEMS) {
-        throw new Error('転送inventoryが上限を超えています。');
+        throw new Error('The transfer inventory exceeds the limit.');
       }
       this.sendControl({
         type: 'inventory-start',
@@ -400,7 +436,7 @@ export class RecordingTransfer {
       for (let offset = 0; offset < items.length; offset += INVENTORY_BATCH_ITEMS) {
         const batch = items.slice(offset, offset + INVENTORY_BATCH_ITEMS);
         if (batch.some((item) => !validInventoryItem(item))) {
-          throw new Error('転送inventoryの内容が不正です。');
+          throw new Error('The transfer inventory content is invalid.');
         }
         const message = {
           type: 'inventory-items',
@@ -410,7 +446,7 @@ export class RecordingTransfer {
         };
         const encoded = JSON.stringify(message);
         await this.waitForBufferSpace(new TextEncoder().encode(encoded).byteLength);
-        this.channel.send(encoded);
+        this.sendData(encoded);
       }
       this.sendControl({
         type: 'inventory-end',
@@ -418,10 +454,10 @@ export class RecordingTransfer {
         requestId,
         count: items.length
       });
-      this.onStatus('ホスト端末の保存音源と回収台帳の照合を開始しました。');
+      this.onStatus('Started comparing saved audio on the host with the recovery ledger.');
     } catch (error) {
       this.inventoryRequested = false;
-      this.onStatus(`ホストの回収台帳を読み出せませんでした: ${error.message}`, true);
+      this.onStatus(`Unable to read the host recovery ledger: ${error.message}`, true);
       try {
         this.sendControl({
           type: 'inventory-start',
@@ -436,7 +472,7 @@ export class RecordingTransfer {
           count: 0
         });
       } catch (sendError) {
-        this.onStatus(`回収inventoryの失敗を相手へ通知できませんでした: ${sendError.message}`, true);
+        this.onStatus(`Unable to notify the other participant about the recovery inventory failure: ${sendError.message}`, true);
       }
     }
   }
@@ -450,9 +486,9 @@ export class RecordingTransfer {
       this.inventoryReady = false;
       try {
         this.sendControl({ type: 'inventory-refresh', generation: this.generation() });
-        this.onStatus('ホストへ回収台帳の再照合を依頼しました。');
+        this.onStatus('Requested that the host reconcile the recovery ledger again.');
       } catch (error) {
-        this.onStatus(`ホストへ再照合を依頼できませんでした: ${error.message}`, true);
+        this.onStatus(`Unable to request reconciliation from the host: ${error.message}`, true);
       }
     }
   }
@@ -460,12 +496,12 @@ export class RecordingTransfer {
   async receive(data) {
     if (!this.isOpen()) return;
     if (typeof data === 'string') {
-      if (data.length > 64 * 1024) throw new Error('回収制御メッセージが上限を超えています。');
+      if (data.length > 64 * 1024) throw new Error('The recovery control message exceeds the size limit.');
       let message;
       try {
         message = JSON.parse(data);
       } catch {
-        throw new Error('回収メッセージ形式が不正です。');
+        throw new Error('The recovery message format is invalid.');
       }
       await this.receiveControl(message);
       return;
@@ -476,7 +512,7 @@ export class RecordingTransfer {
       : data instanceof Blob && data.size <= MESSAGE_BYTES
         ? new Uint8Array(await data.arrayBuffer())
         : null;
-    if (!bytes) throw new Error('回収データの形式が不正です。');
+    if (!bytes) throw new Error('The recovery data format is invalid.');
     await this.receiveChunkBytes(bytes);
   }
 
@@ -514,21 +550,21 @@ export class RecordingTransfer {
       this.receiveAck(message, 'manifest-ack');
       return;
     }
-    throw new Error('許可されていない回収メッセージです。');
+    throw new Error('This recovery message is not allowed.');
   }
 
   receiveInventoryStart(message) {
     if (!UUID_PATTERN.test(message.requestId || '') ||
         !Number.isSafeInteger(message.count) || message.count < 0 ||
         message.count > MAX_INVENTORY_ITEMS) {
-      throw new Error('ホストの回収inventory開始情報が不正です。');
+      throw new Error('The host recovery inventory start information is invalid.');
     }
     window.clearTimeout(this.inventoryTimer);
     this.inventoryReady = false;
     this.receivedInventory = { requestId: message.requestId, count: message.count, items: [] };
     this.inventoryTimer = window.setTimeout(() => {
       this.receivedInventory = null;
-      this.onStatus('ホストの回収台帳照合がタイムアウトしました。再照合してください。', true);
+      this.onStatus('The host recovery ledger comparison timed out. Please retry.');
     }, ACK_TIMEOUT_MS);
   }
 
@@ -538,7 +574,7 @@ export class RecordingTransfer {
         !Array.isArray(message.items) || message.items.length > INVENTORY_BATCH_ITEMS ||
         message.items.some((item) => !validInventoryItem(item)) ||
         pending.items.length + message.items.length > pending.count) {
-      throw new Error('ホストの回収inventory batchが不正です。');
+      throw new Error('The host recovery inventory batch is invalid.');
     }
     pending.items.push(...message.items);
   }
@@ -547,15 +583,15 @@ export class RecordingTransfer {
     const pending = this.receivedInventory;
     if (!pending || message.requestId !== pending.requestId ||
         message.count !== pending.count || pending.items.length !== pending.count) {
-      throw new Error('ホストの回収inventoryが途中で切れています。');
+      throw new Error('The host recovery inventory is incomplete.');
     }
-    if (!this.reconcileTransferInventory) throw new Error('回収inventoryを照合できません。');
+    if (!this.reconcileTransferInventory) throw new Error('Unable to reconcile the recovery inventory.');
     await this.reconcileTransferInventory(this.generation(), pending.items);
     window.clearTimeout(this.inventoryTimer);
     this.inventoryTimer = null;
     this.receivedInventory = null;
     this.inventoryReady = true;
-    this.onStatus('ホストの回収台帳を照合しました。未保存チャンクがあれば再送します。');
+    this.onStatus('Reconciled the host recovery ledger. Any unsaved chunks will be sent again.');
     this.wake();
   }
 
@@ -566,7 +602,7 @@ export class RecordingTransfer {
   async receiveChunkStart(message) {
     this.currentChunk = null;
     if (!validChunkMetadata(message)) {
-      this.sendAck('chunk-ack', message, false, 'チャンク情報が不正です。');
+      this.sendAck('chunk-ack', message, false, 'The chunk information is invalid.');
       return;
     }
     this.currentChunk = {
@@ -578,16 +614,16 @@ export class RecordingTransfer {
 
   async receiveChunkBytes(bytes) {
     const pending = this.currentChunk;
-    if (!pending) throw new Error('対応するチャンク情報がありません。');
+    if (!pending) throw new Error('No matching chunk information was found.');
     if (bytes.byteLength > MESSAGE_BYTES) {
       this.currentChunk = null;
-      this.sendAck('chunk-ack', pending.metadata, false, 'チャンク分割サイズが上限を超えました。');
+      this.sendAck('chunk-ack', pending.metadata, false, 'The chunk part size exceeds the limit.');
       return;
     }
     pending.receivedBytes += bytes.byteLength;
     if (pending.receivedBytes > pending.metadata.totalBytes) {
       this.currentChunk = null;
-      this.sendAck('chunk-ack', pending.metadata, false, '受信チャンクのサイズが上限を超えました。');
+      this.sendAck('chunk-ack', pending.metadata, false, 'The received chunk exceeds the size limit.');
       return;
     }
     pending.parts.push(bytes);
@@ -602,7 +638,7 @@ export class RecordingTransfer {
     const actualHash = await sha256Hex(fullBytes);
     if (actualHash !== pending.metadata.sha256 ||
         !validWavChunk(fullBytes, pending.metadata.frames)) {
-      this.sendAck('chunk-ack', pending.metadata, false, 'チャンクのhashまたはWAV形式が一致しません。');
+      this.sendAck('chunk-ack', pending.metadata, false, 'The chunk hash or WAV format does not match.');
       return;
     }
     try {
@@ -615,7 +651,7 @@ export class RecordingTransfer {
 
   async receiveManifest(message) {
     if (!validManifest(message)) {
-      this.sendAck('manifest-ack', message, false, 'take manifestが不正です。');
+      this.sendAck('manifest-ack', message, false, 'The take manifest is invalid.');
       return;
     }
     try {
@@ -638,7 +674,7 @@ export class RecordingTransfer {
         message: errorMessage
       });
     } catch (error) {
-      this.onStatus(`回収確認を送信できませんでした: ${error.message}`, true);
+      this.onStatus(`Unable to send the recovery acknowledgment: ${error.message}`, true);
     }
   }
 

@@ -29,7 +29,7 @@ test('rejects gaps, altered chunk WAV headers, and inconsistent frame totals', a
   const writable = { async write() {} };
   await assert.rejects(
     writePcm24Wav({ frames: 2 }, [makeChunk(1, 0, [1, 2, 3, 4, 5, 6])], writable),
-    /台帳またはサイズが不正/u
+    /ledger or size.*invalid/u
   );
   const invalidHeaderChunk = makeChunk(0, 0, [1, 2, 3]);
   const invalidHeader = new Uint8Array(await invalidHeaderChunk.wav.arrayBuffer());
@@ -40,9 +40,9 @@ test('rejects gaps, altered chunk WAV headers, and inconsistent frame totals', a
       wav: new Blob([invalidHeader]),
       byteLength: invalidHeader.byteLength
     }], writable),
-    /WAV形式が不正/u
+    /WAV format.*invalid/u
   );
-  await assert.rejects(writePcm24Wav({ frames: 2 }, [makeChunk(0, 0, [1, 2, 3])], writable), /一致しません/u);
+  await assert.rejects(writePcm24Wav({ frames: 2 }, [makeChunk(0, 0, [1, 2, 3])], writable), /frame count.*does not match/u);
 });
 
 test('writes a 44-byte PCM24 mono 48 kHz RIFF header', () => {
@@ -65,5 +65,5 @@ test('encodes live Float32 samples into a complete PCM24 WAV chunk', async () =>
     [...new Uint8Array(await wav.slice(44).arrayBuffer())],
     [0, 0, 128, 0, 0, 0, 255, 255, 127]
   );
-  assert.throws(() => createPcm24Wav([]), /サンプルが不正/u);
+  assert.throws(() => createPcm24Wav([]), /PCM24 WAV sample is invalid/u);
 });

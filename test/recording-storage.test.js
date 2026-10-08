@@ -47,10 +47,10 @@ test('rejects missing, altered, or discontinuous IndexedDB chunks', async () => 
     await storedChunk(0, 0, new Uint8Array([1, 2, 3])),
     await storedChunk(1, 1, new Uint8Array([4, 5, 6]))
   ];
-  await assert.rejects(verifyIncomingStoredTake(take, chunks.slice(0, 1)), /チャンク数/);
-  await assert.rejects(verifyIncomingStoredTake(take, [chunks[0], { ...chunks[1], startFrame: 2 }]), /台帳が不正/);
+  await assert.rejects(verifyIncomingStoredTake(take, chunks.slice(0, 1)), /number of received takes and chunks/u);
+  await assert.rejects(verifyIncomingStoredTake(take, [chunks[0], { ...chunks[1], startFrame: 2 }]), /ledger .* is invalid/u);
   await assert.rejects(
     verifyIncomingStoredChunk(take, { ...chunks[0], wav: new Blob([new Uint8Array([0])]) }, 0),
-    /台帳が不正/
+    /ledger .* is invalid/u
   );
 });

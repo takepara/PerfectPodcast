@@ -34,13 +34,13 @@ test('rejects conflicting or host-only inventory records', () => {
       [{ kind: 'chunk', takeId, sequence: 0, sha256: hashA }],
       [{ kind: 'chunk', takeId, sequence: 0, sha256: hashB }]
     ),
-    /hashが一致しません/
+    /saved hash does not match/u
   );
   assert.throws(
     () => reconcileTransferInventory(
       [],
       [{ kind: 'manifest', takeId }]
     ),
-    /確認できない/
+    /cannot be verified/u
   );
 });

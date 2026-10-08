@@ -10,7 +10,7 @@ export async function loadAuth0Config() {
     signal: AbortSignal.timeout(8000)
   }).then(async (response) => {
     const config = await response.json();
-    if (!response.ok) throw new Error(config.message || 'Auth0設定を読み込めません。');
+    if (!response.ok) throw new Error(config.message || 'Unable to load Auth0 settings.');
     return config;
   });
   return configPromise;
@@ -38,7 +38,7 @@ export async function getHostSession() {
   });
   const payload = await response.json();
   if (response.status === 401) return null;
-  if (!response.ok) throw new Error(payload.message || 'ホスト認証を確認できません。');
+  if (!response.ok) throw new Error(payload.message || 'Unable to verify host authentication.');
   return payload;
 }
 
@@ -52,7 +52,7 @@ export async function establishHostSession(client) {
     signal: AbortSignal.timeout(8000)
   });
   const payload = await response.json();
-  if (!response.ok) throw new Error(payload.message || 'ホスト認証を確立できません。');
+  if (!response.ok) throw new Error(payload.message || 'Unable to establish host authentication.');
   try {
     saveHostProfile(window.sessionStorage, await client.getUser(), payload.sub);
   } catch {
@@ -80,7 +80,7 @@ export async function signOut(client) {
     cache: 'no-store',
     signal: AbortSignal.timeout(8000)
   });
-  if (!response.ok) throw new Error('アプリのログイン状態を終了できません。');
+  if (!response.ok) throw new Error('Unable to end the application session.');
   try {
     clearHostProfile(window.sessionStorage);
   } catch {

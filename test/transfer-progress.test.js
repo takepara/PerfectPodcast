@@ -30,11 +30,11 @@ test('reports empty transfer progress as zero without inventing throughput', () 
 test('rejects invalid chunk measurements instead of reporting them as zero', () => {
   assert.throws(
     () => summarizeTransferChunks([{ bytes: -1, frames: 48_000, hostStored: false }]),
-    /チャンク情報が不正/u
+    /Invalid chunk information/u
   );
   assert.throws(
     () => summarizeTransferChunks([{ bytes: 10, frames: 1, hostStored: null }]),
-    /チャンク情報が不正/u
+    /Invalid chunk information/u
   );
 });
 
@@ -57,6 +57,6 @@ test('splits unsubmitted, sending, and acknowledgement-waiting backlog', () => {
 });
 
 test('rejects malformed send activity when splitting backlog', () => {
-  assert.throws(() => splitTransferBacklog(-1, { state: 'idle', bytes: 0 }), /状況が不正/u);
-  assert.throws(() => splitTransferBacklog(10, { state: 'unknown', bytes: 0 }), /状況が不正/u);
+  assert.throws(() => splitTransferBacklog(-1, { state: 'idle', bytes: 0 }), /queue status is invalid/u);
+  assert.throws(() => splitTransferBacklog(10, { state: 'unknown', bytes: 0 }), /queue status is invalid/u);
 });

@@ -1,10 +1,10 @@
 <!doctype html>
-<html lang="ja">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>Cloudflare TURN 通信テスト</title>
+  <title>Cloudflare TURN Connectivity Test</title>
   <style>
     :root {
       color-scheme: light dark;
@@ -113,33 +113,33 @@
 </head>
 <body>
   <main>
-    <h1>Cloudflare TURN 通信テスト</h1>
-    <p>Auth0で許可された収録ホストとしてログインし、短命のICE資格を取得してTURN relay候補に限定したWebRTC DataChannel通信を確認します。マイクやカメラは使用しません。</p>
+    <h1>Cloudflare TURN Connectivity Test</h1>
+    <p>Log in as an Auth0-authorized recording host, obtain short-lived ICE credentials, and test WebRTC DataChannel communication using TURN relay candidates only. This test does not use a microphone or camera.</p>
 
     <section class="card" aria-labelledby="credential-title">
-      <h2 id="credential-title">1. 認証済みWorkerから短命資格を取得</h2>
-      <p>資格はWorkerがCloudflare Realtimeから取得します。Cloudflare API tokenやTURN keyの秘密値はこのページへ渡りません。</p>
+      <h2 id="credential-title">1. Get Short-Lived Credentials from the Authenticated Worker</h2>
+      <p>The Worker obtains credentials from Cloudflare Realtime. Cloudflare API tokens and TURN key secrets are never sent to this page.</p>
       <div class="actions">
-        <button id="startButton" type="button" disabled>資格を取得してTURNをテスト</button>
-        <button id="stopButton" type="button" disabled>テストを停止</button>
-        <button id="clearButton" type="button">表示を消去</button>
+        <button id="startButton" type="button" disabled>Get Credentials and Test TURN</button>
+        <button id="stopButton" type="button" disabled>Stop Test</button>
+        <button id="clearButton" type="button">Clear Output</button>
       </div>
     </section>
 
     <section class="card" aria-live="polite" aria-labelledby="result-title">
-      <h2 id="result-title">2. テスト結果</h2>
-      <p id="status" data-kind="idle">Auth0でログインしてテストを開始してください。</p>
-      <pre id="log">短命資格は永続保存せず、値をログに表示しません。</pre>
+      <h2 id="result-title">2. Test Results</h2>
+      <p id="status" data-kind="idle">Log in with Auth0 to start the test.</p>
+      <pre id="log">Short-lived credentials are not stored persistently or displayed in the log.</pre>
     </section>
 
     <section class="card">
-      <h2>このテストで確認すること</h2>
+      <h2>What This Test Verifies</h2>
       <ul>
-        <li>Cloudflare TURNでrelay候補を取得できること</li>
-        <li>relay候補だけを使ったICE接続とDataChannelの往復通信</li>
-        <li>選択されたICE候補ペアがrelayであること</li>
+        <li>Retrieval of relay candidates from Cloudflare TURN</li>
+        <li>ICE connectivity and DataChannel round-trip communication using relay candidates only</li>
+        <li>Verification that the selected ICE candidate pair uses relay</li>
       </ul>
-      <p class="muted">同じブラウザー内の試験です。異なる端末間のシグナリング、音声通話、各ネットワークでの接続性は、PerfectPodcastの実通話でも別途確認してください。HTTPSまたはlocalhostで開いてください。</p>
+      <p class="muted">This test runs within the same browser. Verify signaling between separate devices, audio calls, and connectivity across different networks separately using a real PerfectPodcast call. Open this page over HTTPS or localhost.</p>
     </section>
   </main>
 
@@ -176,9 +176,9 @@
           return;
         }
         startButton.disabled = false;
-        setStatus('Auth0ホスト認証済みです。テストを開始できます。');
+        setStatus('Host authenticated with Auth0. You can start the test.');
       } catch (error) {
-        setStatus(`ホスト認証を確認できません: ${error.message}`, 'error');
+        setStatus(`Unable to verify host authentication: ${error.message}`, 'error');
       }
     }
 
@@ -192,18 +192,18 @@
     function normalizeIceServers(input) {
       const iceServers = Array.isArray(input) ? input : input?.iceServers;
       if (!Array.isArray(iceServers) || iceServers.length === 0 || iceServers.length > 6) {
-        throw new Error('レスポンスに有効なiceServers配列がありません。');
+        throw new Error('The response does not contain a valid iceServers array.');
       }
 
       let hasTurnCredentials = false;
       const normalized = iceServers.map((server) => {
         const urls = typeof server?.urls === 'string' ? [server.urls] : server?.urls;
         if (!Array.isArray(urls) || urls.length === 0) {
-          throw new Error('URL形式が不正なICE serverがあります。');
+          throw new Error('An ICE server has an invalid URL.');
         }
         const supportedUrls = urls.filter((url) => {
           if (typeof url !== 'string' || !VALID_URL.test(url)) {
-            throw new Error('Cloudflare TURN以外、または未対応のICE URLが含まれています。');
+            throw new Error('The ICE URLs include a non-Cloudflare TURN URL or an unsupported URL.');
           }
           return !/:(?:53)(?:\?|$)/u.test(url);
         });
@@ -212,7 +212,7 @@
         if (supportedUrls.some((url) => url.startsWith('turn:') || url.startsWith('turns:'))) {
           if (typeof server.username !== 'string' || !server.username ||
               typeof server.credential !== 'string' || !server.credential) {
-            throw new Error('TURN URLに期限付きusername/passwordがありません。');
+            throw new Error('The TURN URL is missing its time-limited username or password.');
           }
           serverConfig.username = server.username;
           serverConfig.credential = server.credential;
@@ -221,7 +221,7 @@
         return serverConfig;
       }).filter(Boolean);
 
-      if (!hasTurnCredentials) throw new Error('認証情報付きのCloudflare TURN URLがありません。');
+      if (!hasTurnCredentials) throw new Error('No Cloudflare TURN URL with credentials was provided.');
       return normalized;
     }
 
@@ -254,7 +254,7 @@
     }
 
     function assertCurrentRun(run) {
-      if (activeRun !== run) throw new Error('テストは停止されました。');
+      if (activeRun !== run) throw new Error('The test was stopped.');
     }
 
     function closeRun(run) {
@@ -276,17 +276,17 @@
       activeRun = run;
       startButton.disabled = true;
       stopButton.disabled = false;
-      logElement.textContent = '資格はメモリー上だけで使用します。';
-      setStatus('資格を検証しています…');
+      logElement.textContent = 'Credentials are used only in memory.';
+      setStatus('Validating credentials…');
 
       try {
         if (!window.RTCPeerConnection || !window.RTCDataChannel) {
-          throw new Error('このブラウザーはWebRTC DataChannelに対応していません。');
+          throw new Error('This browser does not support WebRTC DataChannel.');
         }
         if (!window.isSecureContext) {
-          throw new Error('HTTPSまたはlocalhostでこのページを開いてください。');
+          throw new Error('Open this page over HTTPS or localhost.');
         }
-        setStatus('WorkerがAuth0認証を確認して短命資格を取得しています…');
+        setStatus('The Worker is verifying Auth0 authentication and obtaining short-lived credentials…');
         const response = await fetch('/turn-test/credentials', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -302,14 +302,14 @@
         try {
           parsed = JSON.parse(responseText);
         } catch {
-          if (!response.ok) throw new Error(`Workerから資格を取得できませんでした (HTTP ${response.status})。`);
-          throw new Error('Workerの資格応答をJSONとして読み取れません。');
+          if (!response.ok) throw new Error(`Unable to get credentials from the Worker (HTTP ${response.status}).`);
+          throw new Error('The Worker credential response could not be read as JSON.');
         }
         if (!response.ok) {
-          throw new Error(parsed?.message || `Workerから資格を取得できませんでした (HTTP ${response.status})。`);
+          throw new Error(parsed?.message || `Unable to get credentials from the Worker (HTTP ${response.status}).`);
         }
         const iceServers = normalizeIceServers(parsed);
-        addLog('Worker経由でTURN URLと短命資格を取得しました。資格の値は表示しません。');
+        addLog('Obtained a TURN URL and short-lived credentials through the Worker. Credential values are not displayed.');
 
         const configuration = { iceServers, iceTransportPolicy: 'relay' };
         const host = new RTCPeerConnection(configuration);
@@ -326,7 +326,7 @@
           if (!candidate) return;
           if (candidate.type === 'relay') relayCandidateCount += 1;
           if (guestRemoteDescriptionReady) {
-            void guest.addIceCandidate(candidate).catch((error) => addLog(`ゲストICE候補エラー: ${error.message}`));
+            void guest.addIceCandidate(candidate).catch((error) => addLog(`Guest ICE candidate error: ${error.message}`));
           } else {
             pendingGuestCandidates.push(candidate);
           }
@@ -335,12 +335,12 @@
           if (!candidate) return;
           if (candidate.type === 'relay') relayCandidateCount += 1;
           if (hostRemoteDescriptionReady) {
-            void host.addIceCandidate(candidate).catch((error) => addLog(`ホストICE候補エラー: ${error.message}`));
+            void host.addIceCandidate(candidate).catch((error) => addLog(`Host ICE candidate error: ${error.message}`));
           } else {
             pendingHostCandidates.push(candidate);
           }
         });
-        for (const [label, peerConnection] of [['ホスト', host], ['ゲスト', guest]]) {
+        for (const [label, peerConnection] of [['Host', host], ['Guest', guest]]) {
           peerConnection.addEventListener('iceconnectionstatechange', () => {
             addLog(`${label} ICE: ${peerConnection.iceConnectionState}`);
           });
@@ -351,9 +351,9 @@
 
         const nonce = crypto.randomUUID();
         const verified = new Promise((resolve, reject) => {
-          run.cancel = () => reject(new Error('テストは停止されました。'));
+          run.cancel = () => reject(new Error('The test was stopped.'));
           run.timeout = window.setTimeout(() => {
-            reject(new Error('45秒以内にrelay経由のDataChannel往復が完了しませんでした。'));
+            reject(new Error('The DataChannel round trip over relay did not complete within 45 seconds.'));
           }, TEST_TIMEOUT_MS);
           run.dataChannel = host.createDataChannel('cloudflare-turn-test', { ordered: true });
           guest.addEventListener('datachannel', ({ channel }) => {
@@ -362,16 +362,16 @@
             });
           }, { once: true });
           run.dataChannel.addEventListener('open', () => {
-            addLog('DataChannelがopenしました。往復メッセージを送信します。');
+            addLog('The DataChannel is open. Sending a round-trip message.');
             run.dataChannel.send(nonce);
           }, { once: true });
           run.dataChannel.addEventListener('message', ({ data }) => {
             if (data === `ack:${nonce}`) resolve();
-            else reject(new Error('DataChannelから予期しない応答を受け取りました。'));
+            else reject(new Error('Received an unexpected response from the DataChannel.'));
           });
         });
 
-        setStatus('TURN relay候補を収集中・接続中です…');
+        setStatus('Gathering TURN relay candidates and connecting…');
         const offer = await host.createOffer();
         assertCurrentRun(run);
         await host.setLocalDescription(offer);
@@ -394,16 +394,16 @@
         if (!hostPair || !guestPair ||
             hostPair.localType !== 'relay' || hostPair.remoteType !== 'relay' ||
             guestPair.localType !== 'relay' || guestPair.remoteType !== 'relay') {
-          throw new Error('DataChannelは開きましたが、選択された両端のICE候補がrelayと確認できません。成功とは判定しません。');
+          throw new Error('The DataChannel opened, but the selected ICE candidates on both ends could not be verified as relay. The test will not report success.');
         }
-        addLog(`ホスト候補ペア: local=${hostPair.localType}, remote=${hostPair.remoteType}, protocol=${hostPair.protocol}, relayProtocol=${hostPair.relayProtocol}`);
-        addLog(`ゲスト候補ペア: local=${guestPair.localType}, remote=${guestPair.remoteType}, protocol=${guestPair.protocol}, relayProtocol=${guestPair.relayProtocol}`);
-        addLog(`relay候補を ${relayCandidateCount} 件確認しました。`);
-        setStatus('成功: 両端でrelay候補を選択し、DataChannelの往復通信を確認しました。', 'success');
+        addLog(`Host candidate pair: local=${hostPair.localType}, remote=${hostPair.remoteType}, protocol=${hostPair.protocol}, relayProtocol=${hostPair.relayProtocol}`);
+        addLog(`Guest candidate pair: local=${guestPair.localType}, remote=${guestPair.remoteType}, protocol=${guestPair.protocol}, relayProtocol=${guestPair.relayProtocol}`);
+        addLog(`Found ${relayCandidateCount} relay candidates.`);
+        setStatus('Success: both ends selected relay candidates and the DataChannel round trip was verified.', 'success');
       } catch (error) {
         if (activeRun === run) {
-          setStatus(`失敗: ${error.message}`, 'error');
-          addLog(`エラー: ${error.message}`);
+          setStatus(`Failed: ${error.message}`, 'error');
+          addLog(`Error: ${error.message}`);
         }
       } finally {
         closeRun(run);
@@ -423,12 +423,12 @@
       closeRun(run);
       startButton.disabled = false;
       stopButton.disabled = true;
-      setStatus('テストを停止しました。');
-      addLog('PeerConnectionとDataChannelを閉じました。');
+      setStatus('The test was stopped.');
+      addLog('Closed the PeerConnections and DataChannel.');
     });
     clearButton.addEventListener('click', () => {
-      logElement.textContent = '表示と入力欄を消去しました。';
-      setStatus('Auth0でログインしてテストを開始してください。');
+      logElement.textContent = 'Output and input fields cleared.';
+      setStatus('Log in with Auth0 to start the test.');
     });
 
     void requireHostLogin();

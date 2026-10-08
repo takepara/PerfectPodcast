@@ -28,7 +28,7 @@ function randomToken(byteLength = 32) {
 
 export function fingerprintFromSdp(sdp) {
   const match = sdp.match(/^a=fingerprint:sha-256\s+([0-9A-F:]+)\r?$/imu);
-  if (!match) throw new Error('WebRTC のDTLS fingerprintを取得できませんでした。');
+  if (!match) throw new Error('Unable to get the WebRTC DTLS fingerprint.');
   return match[1].replaceAll(':', '').toLowerCase();
 }
 
@@ -118,6 +118,51 @@ function isValidTurnIceServers(iceServers) {
   return hasTurn;
 }
 
+function networkMessageSummary(message) {
+  if (!message || typeof message !== 'object') return 'invalid message';
+  const type = typeof message.type === 'string' && /^[a-z0-9-]{1,60}$/iu.test(message.type)
+    ? message.type
+    : 'unknown';
+  const fields = [];
+  for (const key of [
+    'role', 'eventId', 'sequence', 'recording', 'ready', 'accepted', 'muted', 'level', 'startAt',
+    'hostStartedAt', 'clockOffsetMs', 'observedAt', 'frame', 'probeId',
+    'sentAt', 'receivedAt', 'takeId', 'startFrame', 'frames', 'totalBytes',
+    'count', 'startedAt', 'takeNumber', 'chunks'
+  ]) {
+    const value = message[key];
+    if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))) {
+      fields.push(`${key}=${value}`);
+    } else if (typeof value === 'string' && value.length <= 64 && /^[A-Za-z0-9_.-]+$/u.test(value)) {
+      fields.push(`${key}=${value}`);
+    }
+  }
+  if (typeof message.sdp === 'string') fields.push(`sdpBytes=${new TextEncoder().encode(message.sdp).byteLength}`);
+  if (message.type === 'candidate' && typeof message.candidate?.candidate === 'string') {
+    const match = message.candidate.candidate.match(/\s(udp|tcp)\s+\d+\s+\S+\s+\d+\s+typ\s+(host|srflx|prflx|relay)\b/iu);
+    fields.push(`candidate=${match ? `${match[2]}/${match[1]}` : 'unknown'}`);
+  }
+  return [`type=${type}`, ...fields].join(' ');
+}
+
+function dataChannelPayloadSummary(data) {
+  if (typeof data !== 'string') {
+    const byteLength = data instanceof ArrayBuffer
+      ? data.byteLength
+      : ArrayBuffer.isView(data)
+        ? data.byteLength
+        : data instanceof Blob
+          ? data.size
+          : null;
+    return byteLength === null ? 'binary payload' : `binary bytes=${byteLength}`;
+  }
+  try {
+    return networkMessageSummary(JSON.parse(data));
+  } catch {
+    return `text bytes=${new TextEncoder().encode(data).byteLength}`;
+  }
+}
+
 export function findSelectedIceCandidatePair(reports) {
   const reportList = [...reports.values()];
   const selectedPairIds = new Set(reportList
@@ -143,6 +188,8 @@ export class RoomCall {
     onReadinessState,
     onRecordingState,
     onLocalStream,
+    onSessionName,
+    onNetworkEvent,
     getNextTransferChunk,
     prepareTransferChunk,
     markTransferChunkStored,
@@ -164,6 +211,8 @@ export class RoomCall {
     this.onReadinessState = onReadinessState;
     this.onRecordingState = onRecordingState;
     this.onLocalStream = onLocalStream;
+    this.onSessionName = onSessionName;
+    this.onNetworkEvent = onNetworkEvent;
     this.onError = onError;
     this.hasPendingTransfer = hasPendingTransfer;
     this.recordingTransfer = new RecordingTransfer({
@@ -174,37 +223,41 @@ export class RoomCall {
         ? getNextTransferChunk(this.authFields?.generation)
         : null,
       markChunkStored: (...args) => {
-        if (!markTransferChunkStored) throw new Error('受信確認をローカル台帳へ保存できません。');
+        if (!markTransferChunkStored) throw new Error('Unable to save the receipt acknowledgment to the local ledger.');
         return markTransferChunkStored(...args);
       },
       getNextManifest: () => getNextTransferManifest
         ? getNextTransferManifest(this.authFields?.generation)
         : null,
       prepareChunk: (...args) => {
-        if (!prepareTransferChunk) throw new Error('転送前hashをローカル台帳へ保存できません。');
+        if (!prepareTransferChunk) throw new Error('Unable to save the pre-transfer hash to the local ledger.');
         return prepareTransferChunk(...args);
       },
       getTransferInventory: (...args) => {
-        if (!getTransferInventory) throw new Error('転送inventoryを読み出せません。');
+        if (!getTransferInventory) throw new Error('Unable to read the transfer inventory.');
         return getTransferInventory(...args);
       },
       reconcileTransferInventory: (...args) => {
-        if (!reconcileTransferInventory) throw new Error('転送inventoryを照合できません。');
+        if (!reconcileTransferInventory) throw new Error('Unable to reconcile the transfer inventory.');
         return reconcileTransferInventory(...args);
       },
       markManifestStored: (...args) => {
-        if (!markTransferManifestStored) throw new Error('最終確認をローカル台帳へ保存できません。');
+        if (!markTransferManifestStored) throw new Error('Unable to save the final acknowledgment to the local ledger.');
         return markTransferManifestStored(...args);
       },
       storeChunk: (...args) => {
-        if (!storeIncomingTransferChunk) throw new Error('受信音源の保存先がありません。');
+        if (!storeIncomingTransferChunk) throw new Error('No destination is available for received audio.');
         return storeIncomingTransferChunk(...args);
       },
       storeManifest: (...args) => {
-        if (!storeIncomingTransferManifest) throw new Error('受信manifestの保存先がありません。');
+        if (!storeIncomingTransferManifest) throw new Error('No destination is available for the received manifest.');
         return storeIncomingTransferManifest(...args);
       },
-      onStatus: (message, isError = false) => this.setStatus(message, isError)
+      onStatus: (message, isError = false) => {
+        if (isError) this.logNetworkEvent('Transfer error', message);
+        this.setStatus(message, isError);
+      },
+      onNetworkEvent: (event, details) => this.logNetworkEvent(event, details)
     });
     this.socket = null;
     this.peerConnection = null;
@@ -214,6 +267,8 @@ export class RoomCall {
     this.guestIdentity = null;
     this.guestNonce = null;
     this.pendingGuest = null;
+    this.sessionName = null;
+    this.remoteSessionName = null;
     this.remoteRecordingState = null;
     this.recordingSequence = 0;
     this.pendingRecordingCommands = new Map();
@@ -281,7 +336,7 @@ export class RoomCall {
 
   async synchronizeClock() {
     if (this.localRole !== 'host' || !this.isPeerReadyForRecording || !this.authFields) {
-      throw new Error('時刻同期には両端末のREADYと接続確認が必要です。');
+      throw new Error('Both devices must be ready and connected before clock synchronization.');
     }
     if (this.clockSyncPromise) return this.clockSyncPromise;
     this.clockSyncPromise = this.measureClockOffset().finally(() => {
@@ -320,10 +375,14 @@ export class RoomCall {
         await new Promise((resolve) => window.setTimeout(resolve, 50));
       }
     }
-    if (!this.isPeerReadyForRecording) throw new Error('時刻同期中に通話接続が失われました。');
+    if (!this.isPeerReadyForRecording) throw new Error('The call connection was lost during clock synchronization.');
     const selected = selectClockSample(samples, MIN_CLOCK_PROBE_SAMPLES);
     this.clockOffsetMs = selected.offsetMs;
-    this.setStatus(`開始時刻を同期しました (RTT ${Math.round(selected.roundTripMs)} ms)。`);
+    this.logNetworkEvent(
+      'Clock sync selected',
+      `offset=${selected.offsetMs.toFixed(2)} ms RTT=${selected.roundTripMs.toFixed(2)} ms samples=${samples.length}`
+    );
+    this.setStatus(`Start time synchronized (RTT ${Math.round(selected.roundTripMs)} ms).`);
     return this.clockOffsetMs;
   }
 
@@ -351,7 +410,7 @@ export class RoomCall {
         repliedAt
       });
     } catch (error) {
-      this.setStatus(`時刻同期応答を送信できませんでした: ${error.message}`, true);
+      this.setStatus(`Unable to send the clock synchronization response: ${error.message}`, true);
     }
   }
 
@@ -363,12 +422,17 @@ export class RoomCall {
     this.pendingClockProbes.delete(message.probeId);
     window.clearTimeout(probe.timer);
     try {
-      probe.resolve(calculateClockSample(
+      const sample = calculateClockSample(
         probe.sentAt,
         message.receivedAt,
         message.repliedAt,
         performance.now()
-      ));
+      );
+      this.logNetworkEvent(
+        'Clock sync sample',
+        `probe=${message.probeId} offset=${sample.offsetMs.toFixed(2)} ms RTT=${sample.roundTripMs.toFixed(2)} ms`
+      );
+      probe.resolve(sample);
     } catch {
       probe.resolve(null);
     }
@@ -378,12 +442,20 @@ export class RoomCall {
     if (!event || frame !== 0) return;
     const pending = this.pendingStartEvents.get(event.eventId);
     if (!pending || pending.sequence !== event.sequence) return;
+    this.logNetworkEvent(
+      'Recording start local',
+      `event=${event.eventId} frame=${frame} observedAt=${observedAt.toFixed(3)} ms target=${pending.startAt.toFixed(3)} ms`
+    );
     pending.localStartedAt = observedAt;
     this.completeStartEvent(pending);
   }
 
   notifyRecordingStarted(event, observedAt, frame) {
     if (!event || this.localRole !== 'guest' || frame !== 0 || !this.authFields) return;
+    this.logNetworkEvent(
+      'Recording start local',
+      `event=${event.eventId} frame=${frame} observedAt=${observedAt.toFixed(3)} ms`
+    );
     try {
       this.send({
         type: 'recording-started',
@@ -394,7 +466,7 @@ export class RoomCall {
         frame
       });
     } catch (error) {
-      this.setStatus(`録音開始の確認をホストへ送信できませんでした: ${error.message}`, true);
+      this.setStatus(`Unable to send the recording start confirmation to the host: ${error.message}`, true);
     }
   }
 
@@ -421,6 +493,10 @@ export class RoomCall {
     if (!pending || pending.sequence !== message.sequence || message.frame !== 0 ||
         !Number.isFinite(message.observedAt)) return;
     pending.remoteStartedAt = message.observedAt - pending.clockOffsetMs;
+    this.logNetworkEvent(
+      'Recording start remote',
+      `event=${message.eventId} guestObservedAt=${message.observedAt.toFixed(3)} ms hostClock=${pending.remoteStartedAt.toFixed(3)} ms offset=${pending.clockOffsetMs.toFixed(3)} ms`
+    );
     this.completeStartEvent(pending);
   }
 
@@ -439,7 +515,7 @@ export class RoomCall {
         ...progress
       });
     } catch (error) {
-      this.setStatus(`ゲストの音源回収状況を通知できません: ${error.message}`, true);
+      this.setStatus(`Unable to report the guest audio recovery status: ${error.message}`, true);
     }
   }
 
@@ -451,14 +527,26 @@ export class RoomCall {
     this.remoteTransferProgress = { ...message, receivedAt: performance.now() };
   }
 
+  async receiveSessionName(message) {
+    if (typeof message.name !== 'string' || !message.name.trim() || message.name.trim().length > 120) {
+      throw new Error('The host sent an invalid session name.');
+    }
+    this.remoteSessionName = message.name.trim();
+    await this.onSessionName?.(this.remoteSessionName);
+  }
+
   completeStartEvent(pending) {
     if (pending.localStartedAt === null || pending.remoteStartedAt === null) return;
     window.clearTimeout(pending.timer);
     this.pendingStartEvents.delete(pending.eventId);
     const driftMs = pending.remoteStartedAt - pending.localStartedAt;
+    this.logNetworkEvent(
+      'Recording start comparison',
+      `event=${pending.eventId} host=${pending.localStartedAt.toFixed(3)} ms guest=${pending.remoteStartedAt.toFixed(3)} ms difference=${driftMs.toFixed(3)} ms`
+    );
     const warning = Math.abs(driftMs) > 20;
     this.setStatus(
-      `双方の実開始を確認しました (開始差 ${Math.round(driftMs)} ms${warning ? ' · 目標20 ms超' : ''})。`,
+      `Recording start confirmed on both devices (difference ${Math.round(driftMs)} ms${warning ? ' · above 20 ms target' : ''}).`,
       warning
     );
   }
@@ -471,13 +559,13 @@ export class RoomCall {
     const hostPublicKey = params.get('host');
     if (!this.inviteMode) return null;
     if (!roomId || !ROOM_ID_PATTERN.test(roomId) || !secret || !hostPublicKey) {
-      this.setStatus('招待リンクが正しくありません。ホストに新しいリンクを依頼してください。', true);
+      this.setStatus('The invitation link is invalid. Ask the host for a new link.', true);
       return null;
     }
     try {
       if (fromBase64Url(secret).length !== 32 || fromBase64Url(hostPublicKey).length < 64) throw new Error();
     } catch {
-      this.setStatus('招待リンクが正しくありません。ホストに新しいリンクを依頼してください。', true);
+      this.setStatus('The invitation link is invalid. Ask the host for a new link.', true);
       return null;
     }
     return { roomId, secret, hostPublicKey };
@@ -498,33 +586,33 @@ export class RoomCall {
 
   applyRoleUI() {
     const guestMode = this.inviteMode;
-    $('participantNameLabel').textContent = guestMode ? 'ホストに表示する名前' : 'あなたの名前';
-    $('micDeviceLabel').textContent = guestMode ? '通話・録音に使うマイク' : '録音マイク';
-    $('openStudioButton').textContent = guestMode ? 'ゲスト用スタジオへ進む' : 'スタジオを開く';
+    $('participantNameLabel').textContent = guestMode ? 'Name shown to the host' : 'Your name';
+    $('micDeviceLabel').textContent = guestMode ? 'Microphone for calls and recording' : 'Recording microphone';
+    $('openStudioButton').textContent = guestMode ? 'Continue to Guest Studio' : 'Open Studio';
     $('openStudioButton').disabled = guestMode && !this.invitation;
     $('recentPanel').hidden = false;
     $('setupView').querySelector('.setup-grid').classList.toggle('guest-mode', guestMode);
     $('roomPanel').classList.toggle('guest-mode', guestMode);
-    $('roleBadge').textContent = guestMode ? 'ゲスト' : 'ホスト';
+    $('roleBadge').textContent = guestMode ? 'Guest' : 'Host';
     $('roleBadge').classList.toggle('guest', guestMode);
-    $('roomRoleLabel').textContent = guestMode ? 'ゲスト操作' : 'ホスト操作';
-    $('roomHeading').textContent = guestMode ? '招待された部屋に参加' : 'ゲストを招待';
+    $('roomRoleLabel').textContent = guestMode ? 'Guest controls' : 'Host controls';
+    $('roomHeading').textContent = guestMode ? 'Join the invited room' : 'Invite a guest';
     $('createRoomButton').hidden = guestMode;
     $('joinRoomButton').hidden = !guestMode || !this.invitation;
     $('joinRoomButton').disabled = guestMode && !this.invitation;
     $('recordControls').hidden = guestMode;
     $('hostRecordingNotice').hidden = !guestMode;
     $('transferProgressHeading').textContent = guestMode
-      ? 'ホストへの音源送信状況'
-      : 'ゲスト音源の受信状況';
-    $('joinRoomButton').textContent = 'ホストに参加申請';
-    this.setRemoteWaveState('未接続');
+      ? 'Audio transfer to host'
+      : 'Guest audio reception status';
+    $('joinRoomButton').textContent = 'Request to Join Host';
+    this.setRemoteWaveState('Not connected');
     if (guestMode && !this.invitation) {
-      $('statusMessage').textContent = '招待リンクが正しくありません。ホストに新しいリンクを依頼してください。';
+      $('statusMessage').textContent = 'The invitation link is invalid. Ask the host for a new link.';
     } else if (guestMode) {
-      this.setStatus('招待を確認しました。準備ができたらホストに参加申請してください。');
+      this.setStatus('Invitation verified. Request to join the host when you are ready.');
     } else {
-      this.setStatus('招待リンクを作成してゲストを招待できます。');
+      this.setStatus('Create an invitation link to invite a guest.');
     }
   }
 
@@ -534,6 +622,10 @@ export class RoomCall {
       status.textContent = message;
       status.classList.toggle('room-error', isError);
     }
+  }
+
+  logNetworkEvent(event, details = '') {
+    this.onNetworkEvent?.(event, details);
   }
 
   setCallState(message) {
@@ -552,7 +644,9 @@ export class RoomCall {
       this.lastInputMonitorSentState.muted !== this.localInputMonitorState.muted ||
       this.lastInputMonitorSentState.deviceLabel !== this.localInputMonitorState.deviceLabel;
     if (!stateChanged && performance.now() - this.lastInputMonitorSentAt < 100) return;
-    channel.send(JSON.stringify({ type: 'input-state', ...this.localInputMonitorState }));
+    const message = { type: 'input-state', ...this.localInputMonitorState };
+    channel.send(JSON.stringify(message));
+    this.logNetworkEvent('DataChannel TX', `input-monitor-v1 ${networkMessageSummary(message)}`);
     this.lastInputMonitorSentAt = performance.now();
     this.lastInputMonitorSentState = {
       muted: this.localInputMonitorState.muted,
@@ -582,7 +676,7 @@ export class RoomCall {
     });
     channel.addEventListener('error', () => {
       if (this.inputMonitorChannel === channel) {
-        this.setStatus('相手のマイク入力レベルを同期できません。', true);
+        this.setStatus('Unable to synchronize the other participant’s microphone input level.', true);
       }
     });
     if (channel.readyState === 'open') {
@@ -598,21 +692,21 @@ export class RoomCall {
 
   receiveInputMonitorMessage(data) {
     if (typeof data !== 'string' || data.length > 512) {
-      this.setStatus('相手のマイク情報の形式が不正です。', true);
+      this.setStatus('The other participant’s microphone information is invalid.', true);
       return;
     }
     let message;
     try {
       message = JSON.parse(data);
     } catch (error) {
-      this.setStatus(`相手のマイク情報を読み取れません: ${error.message}`, true);
+      this.setStatus(`Unable to read the other participant’s microphone information: ${error.message}`, true);
       return;
     }
     if (!message || message.type !== 'input-state' ||
         !Number.isFinite(message.level) || message.level < 0 || message.level > 1 ||
         typeof message.muted !== 'boolean' ||
         typeof message.deviceLabel !== 'string' || message.deviceLabel.length > 120) {
-      this.setStatus('相手のマイク情報の形式が不正です。', true);
+      this.setStatus('The other participant’s microphone information is invalid.', true);
       return;
     }
     this.updateRemoteInputMonitor({
@@ -632,20 +726,20 @@ export class RoomCall {
       waveform.meterFill.className =
         `meter-fill remote-waveform-meter-fill${peak >= 0.999 ? ' clipping' : db >= -6 ? ' near-clip' : db >= -40 ? ' good' : ''}`;
       waveform.meter.setAttribute('aria-valuenow', String(Math.round(percent)));
-      const deviceLabel = `${state.deviceLabel || '情報待ち'}${state.muted ? ' · MUTE' : ''}`;
+      const deviceLabel = `${state.deviceLabel || 'Waiting for information'}${state.muted ? ' · MUTE' : ''}`;
       const option = waveform.device.options[0];
       if (option && option.textContent !== deviceLabel) option.textContent = deviceLabel;
       if (waveform.muteState) {
         const muteState = state.muted === null ? 'wait' : state.muted ? 'muted' : 'unmuted';
         waveform.muteState.textContent =
-          muteState === 'wait' ? 'WAIT' : muteState === 'muted' ? 'MUTED' : 'UNMUTED';
+          muteState === 'wait' ? '' : muteState === 'muted' ? 'MUTED' : 'UNMUTED';
         waveform.muteState.classList.toggle('muted', muteState === 'muted');
         waveform.muteState.classList.toggle('unmuted', muteState === 'unmuted');
         waveform.muteState.classList.toggle('wait', muteState === 'wait');
         waveform.muteState.setAttribute('aria-label',
           muteState === 'wait'
-            ? '相手のミュート状態を確認中'
-            : muteState === 'muted' ? '相手はミュート中' : '相手はミュートしていません');
+            ? 'Checking the other participant’s mute status'
+            : muteState === 'muted' ? 'The other participant is muted' : 'The other participant is not muted');
       }
     }
   }
@@ -657,17 +751,17 @@ export class RoomCall {
     $('checkReadinessButton').hidden = !connected;
     $('retryTransferButton').hidden = !connected;
     $('retryTransferButton').textContent = this.localRole === 'host'
-      ? '受信状況を再確認'
-      : '転送を再試行';
+      ? 'Check Reception Status'
+      : 'Retry Transfer';
     $('recordingReadiness').textContent = waitingForGuest
-      ? 'ゲスト未接続 · 単独録音を開始できます'
+      ? 'Guest not connected · You can start recording alone'
       : !connected
-        ? '録音準備は未確認です'
+        ? 'Recording readiness has not been checked'
         : !this.localReady
-          ? 'この端末の録音準備が未完了です'
+          ? 'This device is not ready to record'
           : !this.remoteReady
-            ? 'この端末の準備完了 · 相手の確認待ち'
-            : '両端末の録音準備が完了しました';
+            ? 'This device is ready · Waiting for the other participant'
+            : 'Both devices are ready to record';
     this.onReadinessState?.({
       connected: Boolean(connected),
       localReady: this.localReady,
@@ -696,8 +790,8 @@ export class RoomCall {
       }
       if (!isCurrent()) return false;
       this.localReady = ready;
-      if (readinessError) this.setStatus(`この端末の録音準備を確認できませんでした: ${readinessError.message}`, true);
-      else if (!this.localReady) this.setStatus('この端末の録音準備が完了していません。マイクと保存領域を確認してください。', true);
+      if (readinessError) this.setStatus(`Unable to verify recording readiness on this device: ${readinessError.message}`, true);
+      else if (!this.localReady) this.setStatus('This device is not ready to record. Check the microphone and available storage.', true);
       this.readySequence += 1;
       try {
         this.send({
@@ -708,11 +802,11 @@ export class RoomCall {
         });
       } catch (error) {
         this.localReady = false;
-        this.setStatus(`録音準備状態を相手へ通知できませんでした: ${error.message}`, true);
+        this.setStatus(`Unable to notify the other participant of recording readiness: ${error.message}`, true);
       }
       this.updateReadinessUI();
-      if (this.localReady && this.remoteReady) this.setStatus('双方の録音準備が完了しました。');
-      else if (this.localReady) this.setStatus('この端末の録音準備が完了しました。相手の確認を待っています。');
+      if (this.localReady && this.remoteReady) this.setStatus('Both devices are ready to record.');
+      else if (this.localReady) this.setStatus('This device is ready to record. Waiting for the other participant.');
       return this.localReady;
     } finally {
       this.readinessCheckInProgress = false;
@@ -729,31 +823,32 @@ export class RoomCall {
     if (!this.connected) return;
     this.recordingTransfer.refreshInventory();
     this.setStatus(this.localRole === 'host'
-      ? 'ホスト保存済み音源の台帳を再照合しています。'
-      : '未確認音源とホスト保存済み台帳を再確認しています。');
+      ? 'Reconciling the ledger for audio saved on the host.'
+      : 'Rechecking unconfirmed audio and the ledger saved on the host.');
   }
 
-  setHostRecordingState(recording, startAt = null, clockOffsetMs = null, eventId = crypto.randomUUID()) {
+  setHostRecordingState(recording, startAt = null, clockOffsetMs = null, eventId = crypto.randomUUID(), hostStartedAt = null) {
     if (this.localRole !== 'host') return null;
     if (typeof recording !== 'boolean') {
-      this.setStatus('録音状態をゲストへ同期できませんでした。', true);
+      this.setStatus('Unable to synchronize recording status with the guest.', true);
       return null;
     }
     if (!this.connected) return null;
     if (recording && !this.canStartRecording) {
-      this.setStatus('双方の録音準備と通話接続を確認してから録音を開始してください。', true);
+      this.setStatus('Verify that both devices are ready to record and connected before starting.', true);
       if (this.getRecordingState()) void this.onRecordingState?.(false);
       return null;
     }
     if (recording && (!Number.isFinite(startAt) || startAt <= performance.now() ||
         !Number.isFinite(clockOffsetMs) || Math.abs(clockOffsetMs) > 60_000 ||
-        !Number.isFinite(startAt + clockOffsetMs))) {
-      this.setStatus('有効な同期開始時刻がありません。時刻同期をやり直してください。', true);
+        !Number.isFinite(startAt + clockOffsetMs) ||
+        (hostStartedAt !== null && (!Number.isFinite(hostStartedAt) || hostStartedAt <= 0)))) {
+      this.setStatus('There is no valid synchronized start time. Synchronize the clocks again.', true);
       if (this.getRecordingState()) void this.onRecordingState?.(false);
       return null;
     }
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-      this.setStatus('ゲストとの接続がないため、録音状態を同期できませんでした。', true);
+      this.setStatus('Unable to synchronize recording status because the guest is not connected.', true);
       if (recording) void this.onRecordingState?.(false);
       return null;
     }
@@ -768,7 +863,8 @@ export class RoomCall {
       sequence: ++this.recordingSequence,
       generation: this.authFields?.generation,
       startAt,
-      clockOffsetMs
+      clockOffsetMs,
+      hostStartedAt
     };
     if (recording) {
       const pendingStart = {
@@ -783,7 +879,7 @@ export class RoomCall {
       pendingStart.timer = window.setTimeout(() => {
         if (this.pendingStartEvents.get(command.eventId) !== pendingStart) return;
         this.pendingStartEvents.delete(command.eventId);
-        this.setStatus('参加者の実開始確認が届きませんでした。録音は継続しています。双方の録音状態を確認してください。', true);
+        this.setStatus('No recording start confirmation was received from the participant. Recording continues. Check the recording status on both devices.', true);
       }, Math.max(0, startAt - performance.now()) + 5000);
       this.pendingStartEvents.set(command.eventId, pendingStart);
     }
@@ -805,6 +901,7 @@ export class RoomCall {
       if (pending.recording) {
         message.startAt = pending.startAt;
         message.clockOffsetMs = pending.clockOffsetMs;
+        if (Number.isFinite(pending.hostStartedAt)) message.hostStartedAt = pending.hostStartedAt;
       }
       this.send(message);
       pending.timer = window.setTimeout(() => {
@@ -820,11 +917,11 @@ export class RoomCall {
           if (startEvent) window.clearTimeout(startEvent.timer);
           this.pendingStartEvents.delete(pending.eventId);
         }
-        this.setStatus('ゲストから録音状態の確認応答がありません。双方の録音状態を確認してください。', true);
+        this.setStatus('No recording status acknowledgment was received from the guest. Check the recording status on both devices.', true);
         if (pending.recording) void this.onRecordingState?.(false);
       }, 5000);
     } catch (error) {
-      this.setStatus(`ゲストへ録音状態を同期できませんでした: ${error.message}`, true);
+      this.setStatus(`Unable to synchronize recording status with the guest: ${error.message}`, true);
       this.pendingRecordingCommands.delete(pending.eventId);
       if (pending.recording) {
         const startEvent = this.pendingStartEvents.get(pending.eventId);
@@ -841,13 +938,15 @@ export class RoomCall {
         !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(message.eventId) ||
         message.generation !== this.authFields?.generation ||
         !Number.isSafeInteger(message.sequence) || message.sequence < 1) {
-      this.setStatus('ホストから不正な録音状態が届きました。', true);
+      this.setStatus('Received invalid recording status from the host.', true);
       return;
     }
     if (message.recording && (!Number.isFinite(message.startAt) || message.startAt <= 0 ||
         !Number.isFinite(message.clockOffsetMs) || Math.abs(message.clockOffsetMs) > 60_000 ||
-        !Number.isFinite(message.startAt + message.clockOffsetMs))) {
-      this.setStatus('開始時刻の形式が不正な録音開始指示を拒否しました。', true);
+        !Number.isFinite(message.startAt + message.clockOffsetMs) ||
+        (message.hostStartedAt !== undefined &&
+          (!Number.isFinite(message.hostStartedAt) || message.hostStartedAt <= 0)))) {
+      this.setStatus('Rejected a recording start instruction with an invalid start time.', true);
       return;
     }
     const prior = this.guestRecordingCommands.get(message.eventId);
@@ -855,8 +954,9 @@ export class RoomCall {
       if (prior.recording !== message.recording || prior.sequence !== message.sequence ||
           prior.generation !== message.generation ||
           prior.startAt !== (message.recording ? message.startAt + message.clockOffsetMs : null) ||
-          prior.clockOffsetMs !== (message.recording ? message.clockOffsetMs : null)) {
-        this.setStatus('同じ録音イベントIDに異なる状態が届きました。', true);
+          prior.clockOffsetMs !== (message.recording ? message.clockOffsetMs : null) ||
+          (prior.hostStartedAt ?? null) !== (message.recording ? message.hostStartedAt ?? null : null)) {
+        this.setStatus('Conflicting states were received for the same recording event ID.', true);
         return;
       }
       await prior.resultPromise;
@@ -864,7 +964,7 @@ export class RoomCall {
       return;
     }
     if (message.recording && message.startAt + message.clockOffsetMs < performance.now() + 250) {
-      this.setStatus('開始予定時刻を過ぎた録音開始指示を拒否しました。', true);
+      this.setStatus('Rejected a recording start instruction received after its scheduled start time.', true);
       this.sendRecordingAck({
         eventId: message.eventId,
         sequence: message.sequence,
@@ -875,7 +975,7 @@ export class RoomCall {
       return;
     }
     if (message.sequence <= this.lastGuestRecordingSequence) {
-      this.setStatus('古い録音状態イベントを無視しました。', true);
+      this.setStatus('Ignored an outdated recording status event.', true);
       return;
     }
     this.lastGuestRecordingSequence = message.sequence;
@@ -887,6 +987,7 @@ export class RoomCall {
       recording: message.recording,
       startAt: message.recording ? message.startAt + message.clockOffsetMs : null,
       clockOffsetMs: message.recording ? message.clockOffsetMs : null,
+      hostStartedAt: message.recording ? message.hostStartedAt ?? null : null,
       accepted: false,
       promise: null,
       resultPromise: null,
@@ -922,7 +1023,7 @@ export class RoomCall {
     if (command.promise) return command.promise;
     command.promise = Promise.resolve().then(async () => {
       if (command.recording && !this.isPeerReadyForRecording) {
-        this.setStatus('双方の録音準備と通話接続が有効でないため、録音開始を拒否しました。', true);
+        this.setStatus('Recording could not start because both devices are not ready and connected.', true);
         command.accepted = false;
         return;
       }
@@ -931,13 +1032,14 @@ export class RoomCall {
         command.recording
           ? {
             startAt: command.startAt,
+            hostStartedAt: command.hostStartedAt,
             event: { eventId: command.eventId, sequence: command.sequence }
           }
           : null
       );
       command.accepted = result !== false;
     }).catch((error) => {
-      this.setStatus(`ホストの録音状態を適用できませんでした: ${error.message}`, true);
+      this.setStatus(`Unable to apply the host recording status: ${error.message}`, true);
       command.accepted = false;
     }).finally(() => {
       command.resolveResult();
@@ -956,7 +1058,7 @@ export class RoomCall {
         accepted: command.accepted
       });
     } catch (error) {
-      this.setStatus(`録音状態の確認応答を送信できませんでした: ${error.message}`, true);
+      this.setStatus(`Unable to send the recording status acknowledgment: ${error.message}`, true);
     }
   }
 
@@ -968,7 +1070,7 @@ export class RoomCall {
     window.clearTimeout(pending.timer);
     this.pendingRecordingCommands.delete(message.eventId);
     if (message.accepted) {
-      this.setStatus(message.recording ? 'ゲストの録音開始予定を確認しました。' : 'ゲストの録音停止と保存を確認しました。');
+      this.setStatus(message.recording ? 'The guest’s scheduled recording start was confirmed.' : 'The guest’s recording stop and save were confirmed.');
       return;
     }
 
@@ -977,7 +1079,7 @@ export class RoomCall {
       if (startEvent) window.clearTimeout(startEvent.timer);
       this.pendingStartEvents.delete(message.eventId);
     }
-    this.setStatus('ゲストが録音状態を適用できませんでした。双方の録音状態を確認してください。', true);
+    this.setStatus('The guest could not apply the recording status. Check the recording status on both devices.', true);
     if (pending.recording) void this.onRecordingState?.(false);
   }
 
@@ -994,13 +1096,13 @@ export class RoomCall {
       ? [this.remoteWaveforms.get(trackId)].filter(Boolean)
       : this.remoteWaveforms.values();
     for (const waveform of waveforms) {
-      waveform.state.textContent = message;
+      waveform.state.textContent = /^(?:Waiting\b|Awaiting\b)/i.test(message) ? '' : message;
       waveform.state.classList.toggle('remote-live', active);
     }
   }
 
   async startRemoteWaveform(track, participantName) {
-    if (!window.AudioContext) throw new Error('このブラウザーでは波形表示を利用できません。');
+    if (!window.AudioContext) throw new Error('Waveform display is not available in this browser.');
     this.stopRemoteWaveform(track.id);
 
     const element = $('remoteWaveformTemplate').content.firstElementChild.cloneNode(true);
@@ -1033,7 +1135,7 @@ export class RoomCall {
     };
     resetWaveformHistory(waveform, waveformStartedAt, now);
     element.querySelector('.remote-waveform-participant').textContent = participantName;
-    waveform.canvas.setAttribute('aria-label', `${participantName}のマイク入力の波形`);
+    waveform.canvas.setAttribute('aria-label', `${participantName} microphone input waveform`);
     $('remoteWaveformTracks').append(element);
     this.remoteWaveforms.set(waveform.id, waveform);
     this.updateRemoteInputMonitor(this.remoteInputMonitorState);
@@ -1049,15 +1151,15 @@ export class RoomCall {
       waveform.source.connect(waveform.analyser);
       waveform.analyser.connect(waveform.silentGain).connect(waveform.audioContext.destination);
       this.setRemoteWaveState(
-        track.muted ? '音声待ち' : waveformStartedAt === null ? '録音待ち' : '波形準備中',
+        track.muted ? 'Waiting for audio' : waveformStartedAt === null ? 'Waiting to record' : 'Preparing waveform',
         false,
         track.id
       );
       if (waveformStartedAt !== null) this.drawRemoteWaveform(waveform);
       if (waveform.audioContext.state === 'suspended') {
         void waveform.audioContext.resume().catch((error) => {
-          this.setRemoteWaveState('波形停止', false, track.id);
-          this.setCallState(`相手の音声は接続中ですが、波形表示を開始できません: ${error.message}`);
+          this.setRemoteWaveState('Waveform stopped', false, track.id);
+          this.setCallState(`The other participant’s audio is connected, but the waveform could not start: ${error.message}`);
         });
       }
     } catch (error) {
@@ -1067,11 +1169,11 @@ export class RoomCall {
   }
 
   beginRecordingWaveform(startedAt) {
-    if (!Number.isFinite(startedAt)) throw new Error('波形の録音開始時刻が不正です。');
+    if (!Number.isFinite(startedAt)) throw new Error('The waveform recording start time is invalid.');
     this.waveformRecordingStartedAt = startedAt;
     for (const waveform of this.remoteWaveforms.values()) {
       resetWaveformHistory(waveform, startedAt, startedAt);
-      this.setRemoteWaveState(waveform.track.muted ? '音声待ち' : '波形準備中', false, waveform.id);
+      this.setRemoteWaveState(waveform.track.muted ? 'Waiting for audio' : 'Preparing waveform', false, waveform.id);
       this.drawRemoteWaveform(waveform);
     }
   }
@@ -1084,7 +1186,7 @@ export class RoomCall {
       resetWaveformHistory(waveform, null);
       const context = waveform.canvas.getContext('2d');
       if (context) context.clearRect(0, 0, waveform.canvas.width, waveform.canvas.height);
-      this.setRemoteWaveState(waveform.track.muted ? '音声待ち' : '録音待ち', false, waveform.id);
+      this.setRemoteWaveState(waveform.track.muted ? 'Waiting for audio' : 'Waiting to record', false, waveform.id);
     }
   }
 
@@ -1095,7 +1197,7 @@ export class RoomCall {
     const canvas = waveform.canvas;
     const context = canvas.getContext('2d');
     if (!context || !canvas.parentElement) {
-      this.setRemoteWaveState('波形描画エラー', false, waveform.id);
+      this.setRemoteWaveState('Waveform rendering error', false, waveform.id);
       return;
     }
     const bounds = canvas.parentElement.getBoundingClientRect();
@@ -1124,7 +1226,7 @@ export class RoomCall {
       waveform.sampledAt = now;
       this.setRemoteWaveState('LIVE', true, waveform.id);
     } else if (waveform.track.muted) {
-      this.setRemoteWaveState('音声待ち', false, waveform.id);
+      this.setRemoteWaveState('Waiting for audio', false, waveform.id);
     }
 
     if (waveform.historyCount > 0) {
@@ -1179,15 +1281,15 @@ export class RoomCall {
 
   async createRoom() {
     if (!this.getSession()) {
-      this.setStatus('先にスタジオを開いてください。', true);
+      this.setStatus('Open the studio first.', true);
       return;
     }
     if (this.getRecordingState()) {
-      this.setStatus('録音を停止して保存してから招待リンクを作成してください。', true);
+      this.setStatus('Stop and save the recording before creating an invitation link.', true);
       return;
     }
     $('createRoomButton').disabled = true;
-    this.setStatus('招待を準備しています…');
+    this.setStatus('Preparing invitation…');
     try {
       this.room = {
         roomId: randomToken(),
@@ -1205,6 +1307,7 @@ export class RoomCall {
       );
       const publicKey = toBase64Url(new Uint8Array(await crypto.subtle.exportKey('spki', this.hostKeys.publicKey)));
       this.localRole = 'host';
+      this.setSessionName(this.getSession().name);
       await this.openSocket(this.room.roomId, 'host');
       this.updateReadinessUI();
       const url = new URL(window.location.href);
@@ -1217,12 +1320,12 @@ export class RoomCall {
       $('inviteField').hidden = false;
       $('createRoomButton').hidden = true;
       $('leaveRoomButton').hidden = false;
-      $('leaveRoomButton').textContent = '招待を終了';
-      this.setStatus('招待を作成しました。リンクを相手に共有してください。');
-      this.setCallState('相手の参加申請を待っています');
-      this.setRemoteWaveState('ゲスト待ち');
+      $('leaveRoomButton').textContent = 'End Invitation';
+      this.setStatus('Invitation created. Share the link with your guest.');
+      this.setCallState('Waiting for the other participant to request access');
+      this.setRemoteWaveState('Waiting for guest');
     } catch (error) {
-      this.setStatus(`招待を作成できませんでした: ${error.message}`, true);
+      this.setStatus(`Unable to create invitation: ${error.message}`, true);
       this.resetRoomState();
     } finally {
       $('createRoomButton').disabled = false;
@@ -1232,7 +1335,7 @@ export class RoomCall {
   async requestJoin() {
     if (!this.invitation || !this.getSession()) return;
     $('joinRoomButton').disabled = true;
-    this.setStatus('マイクを確認して参加申請しています…');
+    this.setStatus('Checking microphone and requesting to join…');
     try {
       await this.getMicrophoneStream();
       this.guestIdentity = await crypto.subtle.generateKey(
@@ -1255,14 +1358,14 @@ export class RoomCall {
         publicKey,
         proof
       });
-      this.setStatus('参加申請を送りました。ホストの承認を待っています。');
-      this.setCallState('ホストの承認待ち');
-      this.setRemoteWaveState('承認待ち');
+      this.setStatus('Join request sent. Waiting for the host to approve.');
+      this.setCallState('Waiting for host approval');
+      this.setRemoteWaveState('Awaiting approval');
       $('joinRoomButton').hidden = true;
       $('leaveRoomButton').hidden = false;
-      $('leaveRoomButton').textContent = '参加申請を取り消す';
+      $('leaveRoomButton').textContent = 'Cancel Join Request';
     } catch (error) {
-      this.setStatus(`参加申請に失敗しました: ${error.message}`, true);
+      this.setStatus(`Unable to send join request: ${error.message}`, true);
       await this.leave({ keepMessage: true });
       $('joinRoomButton').disabled = false;
     }
@@ -1278,22 +1381,31 @@ export class RoomCall {
         if (settled) return;
         settled = true;
         socket.close();
-        reject(new Error('シグナリング接続がタイムアウトしました。'));
+        reject(new Error('The signaling connection timed out.'));
       }, 10000);
-      socket.addEventListener('open', () => socket.send(JSON.stringify({ type: 'join', role })), { once: true });
+      socket.addEventListener('open', () => {
+        this.logNetworkEvent('Signaling socket', 'open');
+        socket.send(JSON.stringify({ type: 'join', role }));
+        this.logNetworkEvent('Signal TX', networkMessageSummary({ type: 'join', role }));
+      }, { once: true });
       socket.addEventListener('message', (event) => {
         let message;
         try {
           message = JSON.parse(event.data);
         } catch {
+          const bytes = typeof event.data === 'string'
+            ? new TextEncoder().encode(event.data).byteLength
+            : event.data?.size ?? event.data?.byteLength ?? 0;
+          this.logNetworkEvent('Signal RX', `invalid JSON bytes=${bytes}`);
           socket.close();
           if (!settled) {
             settled = true;
             window.clearTimeout(timeout);
-            reject(new Error('シグナリング応答を読み取れませんでした。'));
+            reject(new Error('Unable to read the signaling response.'));
           }
           return;
         }
+        this.logNetworkEvent('Signal RX', networkMessageSummary(message));
         if (message.type === 'joined' && !settled) {
           settled = true;
           window.clearTimeout(timeout);
@@ -1301,27 +1413,29 @@ export class RoomCall {
         } else if (message.type === 'rejected' && !settled) {
           settled = true;
           window.clearTimeout(timeout);
-          reject(new Error(message.message || '部屋に参加できません。'));
+          reject(new Error(message.message || 'Unable to join the room.'));
         }
         void this.handleMessage(message);
       });
       socket.addEventListener('error', () => {
+        this.logNetworkEvent('Signaling socket', 'error');
         if (settled) return;
         settled = true;
         window.clearTimeout(timeout);
-        reject(new Error('シグナリングサーバーへ接続できません。HTTPSでWorkerを起動してください。'));
+        reject(new Error('Unable to connect to the signaling server. Run the Worker over HTTPS.'));
       }, { once: true });
-      socket.addEventListener('close', () => {
+      socket.addEventListener('close', (event) => {
+        this.logNetworkEvent('Signaling socket', `close code=${event.code} clean=${event.wasClean}`);
         if (!settled) {
           settled = true;
           window.clearTimeout(timeout);
-          reject(new Error('シグナリングサーバーが接続を拒否しました。'));
+          reject(new Error('The signaling server rejected the connection.'));
         } else if (this.socket === socket && this.localRole) {
           this.connected = false;
           this.localReady = false;
           this.remoteReady = false;
           this.remoteReadySequence = 0;
-          this.setCallState('接続が切れました。録音データはこの端末に保存されています。');
+          this.setCallState('Connection lost. Recording data is saved on this device.');
           this.updateReadinessUI();
         }
       });
@@ -1330,9 +1444,25 @@ export class RoomCall {
 
   send(message) {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-      throw new Error('相手とのシグナリング接続がありません。');
+      throw new Error('There is no signaling connection to the other participant.');
     }
     this.socket.send(JSON.stringify(message));
+    this.logNetworkEvent('Signal TX', networkMessageSummary(message));
+  }
+
+  setSessionName(name) {
+    if (this.isGuest || typeof name !== 'string') return;
+    this.sessionName = name.trim();
+    this.sendSessionName();
+  }
+
+  sendSessionName() {
+    if (this.localRole !== 'host' || !this.sessionName || !this.pendingGuest || !this.peerConnection) return;
+    try {
+      this.send({ type: 'session-name', name: this.sessionName });
+    } catch (error) {
+      this.onError?.(error);
+    }
   }
 
   handleMessage(message) {
@@ -1343,17 +1473,17 @@ export class RoomCall {
   async processMessage(message) {
     try {
       if (message.type === 'rejected') {
-        this.setStatus(message.message || '部屋に参加できません。', true);
+        this.setStatus(message.message || 'Unable to join the room.', true);
         return;
       }
       if (message.type === 'join-request' && this.localRole === 'host') {
         await this.receiveJoinRequest(message);
       } else if (message.type === 'approved' && this.localRole === 'guest') {
-        this.setStatus('ホストが参加を承認しました。通話を接続しています…');
-        $('leaveRoomButton').textContent = '通話を終了';
-        this.setRemoteWaveState('接続中');
+        this.setStatus('The host approved your request. Connecting the call…');
+        $('leaveRoomButton').textContent = 'End Call';
+        this.setRemoteWaveState('Connecting');
       } else if (message.type === 'denied') {
-        this.setStatus('ホストが参加申請を拒否しました。', true);
+        this.setStatus('The host declined your join request.', true);
         await this.leave({ keepMessage: true });
       } else if (message.type === 'offer' && this.localRole === 'guest') {
         await this.receiveOffer(message);
@@ -1375,6 +1505,8 @@ export class RoomCall {
         this.receiveRecordingStarted(message);
       } else if (message.type === 'transfer-progress') {
         this.receiveTransferProgress(message);
+      } else if (message.type === 'session-name' && this.localRole === 'guest') {
+        await this.receiveSessionName(message);
       } else if (message.type === 'turn-credentials') {
         this.receiveTurnCredentials(message);
       } else if (message.type === 'turn-error') {
@@ -1408,18 +1540,18 @@ export class RoomCall {
         $('guestRequestCard').hidden = true;
         $('approveGuestButton').hidden = true;
         $('denyGuestButton').hidden = true;
-        this.setRemoteWaveState('未接続');
-        this.setCallState('相手が退出しました。新しい参加申請を待っています。');
-        this.setStatus('相手との接続が終了しました。');
+        this.setRemoteWaveState('Not connected');
+        this.setCallState('The other participant left. Waiting for a new join request.');
+        this.setStatus('The connection to the other participant has ended.');
         this.updateReadinessUI();
-        $('leaveRoomButton').textContent = '招待を終了';
+        $('leaveRoomButton').textContent = 'End Invitation';
       } else if (message.type === 'ice-restart' && this.localRole === 'guest') {
         await this.answerIceRestart(message);
       } else if (message.type === 'ice-restart-answer' && this.localRole === 'host') {
         await this.receiveIceRestartAnswer(message);
       }
     } catch (error) {
-      this.setStatus(`通話を確立できませんでした: ${error.message}`, true);
+      this.setStatus(`Unable to establish the call: ${error.message}`, true);
       await this.leave({ keepMessage: true });
       this.onError?.(error);
     }
@@ -1427,7 +1559,7 @@ export class RoomCall {
 
   async requestTurnCredentials() {
     if (this.localRole !== 'host' || !this.socket || this.socket.readyState !== WebSocket.OPEN) {
-      return Promise.reject(new Error('TURN資格を要求できるシグナリング接続がありません。'));
+      return Promise.reject(new Error('There is no signaling connection to request TURN credentials.'));
     }
     if (this.pendingTurnCredentials) return this.pendingTurnCredentials.promise;
     const requestId = crypto.randomUUID();
@@ -1448,7 +1580,7 @@ export class RoomCall {
       timer: window.setTimeout(() => {
         if (this.pendingTurnCredentials !== pending) return;
         this.pendingTurnCredentials = null;
-        reject(new Error('TURN資格の発行応答がタイムアウトしました。'));
+        reject(new Error('The TURN credential request timed out.'));
       }, 10_000)
     };
     this.pendingTurnCredentials = pending;
@@ -1467,14 +1599,14 @@ export class RoomCall {
     if (!pending) return;
     window.clearTimeout(pending.timer);
     this.pendingTurnCredentials = null;
-    pending.reject(new Error('TURN資格の要求が取り消されました。'));
+    pending.reject(new Error('The TURN credential request was canceled.'));
   }
 
   receiveTurnCredentials(message) {
     if (typeof message.requestId !== 'string' ||
         !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(message.requestId) ||
         !isValidTurnIceServers(message.iceServers)) {
-      this.setStatus('シグナリングサーバーから不正なTURN資格を受け取りました。', true);
+      this.setStatus('Received invalid TURN credentials from the signaling server.', true);
       return;
     }
     const pending = this.pendingTurnCredentials;
@@ -1491,9 +1623,9 @@ export class RoomCall {
     if (pending && pending.requestId === message.requestId) {
       window.clearTimeout(pending.timer);
       this.pendingTurnCredentials = null;
-      pending.reject(new Error(message.message || 'TURN資格を発行できませんでした。'));
+      pending.reject(new Error(message.message || 'Unable to issue TURN credentials.'));
     } else if (this.localRole === 'guest') {
-      this.setStatus(`TURNを利用できないためSTUN直接接続を試します: ${message.message || '資格を発行できませんでした。'}`, true);
+      this.setStatus(`TURN is unavailable. Trying a direct STUN connection: ${message.message || 'Unable to issue credentials.'}`, true);
     }
   }
 
@@ -1518,10 +1650,10 @@ export class RoomCall {
     try {
       key = await importPublicKey(message.publicKey);
       const expected = await invitationProof(this.room.secret, this.room.roomId, message.nonce, message.publicKey, message.issuedAt);
-      if (!sameBytes(fromBase64Url(expected), fromBase64Url(message.proof))) throw new Error('招待資格が一致しません。');
+      if (!sameBytes(fromBase64Url(expected), fromBase64Url(message.proof))) throw new Error('The invitation credentials do not match.');
     } catch {
       this.send({ type: 'denied' });
-      this.setStatus('有効な招待資格を確認できない参加申請を拒否しました。', true);
+      this.setStatus('Declined a join request because valid invitation credentials could not be verified.', true);
       return;
     }
     if (this.usedNonces.has(message.nonce)) {
@@ -1533,7 +1665,7 @@ export class RoomCall {
     }
     if (this.usedNonces.size >= 128) {
       this.send({ type: 'denied' });
-      this.setStatus('参加申請の上限に達しました。この部屋を閉じて新しい招待を作成してください。', true);
+      this.setStatus('The room has reached its join request limit. Close this room and create a new invitation.');
       return;
     }
     this.usedNonces.set(message.nonce, message.issuedAt);
@@ -1547,15 +1679,15 @@ export class RoomCall {
     $('guestRequestCard').hidden = false;
     $('approveGuestButton').hidden = false;
     $('denyGuestButton').hidden = false;
-    this.setStatus('ゲストから申請が届きました。下の申請カードで名前を確認してください。');
-    this.setCallState('参加申請を確認してください');
-    this.setRemoteWaveState('承認待ち');
+    this.setStatus('A guest has requested to join. Review their name on the request card below.');
+    this.setCallState('Review the join request');
+    this.setRemoteWaveState('Awaiting approval');
   }
 
   async approveGuest() {
     if (!this.pendingGuest || !this.room || !this.hostKeys) return;
     if (this.getRecordingState()) {
-      this.setStatus('録音を停止して保存してからゲストを接続してください。', true);
+      this.setStatus('Stop and save the recording before connecting a guest.', true);
       return;
     }
     $('approveGuestButton').disabled = true;
@@ -1567,10 +1699,11 @@ export class RoomCall {
       } catch (error) {
         if (this.localRole !== 'host' || !this.pendingGuest) return;
         this.turnIceServers = null;
-        this.setStatus(`TURNを利用できないためSTUN直接接続を試します: ${error.message}`, true);
+        this.setStatus(`TURN is unavailable. Trying a direct STUN connection: ${error.message}`, true);
       }
       if (this.localRole !== 'host' || !this.pendingGuest) return;
       await this.createPeerConnection();
+      this.sendSessionName();
       const transceiver = this.peerConnection.addTransceiver('audio', { direction: 'sendrecv' });
       this.prepareOpus(transceiver);
       this.localSender = transceiver.sender;
@@ -1591,12 +1724,12 @@ export class RoomCall {
         auth: { ...this.authFields, signature }
       });
       $('guestRequestCard').hidden = true;
-      this.setStatus('ゲストを承認しました。安全な通話接続を確立しています。');
-      this.setCallState('通話を接続しています…');
-      this.setRemoteWaveState('接続中');
-      $('leaveRoomButton').textContent = '通話を終了';
+      this.setStatus('Guest approved. Establishing a secure call connection.');
+      this.setCallState('Connecting call…');
+      this.setRemoteWaveState('Connecting');
+      $('leaveRoomButton').textContent = 'End Call';
     } catch (error) {
-      this.setStatus(`参加者を承認できませんでした: ${error.message}`, true);
+      this.setStatus(`Unable to approve participant: ${error.message}`, true);
       $('approveGuestButton').disabled = false;
       $('denyGuestButton').disabled = false;
       await this.leave({ keepMessage: true });
@@ -1610,30 +1743,66 @@ export class RoomCall {
     $('guestRequestCard').hidden = true;
     $('approveGuestButton').hidden = true;
     $('denyGuestButton').hidden = true;
-    this.setStatus('参加申請を拒否しました。');
-    this.setCallState('申請を拒否しました。別の申請を待っています');
-    this.setRemoteWaveState('ゲスト待ち');
+    this.setStatus('Join request declined.');
+    this.setCallState('Request declined. Waiting for another request.');
+    this.setRemoteWaveState('Waiting for guest');
+  }
+
+  observeDataChannel(channel, createdLocally = false) {
+    const reliability = channel.ordered
+      ? 'ordered'
+      : `unordered maxRetransmits=${channel.maxRetransmits ?? 'default'} maxPacketLifeTime=${channel.maxPacketLifeTime ?? 'default'}`;
+    this.logNetworkEvent(
+      createdLocally ? 'DataChannel created' : 'DataChannel received',
+      `${String(channel.label).slice(0, 64)} ${reliability}`
+    );
+    channel.addEventListener('open', () => {
+      this.logNetworkEvent('DataChannel state', `${String(channel.label).slice(0, 64)} open`);
+    });
+    channel.addEventListener('close', () => {
+      this.logNetworkEvent('DataChannel state', `${String(channel.label).slice(0, 64)} close`);
+    });
+    channel.addEventListener('error', () => {
+      this.logNetworkEvent('DataChannel state', `${String(channel.label).slice(0, 64)} error`);
+    });
+    channel.addEventListener('message', ({ data }) => {
+      this.logNetworkEvent('DataChannel RX', `${String(channel.label).slice(0, 64)} ${dataChannelPayloadSummary(data)}`);
+    });
+    channel.addEventListener('bufferedamountlow', () => {
+      this.logNetworkEvent(
+        'DataChannel buffer',
+        `${String(channel.label).slice(0, 64)} bufferedAmount=${channel.bufferedAmount}`
+      );
+    });
   }
 
   async createPeerConnection() {
-    if (!window.RTCPeerConnection) throw new Error('このブラウザーはWebRTCに対応していません。');
+    if (!window.RTCPeerConnection) throw new Error('This browser does not support WebRTC.');
     this.recordingTransfer.setRole(this.localRole);
     this.peerConnection = new RTCPeerConnection({
       iceServers: this.turnIceServers || [{ urls: 'stun:stun.cloudflare.com:3478' }]
     });
+    this.logNetworkEvent(
+      'PeerConnection created',
+      `iceServers=${this.turnIceServers ? 'TURN' : 'STUN'}`
+    );
     if (this.localRole === 'host') {
       const channel = this.peerConnection.createDataChannel('master-transfer-v1', { ordered: true });
+      this.observeDataChannel(channel, true);
       this.recordingTransfer.setChannel(channel);
-      this.setInputMonitorChannel(this.peerConnection.createDataChannel(
+      const monitorChannel = this.peerConnection.createDataChannel(
         'input-monitor-v1',
         { ordered: false, maxRetransmits: 0 }
-      ));
+      );
+      this.observeDataChannel(monitorChannel, true);
+      this.setInputMonitorChannel(monitorChannel);
     } else {
       this.peerConnection.addEventListener('datachannel', ({ channel }) => {
+        this.observeDataChannel(channel);
         if (channel.label === 'input-monitor-v1') {
           if (channel.ordered || channel.maxRetransmits !== 0 || channel.maxPacketLifeTime !== null) {
             channel.close();
-            this.setStatus('マイクレベル同期用DataChannelを拒否しました。', true);
+            this.setStatus('Rejected the DataChannel for microphone level synchronization.', true);
             return;
           }
           this.setInputMonitorChannel(channel);
@@ -1642,45 +1811,77 @@ export class RoomCall {
         if (channel.label !== 'master-transfer-v1' || !channel.ordered ||
             channel.maxRetransmits !== null || channel.maxPacketLifeTime !== null) {
           channel.close();
-          this.setStatus('信頼性のない音源回収DataChannelを拒否しました。', true);
+          this.setStatus('Rejected the unreliable audio recovery DataChannel.', true);
           return;
         }
         this.recordingTransfer.setChannel(channel);
       });
     }
     this.peerConnection.addEventListener('icecandidate', ({ candidate }) => {
-      if (candidate && this.socket?.readyState === WebSocket.OPEN) {
-        this.send({ type: 'candidate', candidate: candidate.toJSON() });
+      if (candidate) {
+        this.logNetworkEvent('ICE candidate generated', networkMessageSummary({
+          type: 'candidate',
+          candidate: candidate.toJSON()
+        }));
+        if (this.socket?.readyState === WebSocket.OPEN) {
+          this.send({ type: 'candidate', candidate: candidate.toJSON() });
+        } else {
+          this.logNetworkEvent('ICE candidate not sent', 'signaling socket is not open');
+        }
+      } else if (!candidate) {
+        this.logNetworkEvent('ICE gathering', 'local candidates complete');
       }
     });
+    this.peerConnection.addEventListener('icecandidateerror', (event) => {
+      this.logNetworkEvent(
+        'ICE candidate error',
+        `code=${event.errorCode} address=${event.address || 'unknown'} port=${event.port || 'unknown'} ${String(event.errorText || '').slice(0, 120)}`
+      );
+    });
+    this.peerConnection.addEventListener('negotiationneeded', () => {
+      this.logNetworkEvent('PeerConnection', 'negotiationneeded');
+    });
+    this.peerConnection.addEventListener('signalingstatechange', () => {
+      this.logNetworkEvent('PeerConnection signaling state', this.peerConnection?.signalingState || 'unknown');
+    });
+    this.peerConnection.addEventListener('icegatheringstatechange', () => {
+      this.logNetworkEvent('ICE gathering state', this.peerConnection?.iceGatheringState || 'unknown');
+    });
     this.peerConnection.addEventListener('track', (event) => {
+      this.logNetworkEvent('Remote track', `kind=${event.track.kind} readyState=${event.track.readyState}`);
       const audio = $('remoteAudio');
       audio.srcObject = event.streams[0] || new MediaStream([event.track]);
       const participantName = this.localRole === 'host'
-        ? (this.pendingGuest?.name || 'ゲスト')
-        : 'ホスト';
+        ? (this.pendingGuest?.name || 'Guest')
+        : 'Host';
       void this.startRemoteWaveform(event.track, participantName).catch((error) => {
-        this.setStatus(`相手の波形を表示できませんでした: ${error.message}`, true);
+        this.setStatus(`Unable to display the other participant’s waveform: ${error.message}`, true);
       });
-      event.track.addEventListener('unmute', () => { void this.playRemoteAudio(); });
+      event.track.addEventListener('unmute', () => {
+        this.logNetworkEvent('Remote track', `kind=${event.track.kind} unmute`);
+        void this.playRemoteAudio();
+      });
       event.track.addEventListener('mute', () => {
+        this.logNetworkEvent('Remote track', `kind=${event.track.kind} mute`);
         $('playRemoteAudioButton').hidden = true;
-        this.setRemoteWaveState('音声停止', false, event.track.id);
-        this.setCallState('相手の音声が一時中断しています。相手のマイク状態を確認してください。');
+        this.setRemoteWaveState('Audio stopped', false, event.track.id);
+        this.setCallState('The other participant’s audio is temporarily paused. Check their microphone status.');
       });
       event.track.addEventListener('ended', () => {
+        this.logNetworkEvent('Remote track', `kind=${event.track.kind} ended`);
         $('playRemoteAudioButton').hidden = true;
         this.stopRemoteWaveform(event.track.id);
-        this.setCallState('相手の音声トラックが終了しました。');
+        this.setCallState('The other participant’s audio track has ended.');
       });
       if (event.track.muted) {
-        this.setCallState('通話接続を待っています。相手のマイク音声はまだ届いていません。');
+        this.setCallState('Waiting for the call connection. Audio from the other participant’s microphone has not arrived yet.');
       } else {
         void this.playRemoteAudio();
       }
     });
     this.peerConnection.addEventListener('connectionstatechange', () => {
       const state = this.peerConnection?.connectionState;
+      this.logNetworkEvent('PeerConnection state', `connection=${state || 'unknown'} ice=${this.peerConnection?.iceConnectionState || 'unknown'}`);
       this.updateReadinessUI();
       if (state === 'connected') {
         window.clearTimeout(this.disconnectTimer);
@@ -1690,22 +1891,23 @@ export class RoomCall {
         if ($('playRemoteAudioButton').hidden) {
           const track = $('remoteAudio').srcObject?.getAudioTracks().find((item) => item.readyState === 'live');
           this.setCallState(track && !track.muted
-            ? '通話中 · Opus · 相手の音声を受信しています'
-            : '通話接続済み · 相手のマイク音声を待っています');
+            ? 'On call · Opus · Receiving audio from the other participant'
+            : 'Call connected · Waiting for audio from the other participant’s microphone');
         }
       } else if (state === 'failed') {
         this.stopConnectionStats();
-        this.setCallState('接続に失敗しました。再接続またはローカル録音を続けてください。');
+        this.setCallState('Connection failed. Reconnect or continue recording locally.');
         this.scheduleIceRestart(0);
       } else if (state === 'disconnected') {
         this.stopConnectionStats();
-        this.setCallState('接続が不安定です。再接続を試しています…');
+        this.setCallState('Connection is unstable. Trying to reconnect…');
         this.scheduleIceRestart();
       } else if (state === 'connecting' || state === 'new') {
         this.stopConnectionStats();
       }
     });
     this.peerConnection.addEventListener('iceconnectionstatechange', () => {
+      this.logNetworkEvent('ICE connection state', this.peerConnection?.iceConnectionState || 'unknown');
       if (this.peerConnection?.iceConnectionState === 'disconnected') this.scheduleIceRestart();
     });
   }
@@ -1789,18 +1991,42 @@ export class RoomCall {
       }
       if (inbound?.jitter !== undefined) parts.push(`jitter ${Math.round(inbound.jitter * 1000)} ms`);
       if (intervalStats.packetLossPercent !== null) {
-        parts.push(`損失 ${intervalStats.packetLossPercent.toFixed(1)}%`);
+        parts.push(`Loss ${intervalStats.packetLossPercent.toFixed(1)}%`);
       }
       if (intervalStats.bitrateKbps !== null) {
-        parts.push(`送信 ${Math.round(intervalStats.bitrateKbps)} kbps`);
+        parts.push(`Send ${Math.round(intervalStats.bitrateKbps)} kbps`);
       }
       const stats = $('connectionStats');
       stats.hidden = false;
       stats.textContent = parts.length ? parts.join(' · ') : '—';
+      const localCandidate = pair && reports.get(pair.localCandidateId);
+      const remoteCandidate = pair && reports.get(pair.remoteCandidateId);
+      const networkDetails = [
+        `connection=${peerConnection.connectionState}`,
+        `ice=${peerConnection.iceConnectionState}`,
+        `path=${localCandidate?.candidateType || 'unknown'}/${localCandidate?.protocol || 'unknown'}→${remoteCandidate?.candidateType || 'unknown'}/${remoteCandidate?.protocol || 'unknown'}`
+      ];
+      if (pair?.currentRoundTripTime !== undefined) {
+        networkDetails.push(`rtt=${(pair.currentRoundTripTime * 1000).toFixed(2)}ms`);
+      }
+      if (inbound?.jitter !== undefined) networkDetails.push(`jitter=${(inbound.jitter * 1000).toFixed(2)}ms`);
+      if (intervalStats.packetLossPercent !== null) {
+        networkDetails.push(`loss=${intervalStats.packetLossPercent.toFixed(2)}%`);
+      }
+      if (intervalStats.bitrateKbps !== null) {
+        networkDetails.push(`audioSend=${intervalStats.bitrateKbps.toFixed(2)}kbps`);
+      }
+      if (Number.isFinite(this.transferSendMbps)) {
+        networkDetails.push(`transferSend=${this.transferSendMbps.toFixed(3)}Mbps`);
+      }
+      if (Number.isFinite(outbound?.bytesSent)) networkDetails.push(`audioBytesSent=${outbound.bytesSent}`);
+      if (Number.isFinite(inbound?.bytesReceived)) networkDetails.push(`audioBytesReceived=${inbound.bytesReceived}`);
+      this.logNetworkEvent('WebRTC stats', networkDetails.join(' '));
     } catch (error) {
       if (this.peerConnection !== peerConnection) return;
       $('connectionStats').hidden = false;
-      $('connectionStats').textContent = `接続統計を取得できません: ${error.message}`;
+      $('connectionStats').textContent = `Unable to get connection statistics: ${error.message}`;
+      this.logNetworkEvent('WebRTC stats error', error.message);
     } finally {
       this.statsRefreshInProgress = false;
     }
@@ -1810,19 +2036,19 @@ export class RoomCall {
     const codecs = RTCRtpSender.getCapabilities?.('audio')?.codecs || [];
     const opus = codecs.filter((codec) => codec.mimeType.toLowerCase() === 'audio/opus');
     if (!opus.length || !transceiver.setCodecPreferences) {
-      throw new Error('Opusの選択を確認できないため、この環境では通話を開始できません。');
+      throw new Error('Unable to verify Opus selection. A call cannot be started in this environment.');
     }
     transceiver.setCodecPreferences(opus);
   }
 
   async receiveOffer(message) {
     if (!this.invitation || !this.guestIdentity || !message.auth || typeof message.sdp !== 'string') {
-      throw new Error('認証情報を含まない通話招待を拒否しました。');
+      throw new Error('Rejected a call invitation that does not contain authentication information.');
     }
     const auth = message.auth;
     if (auth.roomId !== this.invitation.roomId || auth.guestNonce === undefined ||
         auth.guestPublicKey !== toBase64Url(new Uint8Array(await crypto.subtle.exportKey('spki', this.guestIdentity.publicKey)))) {
-      throw new Error('別の部屋または参加者向けの通話招待です。');
+      throw new Error('This call invitation is for a different room or participant.');
     }
     const hostKey = await importPublicKey(this.invitation.hostPublicKey);
     await this.createPeerConnection();
@@ -1831,10 +2057,10 @@ export class RoomCall {
     const actualHostFingerprint = fingerprintFromSdp(this.peerConnection.remoteDescription.sdp);
     if (auth.guestNonce !== this.guestNonce || auth.hostFingerprint !== actualHostFingerprint ||
         !(await verify(hostKey, auth.signature, transcript(auth)))) {
-      throw new Error('ホスト署名またはDTLS fingerprintが一致しません。');
+      throw new Error('The host signature or DTLS fingerprint does not match.');
     }
     const transceiver = this.peerConnection.getTransceivers().find((item) => item.receiver.track.kind === 'audio');
-    if (!transceiver) throw new Error('音声通話用トランシーバーがありません。');
+    if (!transceiver) throw new Error('No audio call transceiver is available.');
     this.prepareOpus(transceiver);
     transceiver.direction = 'sendrecv';
     this.localSender = transceiver.sender;
@@ -1849,12 +2075,12 @@ export class RoomCall {
       sdp: this.peerConnection.localDescription.sdp,
       auth: { ...this.authFields, signature }
     });
-    this.setStatus('応答を送信しました。DTLS認証完了までマイク音声は送信されません。');
+    this.setStatus('Response sent. Microphone audio will not be sent until DTLS authentication is complete.');
   }
 
   async receiveAnswer(message) {
     if (!this.peerConnection || !this.pendingGuest || !message.auth || typeof message.sdp !== 'string') {
-      throw new Error('認証されていない通話応答です。');
+      throw new Error('The call response is not authenticated.');
     }
     await this.peerConnection.setRemoteDescription({ type: 'answer', sdp: message.sdp });
     const auth = message.auth;
@@ -1866,7 +2092,7 @@ export class RoomCall {
         auth.guestPublicKey !== expectedFields.guestPublicKey ||
         auth.guestFingerprint !== actualGuestFingerprint ||
         !(await verify(this.pendingGuest.verifyKey, auth.signature, transcript(expectedFields)))) {
-      throw new Error('参加者署名またはDTLS fingerprintが一致しません。');
+      throw new Error('The participant signature or DTLS fingerprint does not match.');
     }
     this.authFields = expectedFields;
     this.remoteTransferProgress = null;
@@ -1875,19 +2101,19 @@ export class RoomCall {
     await this.attachLocalAudio();
     this.connected = true;
     this.recordingTransfer.wake();
-    this.setStatus('参加者の署名とDTLS fingerprintを確認しました。');
-    this.setCallState('通話を接続しています…');
+    this.setStatus('Participant signature and DTLS fingerprint verified.');
+    this.setCallState('Connecting call…');
     await this.checkLocalReadiness();
     if (this.getRecordingState()) {
       await this.onRecordingState?.(false);
-      this.setStatus('接続前からの録音を停止しました。双方の準備完了後に新しいtakeを開始してください。', true);
+      this.setStatus('Recording that started before the connection was stopped. Start a new take after both participants are ready.', true);
     }
     await this.flushCandidates();
   }
 
   async receiveAuthConfirm(message) {
     if (!this.peerConnection || !this.guestIdentity || !this.authFields || !message.auth) {
-      throw new Error('ホストの認証確認がありません。');
+      throw new Error('Host authentication is missing.');
     }
     const auth = message.auth;
     const actualHostFingerprint = fingerprintFromSdp(this.peerConnection.remoteDescription.sdp);
@@ -1897,13 +2123,13 @@ export class RoomCall {
         auth.guestFingerprint !== fingerprintFromSdp(this.peerConnection.localDescription.sdp) ||
         auth.guestPublicKey !== this.authFields.guestPublicKey ||
         !(await verify(await importPublicKey(this.invitation.hostPublicKey), auth.signature, transcript(this.authFields)))) {
-      throw new Error('ホストの署名確認またはDTLS fingerprintが一致しません。');
+      throw new Error('Host signature verification or DTLS fingerprint does not match.');
     }
     await this.attachLocalAudio();
     this.connected = true;
     this.recordingTransfer.wake();
-    this.setStatus('ホストと双方の署名・DTLS fingerprintを確認しました。');
-    this.setCallState('通話を接続しています…');
+    this.setStatus('Host and both signatures and DTLS fingerprints verified.');
+    this.setCallState('Connecting call…');
     await this.checkLocalReadiness();
     await this.applyPendingGuestRecordingCommand();
   }
@@ -1915,8 +2141,8 @@ export class RoomCall {
     this.remoteReadySequence = message.sequence;
     this.remoteReady = message.ready;
     this.updateReadinessUI();
-    if (!message.ready) this.setStatus('相手の録音準備が完了していません。相手側の表示を確認してください。', true);
-    else if (this.localReady) this.setStatus('双方の録音準備が完了しました。');
+    if (!message.ready) this.setStatus('The other participant is not ready to record. Check their status.', true);
+    else if (this.localReady) this.setStatus('Both devices are ready to record.');
   }
 
   async receiveCandidate(candidate) {
@@ -1958,7 +2184,7 @@ export class RoomCall {
   async restartIce() {
     if (this.localRole !== 'host' || !this.peerConnection) return;
     if (this.retryCount >= MAX_SIGNAL_RETRIES) {
-      this.setCallState('再接続を中断しました。通話を終了するか、録音をローカルで続けてください。');
+      this.setCallState('Reconnection was interrupted. End the call or continue recording locally.');
       return;
     }
     this.retryCount += 1;
@@ -1967,17 +2193,17 @@ export class RoomCall {
       const offer = await this.peerConnection.createOffer({ iceRestart: true });
       await this.peerConnection.setLocalDescription(offer);
       this.send({ type: 'ice-restart', sdp: this.peerConnection.localDescription.sdp });
-      this.setCallState(`再接続中 (${this.retryCount}/${MAX_SIGNAL_RETRIES})`);
+      this.setCallState(`Reconnecting (${this.retryCount}/${MAX_SIGNAL_RETRIES})`);
     } catch (error) {
-      this.setCallState(`再接続に失敗しました: ${error.message}`);
+      this.setCallState(`Unable to reconnect: ${error.message}`);
     }
   }
 
   async attachLocalAudio(replacementStream = null) {
     if (replacementStream && (!this.connected || !this.authFields)) {
-      throw new Error('認証済みの通話がありません。');
+      throw new Error('There is no authenticated call.');
     }
-    if (!this.localSender) throw new Error('送信用オーディオトラックがありません。');
+    if (!this.localSender) throw new Error('No outgoing audio track is available.');
     const stream = replacementStream ?? await this.getMicrophoneStream();
     await this.localSender.replaceTrack(stream.getAudioTracks()[0]);
     const parameters = this.localSender.getParameters();
@@ -1986,7 +2212,7 @@ export class RoomCall {
     try {
       await this.localSender.setParameters(parameters);
     } catch {
-      this.setStatus('通話は認証済みです。32 kbps上限を設定できず、ブラウザー既定値で接続しています。');
+      this.setStatus('The call is authenticated, but the 32 kbps limit could not be set. Connecting with the browser default.');
     }
     this.onLocalStream?.(stream);
   }
@@ -1995,8 +2221,8 @@ export class RoomCall {
     for (const waveform of this.remoteWaveforms.values()) {
       if (waveform.audioContext?.state === 'suspended') {
         void waveform.audioContext.resume().catch((error) => {
-          this.setRemoteWaveState('波形停止', false, waveform.id);
-          this.setCallState(`相手の音声は接続中ですが、波形表示を開始できません: ${error.message}`);
+          this.setRemoteWaveState('Waveform stopped', false, waveform.id);
+          this.setCallState(`The other participant’s audio is connected, but the waveform could not start: ${error.message}`);
         });
       }
     }
@@ -2004,32 +2230,32 @@ export class RoomCall {
     const track = audio.srcObject?.getAudioTracks().find((item) => item.readyState === 'live' && !item.muted);
     if (!track) {
       $('playRemoteAudioButton').hidden = true;
-      this.setCallState('相手の音声はまだ届いていません。相手のマイクと通話状態を確認してください。');
+      this.setCallState('Audio from the other participant has not arrived yet. Check their microphone and call status.');
       return;
     }
     try {
       await audio.play();
       $('playRemoteAudioButton').hidden = true;
-      this.setCallState('通話中 · 相手の音声を再生しています');
+      this.setCallState('On call · Playing audio from the other participant');
     } catch (error) {
       if (error.name === 'NotAllowedError') {
         $('playRemoteAudioButton').hidden = false;
-        this.setCallState('相手の音声は届いていますが、自動再生が制限されています。「音声の再生を許可」を押してください。');
+        this.setCallState('Audio from the other participant is available, but autoplay is restricted. Select “Allow Audio Playback.”');
         return;
       }
       $('playRemoteAudioButton').hidden = true;
-      this.setCallState(`相手の音声を再生できません: ${error.message}`);
+      this.setCallState(`Unable to play audio from the other participant: ${error.message}`);
     }
   }
 
   async copyInvite() {
     try {
       await navigator.clipboard.writeText($('inviteUrl').value);
-      this.setStatus('招待リンクをコピーしました。相手だけに共有してください。');
+      this.setStatus('Invitation link copied. Share it only with the intended participant.');
     } catch {
       $('inviteUrl').focus();
       $('inviteUrl').select();
-      this.setStatus('自動コピーできませんでした。選択されたリンクをコピーしてください。', true);
+      this.setStatus('Unable to copy automatically. Copy the selected link.', true);
     }
   }
 
@@ -2073,7 +2299,7 @@ export class RoomCall {
     this.remoteReadySequence = 0;
     $('remoteAudio').srcObject = null;
     this.stopRemoteWaveform();
-    this.setRemoteWaveState('未接続');
+    this.setRemoteWaveState('Not connected');
     $('leaveRoomButton').hidden = true;
     $('guestRequestCard').hidden = true;
     $('approveGuestButton').hidden = true;
@@ -2090,14 +2316,14 @@ export class RoomCall {
     await this.releaseMicrophone();
     this.onLocalStream?.(null);
     if (previousRole === 'host') this.resetRoomState();
-    this.setCallState('通話は未接続です');
+    this.setCallState('Call is not connected');
     this.updateReadinessUI();
     if (!keepMessage) {
       const message = previousRole === 'guest' && !wasConnected
-        ? '参加申請を取り消しました。'
+        ? 'Join request canceled.'
         : previousRole === 'host' && !wasConnected
-          ? '招待を終了しました。'
-          : '通話を終了しました。ローカル録音データはこの端末に残っています。';
+          ? 'Invitation ended.'
+          : 'Call ended. Local recordings remain on this device.';
       this.setStatus(message);
     }
   }
@@ -2106,12 +2332,12 @@ export class RoomCall {
     if (this.localRole === 'guest' && this.hasPendingTransfer) {
       try {
         if (await this.hasPendingTransfer(this.authFields?.generation) &&
-            !window.confirm('ホスト保存を確認できていない音源があります。退出すると音源はこの端末にだけ残り、録音中転送は停止します。退出しますか？')) {
+            !window.confirm('Some audio has not been confirmed as saved on the host. If you leave, it will remain only on this device and transfers in progress will stop. Leave anyway?')) {
           return;
         }
       } catch (error) {
-        this.setStatus(`ホスト保存状態を確認できませんでした: ${error.message}`, true);
-        if (!window.confirm('ホスト保存状態が不明です。ローカル音源だけが残る可能性があります。それでも退出しますか？')) {
+        this.setStatus(`Unable to verify save status on the host: ${error.message}`, true);
+        if (!window.confirm('The host save status is unknown. Audio may remain only on this device. Leave anyway?')) {
           return;
         }
       }
