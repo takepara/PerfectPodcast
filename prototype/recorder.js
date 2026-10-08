@@ -103,6 +103,8 @@ let cleanupRecordingTrackMonitor = null;
 let switchingMicrophone = false;
 let detectingDevices = false;
 let deletingSession = false;
+let participantNameEdited = false;
+const selectedSessionIds = new Set();
 
 const requestResult = (request) => new Promise((resolve, reject) => {
   request.addEventListener('success', () => resolve(request.result), { once: true });
@@ -207,6 +209,13 @@ function updateRecordButtonAvailability() {
   }
   recordButton.disabled = sessionLimitReached || recording || starting || finalizing || switchingMicrophone ||
     Boolean(roomCall?.isActive && !roomCall.isGuest && !roomCall.canStartRecording);
+}
+
+function guestTakesAreStored(takes) {
+  return takes.every((take) =>
+    !take.remote && Boolean(take.transferGeneration) &&
+    take.status !== 'recording' && take.hostStored === true
+  );
 }
 
 function clearRecordingTrackMonitor() {
@@ -462,30 +471,38 @@ async function persistSession(session) {
   await done;
 }
 
-async function deleteSessionAndRecordings(sessionId) {
+async function deleteSessionsAndRecordings(sessionIds) {
+  const uniqueSessionIds = [...new Set(sessionIds)];
   const transaction = database.transaction(['sessions', 'takes', 'chunks'], 'readwrite');
   const done = transactionComplete(transaction);
   const takes = transaction.objectStore('takes');
   const chunks = transaction.objectStore('chunks').index('takeId');
-  transaction.objectStore('sessions').delete(sessionId);
-  const takeRequest = takes.index('sessionId').openCursor(IDBKeyRange.only(sessionId));
-  takeRequest.addEventListener('error', () => transaction.abort(), { once: true });
-  takeRequest.addEventListener('success', () => {
-    const takeCursor = takeRequest.result;
-    if (!takeCursor) return;
-    const takeId = takeCursor.primaryKey;
-    takes.delete(takeId);
-    const chunkRequest = chunks.openCursor(IDBKeyRange.only(takeId));
-    chunkRequest.addEventListener('error', () => transaction.abort(), { once: true });
-    chunkRequest.addEventListener('success', () => {
-      const chunkCursor = chunkRequest.result;
-      if (!chunkCursor) return;
-      chunkCursor.delete();
-      chunkCursor.continue();
+  const sessionStore = transaction.objectStore('sessions');
+  for (const sessionId of uniqueSessionIds) {
+    sessionStore.delete(sessionId);
+    const takeRequest = takes.index('sessionId').openCursor(IDBKeyRange.only(sessionId));
+    takeRequest.addEventListener('error', () => transaction.abort(), { once: true });
+    takeRequest.addEventListener('success', () => {
+      const takeCursor = takeRequest.result;
+      if (!takeCursor) return;
+      const takeId = takeCursor.primaryKey;
+      takes.delete(takeId);
+      const chunkRequest = chunks.openCursor(IDBKeyRange.only(takeId));
+      chunkRequest.addEventListener('error', () => transaction.abort(), { once: true });
+      chunkRequest.addEventListener('success', () => {
+        const chunkCursor = chunkRequest.result;
+        if (!chunkCursor) return;
+        chunkCursor.delete();
+        chunkCursor.continue();
+      });
+      takeCursor.continue();
     });
-    takeCursor.continue();
-  });
+  }
   await done;
+}
+
+async function deleteSessionAndRecordings(sessionId) {
+  await deleteSessionsAndRecordings([sessionId]);
 }
 
 async function persistTake(take) {
@@ -585,23 +602,53 @@ async function prepareTransferChunk(takeId, sequence, sha256) {
 }
 
 async function markTransferChunkStored(takeId, sequence, sha256) {
-  const transaction = database.transaction('chunks', 'readwrite');
+  const transaction = database.transaction(['chunks', 'takes'], 'readwrite');
   const done = transactionComplete(transaction);
-  const store = transaction.objectStore('chunks');
-  const request = store.get([takeId, sequence]);
+  const chunks = transaction.objectStore('chunks');
+  const takes = transaction.objectStore('takes');
+  const chunkRequest = chunks.get([takeId, sequence]);
+  const takeRequest = takes.get(takeId);
+  let chunkLoaded = false;
+  let takeLoaded = false;
+  let chunk;
+  let take;
   let newlyStoredChunk = null;
-  request.addEventListener('success', () => {
-    const chunk = request.result;
-    if (!chunk) {
+  const persistConfirmation = () => {
+    if (!chunkLoaded || !takeLoaded) return;
+    if (!take) {
       transaction.abort();
       return;
     }
-    if (chunk.sha256 && chunk.sha256 !== sha256) {
+    const confirmedChunks = Array.isArray(take.hostStoredChunks) ? [...take.hostStoredChunks] : [];
+    const existingConfirmation = confirmedChunks.find((item) => item.sequence === sequence);
+    if (existingConfirmation) {
+      if (existingConfirmation.sha256 !== sha256) transaction.abort();
+      return;
+    }
+    if (!chunk || (chunk.sha256 && chunk.sha256 !== sha256)) {
       transaction.abort();
       return;
     }
-    if (!chunk.hostStored) newlyStoredChunk = chunk;
-    store.put({ ...chunk, hostStored: true, sha256 });
+    newlyStoredChunk = chunk;
+    confirmedChunks.push({
+      sequence,
+      sha256,
+      bytes: chunk.byteLength ?? chunk.wav?.size ?? 0,
+      frames: chunk.frames
+    });
+    confirmedChunks.sort((left, right) => left.sequence - right.sequence);
+    takes.put({ ...take, hostStoredChunks: confirmedChunks });
+    chunks.delete([takeId, sequence]);
+  };
+  chunkRequest.addEventListener('success', () => {
+    chunk = chunkRequest.result;
+    chunkLoaded = true;
+    persistConfirmation();
+  }, { once: true });
+  takeRequest.addEventListener('success', () => {
+    take = takeRequest.result;
+    takeLoaded = true;
+    persistConfirmation();
   }, { once: true });
   await done;
   if (newlyStoredChunk?.transferGeneration) {
@@ -642,13 +689,36 @@ async function getTransferInventory(generation) {
   transferProgressCache = null;
   const range = IDBKeyRange.only(generation);
   if (roomCall?.localRole === 'guest') {
-    const chunks = await findIndexValues('chunks', 'transferGeneration', range, (chunk) =>
+    const chunkItems = await findIndexValues('chunks', 'transferGeneration', range, (chunk) =>
       chunk.transferGeneration === generation && !chunk.remote && Boolean(chunk.sha256),
     (chunk) => ({ kind: 'chunk', takeId: chunk.takeId, sequence: chunk.sequence, sha256: chunk.sha256 }));
-    const takes = await findIndexValues('takes', 'transferGeneration', IDBKeyRange.only(generation), (take) =>
-      !take.remote && take.status !== 'recording' && take.frames > 0 && take.chunks > 0,
-    (take) => ({ kind: 'manifest', takeId: take.id }));
-    return [...chunks, ...takes];
+    const takes = await findIndexValues('takes', 'transferGeneration', range, (take) =>
+      take.transferGeneration === generation && !take.remote);
+    const chunkItemsByKey = new Map(chunkItems.map((item) =>
+      [`${item.takeId}:${item.sequence}`, item]));
+    for (const take of takes) {
+      for (const item of take.hostStoredChunks || []) {
+        if (!Number.isSafeInteger(item.sequence) || item.sequence < 0 ||
+            !/^[0-9a-f]{64}$/u.test(item.sha256 || '')) {
+          throw new Error(`take ${take.id} の送信済みチャンク台帳が不正です。`);
+        }
+        const key = `${take.id}:${item.sequence}`;
+        const existing = chunkItemsByKey.get(key);
+        if (existing && existing.sha256 !== item.sha256) {
+          throw new Error(`take ${take.id} のチャンク ${item.sequence + 1} で保存hashが一致しません。`);
+        }
+        chunkItemsByKey.set(key, {
+          kind: 'chunk',
+          takeId: take.id,
+          sequence: item.sequence,
+          sha256: item.sha256
+        });
+      }
+    }
+    const manifests = takes
+      .filter((take) => take.status !== 'recording' && take.frames > 0 && take.chunks > 0)
+      .map((take) => ({ kind: 'manifest', takeId: take.id }));
+    return [...chunkItemsByKey.values(), ...manifests];
   }
   if (roomCall?.localRole !== 'host') throw new Error('この端末は転送inventoryのホストではありません。');
   const takes = await findIndexValues('takes', 'transferGeneration', IDBKeyRange.only(generation), (take) =>
@@ -729,6 +799,23 @@ async function getTransferInventory(generation) {
 async function reconcileGuestTransferInventory(generation, hostItems) {
   const localItems = await getTransferInventory(generation);
   const reconciled = reconcileTransferInventory(localItems, hostItems);
+  const hostChunkKeys = new Set(hostItems
+    .filter((item) => item.kind === 'chunk')
+    .map((item) => `${item.takeId}:${item.sequence}`));
+  const confirmedChunks = await findIndexValues(
+    'takes',
+    'transferGeneration',
+    IDBKeyRange.only(generation),
+    (take) => !take.remote && Array.isArray(take.hostStoredChunks) && take.hostStoredChunks.length > 0,
+    (take) => take.hostStoredChunks.map((item) => ({ takeId: take.id, ...item }))
+  );
+  for (const chunks of confirmedChunks) {
+    for (const chunk of chunks) {
+      if (!hostChunkKeys.has(`${chunk.takeId}:${chunk.sequence}`)) {
+        throw new Error(`ホストに保存済みのチャンク ${chunk.sequence + 1} が見つかりません。ゲスト端末では削除済みのため再送できません。`);
+      }
+    }
+  }
   const chunkStates = new Map(reconciled.chunks.map((item) =>
     [`${item.takeId}:${item.sequence}`, item.hostStored]));
   const manifestStates = new Map(reconciled.manifests.map((item) =>
@@ -760,6 +847,11 @@ async function reconcileGuestTransferInventory(generation, hostItems) {
     cursor.continue();
   });
   await done;
+  for (const chunk of reconciled.chunks) {
+    if (chunk.hostStored) {
+      await markTransferChunkStored(chunk.takeId, chunk.sequence, chunk.sha256);
+    }
+  }
   transferProgressCache = null;
 }
 
@@ -805,11 +897,37 @@ async function getTransferProgress(generation) {
     (chunk) => chunk.transferGeneration === generation &&
       (role === 'guest' ? !chunk.remote : chunk.remote),
     (chunk) => ({
+      takeId: chunk.takeId,
+      sequence: chunk.sequence,
       bytes: chunk.byteLength ?? chunk.wav?.size,
       frames: chunk.frames,
       hostStored: chunk.hostStored === true
     })
   );
+  if (role === 'guest') {
+    const takesWithStoredChunks = await findIndexValues(
+      'takes',
+      'transferGeneration',
+      range,
+      (take) => take.transferGeneration === generation && !take.remote &&
+        Array.isArray(take.hostStoredChunks) && take.hostStoredChunks.length > 0
+    );
+    const chunkKeys = new Set(chunks.map((chunk) => `${chunk.takeId}:${chunk.sequence}`));
+    for (const take of takesWithStoredChunks) {
+      for (const chunk of take.hostStoredChunks) {
+        const key = `${take.id}:${chunk.sequence}`;
+        if (chunkKeys.has(key)) continue;
+        chunks.push({
+          takeId: take.id,
+          sequence: chunk.sequence,
+          bytes: chunk.bytes,
+          frames: chunk.frames,
+          hostStored: true
+        });
+        chunkKeys.add(key);
+      }
+    }
+  }
   const takes = role === 'host'
     ? await findIndexValues(
       'takes',
@@ -1181,13 +1299,37 @@ function scheduleTakeRefresh() {
 async function refreshSessionList() {
   const sessions = (await loadAll('sessions')).sort((left, right) => right.createdAt - left.createdAt);
   const takes = await loadAll('takes');
+  const takesBySession = new Map();
+  for (const take of takes) {
+    const sessionTakes = takesBySession.get(take.sessionId) || [];
+    sessionTakes.push(take);
+    takesBySession.set(take.sessionId, sessionTakes);
+  }
+  const guestMode = roomCall?.isGuest === true;
+  const visibleSessions = guestMode
+    ? sessions.filter((session) => isGuestLocalSession(session, takesBySession.get(session.id) || []))
+    : sessions;
+  const visibleSessionIds = new Set(visibleSessions.map((session) => session.id));
+  for (const sessionId of selectedSessionIds) {
+    if (!visibleSessionIds.has(sessionId)) selectedSessionIds.delete(sessionId);
+  }
+  const deleteSelectedSessionsButton = $('deleteSelectedSessionsButton');
+  deleteSelectedSessionsButton.hidden = visibleSessions.length === 0;
+  deleteSelectedSessionsButton.disabled = deletingSession || Boolean(activeSession) ||
+    Boolean(roomCall?.isActive) || selectedSessionIds.size === 0;
+  deleteSelectedSessionsButton.textContent = 'セッション削除';
+  deleteSelectedSessionsButton.title = guestMode
+    ? '未保存の録音を選択して削除すると、この端末だけにある音源も失われます。'
+    : '';
   sessionList.replaceChildren();
-  if (!sessions.length) {
-    sessionList.innerHTML = '<p class="empty-state">保存済みのセッションはありません。</p>';
+  if (!visibleSessions.length) {
+    sessionList.innerHTML = guestMode
+      ? '<p class="empty-state">この端末に保存されたゲスト録音はありません。</p>'
+      : '<p class="empty-state">保存済みのセッションはありません。</p>';
     return;
   }
-  for (const session of sessions) {
-    const sessionTakes = takes.filter((take) => take.sessionId === session.id);
+  for (const session of visibleSessions) {
+    const sessionTakes = takesBySession.get(session.id) || [];
     const row = document.createElement('div');
     row.className = 'session-entry';
     const info = document.createElement('div');
@@ -1198,15 +1340,87 @@ async function refreshSessionList() {
     const meta = document.createElement('p');
     meta.className = 'session-entry-meta';
     const totalBytes = sessionTakes.reduce((sum, take) => sum + (take.bytes || 0), 0);
-    meta.textContent = `${session.participant} · ${sessionTakes.length} take · ${formatBytes(totalBytes)}`;
-    const openButton = document.createElement('button');
-    openButton.className = 'session-open';
-    openButton.type = 'button';
-    openButton.textContent = '開く →';
-    openButton.addEventListener('click', () => { void openSession(session); });
+    const stored = guestTakesAreStored(sessionTakes);
+    meta.textContent = guestMode
+      ? `${session.participant} · ${sessionTakes.length} take · ${formatBytes(totalBytes)} · ${stored ? 'ホスト保存済み' : '未保存分あり'}`
+      : `${session.participant} · ${sessionTakes.length} take · ${formatBytes(totalBytes)}`;
     info.append(name, meta);
-    row.append(info, openButton);
+    const selectionLabel = document.createElement('label');
+    selectionLabel.className = 'session-selection';
+    const selection = document.createElement('input');
+    selection.type = 'checkbox';
+    selection.checked = selectedSessionIds.has(session.id);
+    selection.setAttribute('aria-label', `${session.name} を削除対象に選択`);
+    selection.addEventListener('change', () => {
+      if (selection.checked) selectedSessionIds.add(session.id);
+      else selectedSessionIds.delete(session.id);
+      deleteSelectedSessionsButton.disabled = deletingSession || Boolean(activeSession) ||
+        Boolean(roomCall?.isActive) || selectedSessionIds.size === 0;
+    });
+    selectionLabel.append(selection);
+    if (guestMode) {
+      row.append(selectionLabel, info);
+    } else {
+      const openButton = document.createElement('button');
+      openButton.className = 'session-open';
+      openButton.type = 'button';
+      openButton.textContent = '開く →';
+      openButton.addEventListener('click', () => { void openSession(session); });
+      row.append(selectionLabel, info, openButton);
+    }
     sessionList.append(row);
+  }
+}
+
+function isGuestLocalSession(session, takes) {
+  return session.guestSession === true ||
+    takes.some((take) => !take.remote && Boolean(take.transferGeneration));
+}
+
+async function deleteSelectedSessions() {
+  if (deletingSession || activeSession || roomCall?.isActive) return;
+  deletingSession = true;
+  try {
+    const sessions = await loadAll('sessions');
+    const takes = await loadAll('takes');
+    const takesBySession = new Map();
+    for (const take of takes) {
+      const sessionTakes = takesBySession.get(take.sessionId) || [];
+      sessionTakes.push(take);
+      takesBySession.set(take.sessionId, sessionTakes);
+    }
+    const guestMode = roomCall?.isGuest === true;
+    const selectedSessions = sessions
+      .filter((session) => selectedSessionIds.has(session.id) &&
+        (!guestMode || isGuestLocalSession(session, takesBySession.get(session.id) || [])))
+      .sort((left, right) => left.name.localeCompare(right.name));
+    if (!selectedSessions.length) {
+      $('statusMessage').textContent = '削除するセッションを選択してください。';
+      return;
+    }
+    const unconfirmedCount = selectedSessions.filter((session) =>
+      !guestTakesAreStored(takesBySession.get(session.id) || [])).length;
+    const selectedIds = selectedSessions
+      .map((session) => session.id);
+    const warning = guestMode && unconfirmedCount > 0
+      ? `\n\n選択した${unconfirmedCount}セッションにはホスト未保存の音源があります。削除するとこの端末だけにある音源も失われ、復元できません。`
+      : '';
+    const prompt = guestMode
+      ? `選択した${selectedIds.length}セッションのゲスト録音をこの端末から一括削除します。ホストに保存済みの音源は削除されません。${warning}\n\nこの操作は取り消せません。`
+      : `選択した${selectedIds.length}セッションと、それらに保存された録音・受信音声を一括削除します。この操作は取り消せません。`;
+    if (!window.confirm(prompt)) return;
+    await deleteSessionsAndRecordings(selectedIds);
+    for (const sessionId of selectedIds) selectedSessionIds.delete(sessionId);
+    $('statusMessage').textContent = '';
+  } catch (error) {
+    $('statusMessage').textContent = `選択したセッションを一括削除できませんでした: ${error.message}`;
+  } finally {
+    deletingSession = false;
+    try {
+      await refreshSessionList();
+    } catch (error) {
+      $('statusMessage').textContent = `セッション一覧を更新できませんでした: ${error.message}`;
+    }
   }
 }
 
@@ -1294,10 +1508,9 @@ async function openSession(session) {
 async function deleteActiveSession() {
   const session = activeSession;
   if (!session || roomCall?.isGuest || $('deleteSessionButton').disabled) return;
-  const confirmed = window.confirm(
+  if (!window.confirm(
     `「${session.name}」と、このセッションに保存された録音・受信音声をすべて削除します。この操作は取り消せません。`
-  );
-  if (!confirmed) return;
+  )) return;
 
   deletingSession = true;
   updateRecordButtonAvailability();
@@ -1334,7 +1547,7 @@ async function detectDevices(requestPermission = true) {
   updateRecordButtonAvailability();
   button.disabled = true;
   button.textContent = '確認中…';
-  $('setupMessage').textContent = '';
+  $('statusMessage').textContent = '';
   try {
     if (!navigator.mediaDevices?.enumerateDevices) throw new Error('デバイス一覧を取得できません。HTTPS または localhost で開いてください。');
     if (requestPermission) {
@@ -1349,23 +1562,19 @@ async function detectDevices(requestPermission = true) {
     micDevice.replaceChildren();
     if (!microphones.length) {
       micDevice.add(new Option('マイクが見つかりません', ''));
-      $('setupMessage').textContent = '利用可能なマイクが見つかりませんでした。';
+      $('statusMessage').textContent = '利用可能なマイクが見つかりませんでした。';
     } else {
       for (const [index, device] of microphones.entries()) {
         micDevice.add(new Option(device.label || `マイク ${index + 1}`, device.deviceId));
       }
       if (microphones.some((device) => device.deviceId === selectedDevice)) micDevice.value = selectedDevice;
-      const labelsVisible = microphones.every((device) => device.label);
-      $('setupMessage').textContent = labelsVisible
-        ? `${microphones.length} 台のマイクを検出しました。`
-        : `${microphones.length} 台のマイクを検出しました。名前を表示するには「デバイスを検出」を押してください。`;
     }
     if (selectedDevice && !microphones.some((device) => device.deviceId === selectedDevice) && mediaStream) {
       micDevice.add(new Option(`${selectedLabel || '選択中のマイク'}（未接続）`, selectedDevice));
       micDevice.value = selectedDevice;
     }
   } catch (error) {
-    $('setupMessage').textContent = error.name === 'NotAllowedError'
+    $('statusMessage').textContent = error.name === 'NotAllowedError'
       ? 'マイクの使用が許可されませんでした。ブラウザーのサイト設定を確認してください。'
       : `デバイスを検出できませんでした: ${error.message}`;
   } finally {
@@ -1492,13 +1701,21 @@ async function commitChunk(samples, isFinal, startFrame) {
     const transaction = database.transaction(['chunks', 'takes'], 'readwrite');
     const done = transactionComplete(transaction);
     transaction.objectStore('chunks').put(chunk);
-    const take = { ...activeTake };
-    take.frames += samples.length;
-    take.chunks += 1;
-    take.bytes += wav.size;
-    transaction.objectStore('takes').put(take);
+    const nextTake = { ...activeTake };
+    nextTake.frames += samples.length;
+    nextTake.chunks += 1;
+    nextTake.bytes += wav.size;
+    let committedTake;
+    const storedTakeRequest = transaction.objectStore('takes').get(activeTake.id);
+    storedTakeRequest.addEventListener('success', () => {
+      committedTake = {
+        ...nextTake,
+        hostStoredChunks: storedTakeRequest.result?.hostStoredChunks || []
+      };
+      transaction.objectStore('takes').put(committedTake);
+    }, { once: true });
     await done;
-    activeTake = take;
+    activeTake = committedTake;
   }).catch((error) => {
     commitError = error;
     throw error;
@@ -2026,7 +2243,7 @@ setupForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const participant = participantNameInput.value.trim();
   if (!participant || !micDevice.value) {
-    $('setupMessage').textContent = '名前と録音マイクを指定してください。';
+    $('statusMessage').textContent = '名前と録音マイクを指定してください。';
     return;
   }
   const createdAt = Date.now();
@@ -2037,18 +2254,28 @@ setupForm.addEventListener('submit', async (event) => {
     minute: '2-digit',
     hour12: false
   });
-  const session = { id: crypto.randomUUID(), name: `収録 ${sessionName}`, participant, createdAt };
+  const session = {
+    id: crypto.randomUUID(),
+    name: `収録 ${sessionName}`,
+    participant,
+    createdAt,
+    guestSession: roomCall?.isGuest === true
+  };
   try {
     await persistSession(session);
     activeSession = session;
     await openSession(session);
   } catch (error) {
-    $('setupMessage').textContent = `セッションを保存できませんでした: ${error.message}`;
+    $('statusMessage').textContent = `セッションを保存できませんでした: ${error.message}`;
   }
 });
 
+participantNameInput.addEventListener('beforeinput', () => {
+  participantNameEdited = true;
+});
 $('detectDevices').addEventListener('click', () => { void detectDevices(); });
 $('deleteSessionButton').addEventListener('click', () => { void deleteActiveSession(); });
+$('deleteSelectedSessionsButton').addEventListener('click', () => { void deleteSelectedSessions(); });
 micDevice.addEventListener('change', () => { trackMicDevice.value = micDevice.value; updateRecordButtonAvailability(); });
 trackMicDevice.addEventListener('change', () => { void changeMicrophone(); });
 $('microphoneMuteButton').addEventListener('click', toggleMicrophoneMute);
@@ -2095,7 +2322,7 @@ async function initialize() {
     try {
       authSession = await getHostSession();
     } catch (error) {
-      $('setupMessage').textContent = `ホスト認証を確認できません: ${error.message}`;
+      $('statusMessage').textContent = `ホスト認証を確認できません: ${error.message}`;
       setupForm.querySelector('button[type="submit"]').disabled = true;
       return;
     }
@@ -2105,23 +2332,23 @@ async function initialize() {
       return;
     }
     void getHostDisplayName(authSession).then((name) => {
-      if (name && !participantNameInput.value.trim() && !activeSession) participantNameInput.value = name;
+      if (name && !participantNameEdited && !activeSession) participantNameInput.value = name;
     });
     $('logoutButton').hidden = false;
     $('logoutButton').addEventListener('click', async () => {
       if (recording || finalizing) {
-        $('setupMessage').textContent = '録音を停止して保存してからログアウトしてください。';
+        $('statusMessage').textContent = '録音を停止して保存してからログアウトしてください。';
         return;
       }
       if (roomCall?.isActive) {
-        $('setupMessage').textContent = '通話または招待を終了してからログアウトしてください。';
+        $('statusMessage').textContent = '通話または招待を終了してからログアウトしてください。';
         return;
       }
       $('logoutButton').disabled = true;
       try {
         await signOut(await getAuth0Client());
       } catch (error) {
-        $('setupMessage').textContent = `ログアウトできません: ${error.message}`;
+        $('statusMessage').textContent = `ログアウトできません: ${error.message}`;
         $('logoutButton').disabled = false;
       }
     });
@@ -2170,7 +2397,7 @@ async function initialize() {
       });
     }, 1000);
   } catch (error) {
-    $('setupMessage').textContent = `ローカル保存を初期化できませんでした: ${error.message}`;
+    $('statusMessage').textContent = `ローカル保存を初期化できませんでした: ${error.message}`;
     setupForm.querySelector('button[type="submit"]').disabled = true;
   }
 }

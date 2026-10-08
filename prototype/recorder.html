@@ -21,15 +21,13 @@
     </header>
 
     <section id="setupView" class="view">
-      <h1 class="visually-hidden">収録の準備</h1>
+      <h1 class="visually-hidden">スタジオ</h1>
       <div class="setup-grid">
         <form id="setupForm" class="panel setup-panel">
-          <div class="panel-heading">
-            <h2 id="setupFormTitle">収録の準備</h2>
-          </div>
+          <div class="panel-heading" aria-hidden="true"></div>
           <label class="field">
             <span id="participantNameLabel">あなたの名前</span>
-            <input id="participantName" name="participantName" maxlength="60" placeholder="例：山田 花子" required>
+            <input id="participantName" name="participantName" maxlength="60" placeholder="例：山田 花子" autocomplete="off" required>
           </label>
           <div class="device-row">
             <label class="field">
@@ -38,12 +36,14 @@
             </label>
             <button id="detectDevices" class="button button-quiet device-action" type="button">デバイスを検出</button>
           </div>
-          <p id="setupMessage" class="inline-message" role="status"></p>
+          <p id="statusMessage" class="inline-message" role="status"></p>
           <button id="openStudioButton" class="button button-primary" type="submit">スタジオを開く</button>
         </form>
-        <aside id="recentPanel" class="panel recent-panel">
+        <aside id="recentPanel" class="panel recent-panel" aria-label="セッション一覧">
           <div class="panel-heading compact">
-            <h2>保存したセッション</h2>
+            <button id="deleteSelectedSessionsButton" class="button button-danger session-bulk-delete" type="button" hidden>
+              セッション削除
+            </button>
           </div>
           <div id="sessionList" class="session-list">
             <p class="empty-state">保存済みのセッションはありません。</p>

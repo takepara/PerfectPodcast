@@ -4,14 +4,20 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { clearHostProfile, profileDisplayName, readHostProfile, saveHostProfile } from '../src/auth-profile.js';
 
-test('autofills an empty setup field without overwriting typed names or an open session', async () => {
+test('autofills Auth0 name unless the user edited the field or opened a session', async () => {
   const source = readFileSync(new URL('../prototype/recorder.js', import.meta.url), 'utf8');
+  assert.match(source, /participantNameInput\.addEventListener\('beforeinput'/);
   const start = source.indexOf('    void getHostDisplayName(authSession)');
   const autofill = source.slice(start, source.indexOf("    $('logoutButton').hidden", start));
-  for (const [value, activeSession, expected] of [['', null, 'Host'], ['Custom', null, 'Custom'], ['', {}, '']]) {
+  for (const [value, participantNameEdited, activeSession, expected] of [
+    ['', false, null, 'Host'],
+    ['Custom', true, null, 'Custom'],
+    ['Browser Autofill', false, null, 'Host'],
+    ['', false, {}, '']
+  ]) {
     const context = vm.createContext({
       getHostDisplayName: async () => 'Host', authSession: { sub: 'host' },
-      participantNameInput: { value }, activeSession
+      participantNameInput: { value }, participantNameEdited, activeSession
     });
     vm.runInContext(autofill, context);
     await Promise.resolve();

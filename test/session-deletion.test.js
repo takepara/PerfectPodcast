@@ -5,7 +5,7 @@ import vm from 'node:vm';
 
 const recorderSource = readFileSync(new URL('../prototype/recorder.js', import.meta.url), 'utf8');
 const deleteFunction = recorderSource.slice(
-  recorderSource.indexOf('async function deleteSessionAndRecordings(sessionId)'),
+  recorderSource.indexOf('async function deleteSessionsAndRecordings(sessionIds)'),
   recorderSource.indexOf('async function persistTake(take)')
 );
 
@@ -101,4 +101,33 @@ test('deletes a session and all its takes and chunks without affecting other ses
   assert.deepEqual(data.sessions, [{ id: 'session-b' }]);
   assert.deepEqual(data.takes, [{ id: 'take-b1', sessionId: 'session-b' }]);
   assert.deepEqual(data.chunks, [{ takeId: 'take-b1', sequence: 0 }]);
+});
+
+test('deletes multiple sessions and all their recordings in one transaction', async () => {
+  const data = {
+    sessions: [{ id: 'session-a' }, { id: 'session-b' }, { id: 'session-c' }],
+    takes: [
+      { id: 'take-a1', sessionId: 'session-a' },
+      { id: 'take-b1', sessionId: 'session-b' },
+      { id: 'take-c1', sessionId: 'session-c' }
+    ],
+    chunks: [
+      { takeId: 'take-a1', sequence: 0 },
+      { takeId: 'take-b1', sequence: 0 },
+      { takeId: 'take-c1', sequence: 0 }
+    ]
+  };
+  const context = vm.createContext({
+    database: { transaction: () => new FakeTransaction(data) },
+    transactionComplete: (tx) => new Promise((resolve, reject) => {
+      tx.addEventListener('complete', resolve, { once: true });
+      tx.addEventListener('abort', reject, { once: true });
+    }),
+    IDBKeyRange: { only: (value) => ({ value }) }
+  });
+  vm.runInContext(deleteFunction, context);
+  await context.deleteSessionsAndRecordings(['session-a', 'session-b']);
+  assert.deepEqual(data.sessions, [{ id: 'session-c' }]);
+  assert.deepEqual(data.takes, [{ id: 'take-c1', sessionId: 'session-c' }]);
+  assert.deepEqual(data.chunks, [{ takeId: 'take-c1', sequence: 0 }]);
 });

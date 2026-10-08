@@ -498,12 +498,11 @@ export class RoomCall {
 
   applyRoleUI() {
     const guestMode = this.inviteMode;
-    $('setupFormTitle').textContent = guestMode ? 'ゲスト参加の準備' : '収録の準備';
     $('participantNameLabel').textContent = guestMode ? 'ホストに表示する名前' : 'あなたの名前';
     $('micDeviceLabel').textContent = guestMode ? '通話・録音に使うマイク' : '録音マイク';
     $('openStudioButton').textContent = guestMode ? 'ゲスト用スタジオへ進む' : 'スタジオを開く';
     $('openStudioButton').disabled = guestMode && !this.invitation;
-    $('recentPanel').hidden = guestMode;
+    $('recentPanel').hidden = false;
     $('setupView').querySelector('.setup-grid').classList.toggle('guest-mode', guestMode);
     $('roomPanel').classList.toggle('guest-mode', guestMode);
     $('roleBadge').textContent = guestMode ? 'ゲスト' : 'ホスト';
@@ -521,7 +520,7 @@ export class RoomCall {
     $('joinRoomButton').textContent = 'ホストに参加申請';
     this.setRemoteWaveState('未接続');
     if (guestMode && !this.invitation) {
-      $('setupMessage').textContent = '招待リンクが正しくありません。ホストに新しいリンクを依頼してください。';
+      $('statusMessage').textContent = '招待リンクが正しくありません。ホストに新しいリンクを依頼してください。';
     } else if (guestMode) {
       this.setStatus('招待を確認しました。準備ができたらホストに参加申請してください。');
     } else {

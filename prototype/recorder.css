@@ -91,12 +91,15 @@ h1 { margin-bottom: 0; font-family: Georgia, "Yu Mincho", serif; font-size: clam
 .recent-panel { min-height: 265px; }
 .session-list, .take-list { display: grid; }
 .session-list { gap: 9px; }
-.session-entry { display: flex; align-items: center; justify-content: space-between; gap: 10px; border-top: 1px solid var(--line); padding: 12px 0 3px; }
-.session-entry-info { min-width: 0; }
+.session-entry { display: flex; align-items: center; justify-content: flex-start; gap: 10px; border-top: 1px solid var(--line); padding: 12px 0 3px; }
+.session-entry-info { min-width: 0; flex: 1 1 auto; }
 .session-entry-name { overflow: hidden; margin: 0 0 4px; font-size: 12px; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
 .session-entry-meta { margin: 0; color: var(--muted); font-size: 10px; }
-.session-open { flex: 0 0 auto; border: 0; background: transparent; color: var(--teal); padding: 7px 0 7px 8px; font-size: 10px; font-weight: 850; }
+.session-open { flex: 0 0 auto; margin-left: auto; border: 0; background: transparent; color: var(--teal); padding: 7px 0 7px 8px; font-size: 10px; font-weight: 850; }
 .session-open:hover { color: var(--coral-dark); }
+.session-bulk-delete { flex: 0 0 auto; margin: 0; padding: 8px 10px; white-space: nowrap; }
+.session-selection { display: flex; flex: 0 0 16px; align-items: center; }
+.session-selection input { width: 16px; height: 16px; accent-color: var(--teal); }
 .empty-state { margin: 0; color: #899398; font-size: 12px; line-height: 1.7; }
 .page-footer { margin-top: 25px; color: #778184; font-size: 9px; font-weight: 750; letter-spacing: .08em; text-align: center; text-transform: uppercase; }
 .page-footer span { padding: 0 7px; color: var(--coral); }
@@ -296,10 +299,10 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
 .terminal-ui .panel { border-radius: 4px; background: var(--card); box-shadow: inset 0 1px rgb(255 255 255 / 2%); }
 .terminal-ui .setup-panel, .terminal-ui .recent-panel { padding: 20px; }
 .terminal-ui .setup-grid { grid-template-columns: minmax(0, 1.08fr) minmax(290px, .92fr); gap: 10px; }
-.terminal-ui .setup-panel .panel-heading, .terminal-ui .recent-panel .panel-heading { display: block; margin-bottom: 19px; border-bottom: 1px dashed var(--line); padding-bottom: 12px; }
+.terminal-ui .setup-panel .panel-heading { display: block; margin-bottom: 19px; border-bottom: 1px dashed var(--line); padding-bottom: 12px; }
+.terminal-ui .recent-panel .panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 19px; border-bottom: 1px dashed var(--line); padding-bottom: 12px; }
 .terminal-ui .setup-panel .panel-heading::before { display: block; margin-bottom: 7px; color: var(--yellow); content: "00 // INITIALIZE"; font-size: 12px; font-weight: 850; letter-spacing: .1em; }
-.terminal-ui .setup-panel .panel-heading h2, .terminal-ui .recent-panel .panel-heading h2 { font-size: 18px; letter-spacing: 0; }
-.terminal-ui .recent-panel .panel-heading::before { display: block; margin-bottom: 7px; color: var(--teal); content: "ARCHIVE / LOCAL SESSIONS"; font-size: 12px; font-weight: 850; letter-spacing: .1em; }
+.terminal-ui .recent-panel .panel-heading::before { display: block; margin: 0; color: var(--teal); content: "ARCHIVE / LOCAL SESSIONS"; font-size: 12px; font-weight: 850; letter-spacing: .1em; }
 .terminal-ui .field { color: #a5bca9; font-size: 14px; letter-spacing: .04em; }
 .terminal-ui .field input, .terminal-ui .field select, .terminal-ui .field textarea {
   border-color: var(--line);
@@ -325,6 +328,7 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
 .terminal-ui .inline-message { color: #ff898e; font-size: 12px; }
 .terminal-ui .session-list { gap: 0; }
 .terminal-ui .session-entry { border-top: 1px dashed var(--line); padding: 12px 2px; }
+.terminal-ui .session-entry:first-child { border-top: 0; }
 .terminal-ui .session-entry-name { font-size: 14px; letter-spacing: 0; }
 .terminal-ui .session-entry-meta { color: var(--muted); font-size: 12px; }
 .terminal-ui .session-open { color: var(--teal); font-family: inherit; font-size: 12px; }

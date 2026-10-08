@@ -32,7 +32,7 @@ test('removes recorder instructions but retains live statuses and errors', () =>
     assert.equal(recorder.includes(`id="${id}"`), false);
   }
   assert.equal(index.includes('許可されたAuth0アカウント'), false);
-  for (const id of ['setupMessage', 'roomStatus', 'errorText', 'recordingPreparation', 'trackMicDeviceHint', 'transferGraphSummary']) {
+  for (const id of ['statusMessage', 'roomStatus', 'errorText', 'recordingPreparation', 'trackMicDeviceHint', 'transferGraphSummary']) {
     assert.ok(recorder.includes(`id="${id}"`));
   }
   assert.match(recorder, /id="trackMicDeviceHint"[^>]*><\/p>/);
@@ -46,15 +46,28 @@ test('hides the requested redundant session labels while preserving accessible h
   }
 });
 
-test('removes the placeholder avatar and adds a host-controlled session delete button', () => {
+test('removes the placeholder avatar and offers checkbox-based bulk session deletion', () => {
   assert.equal(recorder.includes('class="avatar"'), false);
   assert.match(recorder, /<div class="participant-chip">[\s\S]*?<span id="participantLabel">Participant<\/span><\/div>\s*<button id="deleteSessionButton"/);
+  assert.doesNotMatch(recorder, /id="setupFormTitle"|保存したセッション|この端末のゲスト録音/);
+  assert.match(recorder, /<div class="panel-heading compact">[\s\S]*?<button id="deleteSelectedSessionsButton"[^>]*>\s*セッション削除/);
   const source = readFileSync(new URL('../prototype/recorder.js', import.meta.url), 'utf8');
   assert.match(source, /deleteSessionButton\.hidden = !activeSession \|\| roomCall\?\.isGuest === true/);
   assert.match(source, /deleteSessionButton\.disabled = recording \|\| starting \|\| finalizing \|\| switchingMicrophone \|\|/);
   assert.match(source, /Boolean\(roomCall\?\.isActive\)/);
+  assert.match(source, /function guestTakesAreStored\(takes\)/);
+  assert.match(source, /function deleteSelectedSessions\(\)/);
+  assert.match(source, /deleteSessionsAndRecordings\(selectedIds\)/);
+  assert.match(source, /選択した.*セッション.*一括削除/);
+  assert.match(source, /復元できません/);
+  assert.doesNotMatch(source, /選択したセッションと録音を一括削除しました/);
+  assert.match(source, /selection\.type = 'checkbox'/);
   assert.match(source, /このセッションに保存された録音・受信音声をすべて削除します/);
   assert.match(source, /database\.transaction\(\['sessions', 'takes', 'chunks'\], 'readwrite'\)/);
+  const css = readFileSync(new URL('../prototype/recorder.css', import.meta.url), 'utf8');
+  assert.match(css, /\.terminal-ui \.recent-panel \.panel-heading \{ display: flex; align-items: center; justify-content: space-between;/);
+  assert.match(css, /\.session-bulk-delete \{ flex: 0 0 auto; margin: 0;/);
+  assert.match(css, /\.terminal-ui \.session-entry:first-child \{ border-top: 0;/);
 });
 
 test('places compact name-and-sequence WAV rows inside the device storage panel', () => {
@@ -224,8 +237,9 @@ test('role UI works with removed instruction elements and keeps invalid invitati
         inviteMode, invitation: null, setRemoteWaveState() {}, setStatus() {}
       });
       assert.equal(elements.get('roleBadge').textContent, inviteMode ? 'ゲスト' : 'ホスト');
+      assert.equal(elements.get('recentPanel').hidden, false);
     }
-    assert.match(elements.get('setupMessage').textContent, /招待リンクが正しくありません/);
+    assert.match(elements.get('statusMessage').textContent, /招待リンクが正しくありません/);
     assert.equal(elements.get('openStudioButton').disabled, true);
   } finally {
     if (originalDocument === undefined) delete globalThis.document;
