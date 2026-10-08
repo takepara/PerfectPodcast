@@ -90,6 +90,60 @@
           <div id="errorText" class="error-text" role="alert" aria-live="assertive"></div>
         </section>
 
+        <section id="roomPanel" class="panel room-panel" aria-labelledby="roomHeading">
+          <div class="room-heading">
+            <div>
+              <span id="roomRoleLabel" class="room-role-label">ホスト操作</span>
+              <h2 id="roomHeading">ゲストを招待</h2>
+            </div>
+            <span class="format-pill">Opus · mono · 最大32 kbps</span>
+          </div>
+          <p id="roomStatus" class="room-status" role="status">招待リンクを作成してゲストを招待できます。</p>
+          <div class="room-actions">
+            <button id="createRoomButton" class="button button-primary" type="button">招待リンクを作成</button>
+            <button id="joinRoomButton" class="button button-primary" type="button" hidden>ホストに参加申請</button>
+            <button id="checkReadinessButton" class="button button-quiet" type="button" hidden>録音準備を再確認</button>
+            <button id="retryTransferButton" class="button button-quiet" type="button" hidden>転送を再試行</button>
+            <button id="leaveRoomButton" class="button button-quiet" type="button" hidden>通話を終了</button>
+          </div>
+          <section id="transferProgressCard" class="transfer-progress" hidden aria-labelledby="transferProgressHeading">
+            <h3 id="transferProgressHeading">ゲスト音源の受信状況</h3>
+            <progress id="transferProgressBar" max="1" value="0" aria-label="音源の受信済み割合"></progress>
+            <p id="transferProgressText" role="status">通話接続後に保存状況を表示します。</p>
+            <details id="transferDiagnostics" class="transfer-diagnostics">
+              <summary>転送の詳しい状況</summary>
+              <p id="transferProgressDetails">詳細を読み込んでいます。</p>
+              <canvas id="transferGraph" width="600" height="132" aria-hidden="true"></canvas>
+              <p id="transferGraphSummary" role="status"></p>
+              <p class="transfer-graph-legend"><span>送出速度</span><span>保存確認速度</span><span>録音データ生成基準</span></p>
+            </details>
+          </section>
+          <label id="inviteField" class="field invite-field" hidden>
+            <span>招待リンク</span>
+            <span class="invite-input-row">
+              <input id="inviteUrl" type="url" readonly>
+              <button id="copyInviteButton" class="button button-quiet" type="button">リンクをコピー</button>
+            </span>
+          </label>
+          <section id="guestRequestCard" class="guest-request-card" hidden aria-labelledby="guestRequestTitle">
+            <div class="guest-request-copy">
+              <span class="request-step">ゲストから参加申請</span>
+              <h3 id="guestRequestTitle"><span id="guestRequestName"></span> さん</h3>
+            </div>
+            <div class="guest-request-actions">
+              <button id="approveGuestButton" class="button button-primary" type="button">承認して通話を開始</button>
+              <button id="denyGuestButton" class="button button-danger" type="button">拒否</button>
+            </div>
+          </section>
+          <div class="remote-audio-row">
+            <span id="callState" class="call-state">通話は未接続です</span>
+            <span id="recordingReadiness" class="call-state">録音準備は未確認です</span>
+            <p id="connectionStats" class="connection-stats" role="status" hidden>接続統計を取得していません</p>
+            <audio id="remoteAudio" autoplay playsinline></audio>
+            <button id="playRemoteAudioButton" class="button button-quiet" type="button" hidden>音声の再生を許可</button>
+          </div>
+        </section>
+
         <aside class="panel storage-panel" aria-labelledby="storageHeading">
           <div class="panel-heading compact">
             <span class="storage-icon" aria-hidden="true">▤</span>
@@ -104,60 +158,6 @@
           </section>
         </aside>
       </div>
-
-      <section id="roomPanel" class="panel room-panel" aria-labelledby="roomHeading">
-        <div class="room-heading">
-          <div>
-            <span id="roomRoleLabel" class="room-role-label">ホスト操作</span>
-            <h2 id="roomHeading">ゲストを招待</h2>
-          </div>
-          <span class="format-pill">Opus · mono · 最大32 kbps</span>
-        </div>
-        <p id="roomStatus" class="room-status" role="status">招待リンクを作成してゲストを招待できます。</p>
-        <div class="room-actions">
-          <button id="createRoomButton" class="button button-primary" type="button">招待リンクを作成</button>
-          <button id="joinRoomButton" class="button button-primary" type="button" hidden>ホストに参加申請</button>
-          <button id="checkReadinessButton" class="button button-quiet" type="button" hidden>録音準備を再確認</button>
-          <button id="retryTransferButton" class="button button-quiet" type="button" hidden>転送を再試行</button>
-          <button id="leaveRoomButton" class="button button-quiet" type="button" hidden>通話を終了</button>
-        </div>
-        <section id="transferProgressCard" class="transfer-progress" hidden aria-labelledby="transferProgressHeading">
-          <h3 id="transferProgressHeading">ゲスト音源の受信状況</h3>
-          <progress id="transferProgressBar" max="1" value="0" aria-label="音源の受信済み割合"></progress>
-          <p id="transferProgressText" role="status">通話接続後に保存状況を表示します。</p>
-          <details id="transferDiagnostics" class="transfer-diagnostics">
-            <summary>転送の詳しい状況</summary>
-            <p id="transferProgressDetails">詳細を読み込んでいます。</p>
-            <canvas id="transferGraph" width="600" height="132" aria-hidden="true"></canvas>
-            <p id="transferGraphSummary" role="status"></p>
-            <p class="transfer-graph-legend"><span>送出速度</span><span>保存確認速度</span><span>録音データ生成基準</span></p>
-          </details>
-        </section>
-        <label id="inviteField" class="field invite-field" hidden>
-          <span>招待リンク</span>
-          <span class="invite-input-row">
-            <input id="inviteUrl" type="url" readonly>
-            <button id="copyInviteButton" class="button button-quiet" type="button">リンクをコピー</button>
-          </span>
-        </label>
-        <section id="guestRequestCard" class="guest-request-card" hidden aria-labelledby="guestRequestTitle">
-          <div class="guest-request-copy">
-            <span class="request-step">ゲストから参加申請</span>
-            <h3 id="guestRequestTitle"><span id="guestRequestName"></span> さん</h3>
-          </div>
-          <div class="guest-request-actions">
-            <button id="approveGuestButton" class="button button-primary" type="button">承認して通話を開始</button>
-            <button id="denyGuestButton" class="button button-danger" type="button">拒否</button>
-          </div>
-        </section>
-        <div class="remote-audio-row">
-          <span id="callState" class="call-state">通話は未接続です</span>
-          <span id="recordingReadiness" class="call-state">録音準備は未確認です</span>
-          <p id="connectionStats" class="connection-stats" role="status" hidden>接続統計を取得していません</p>
-          <audio id="remoteAudio" autoplay playsinline></audio>
-          <button id="playRemoteAudioButton" class="button button-quiet" type="button" hidden>音声の再生を許可</button>
-        </div>
-      </section>
 
       <section class="panel waveform-panel" aria-labelledby="waveformHeading">
         <h2 id="waveformHeading" class="visually-hidden">参加者ごとの音声波形</h2>

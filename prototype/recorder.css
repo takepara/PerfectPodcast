@@ -109,7 +109,8 @@ h1 { margin-bottom: 0; font-family: Georgia, "Yu Mincho", serif; font-size: clam
 .role-badge.guest { background: var(--teal-soft); color: var(--teal); }
 .participant-controls { display: flex; flex: 0 0 auto; align-items: center; gap: 10px; }
 .session-delete { min-height: 36px; margin: 0; padding: 7px 10px; font-size: 9px; }
-.studio-grid { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 18px; align-items: stretch; }
+.studio-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; align-items: stretch; }
+.studio-grid > .room-panel { margin-top: 0; }
 .record-panel { position: relative; overflow: hidden; padding: 25px 28px 22px; }
 .record-panel::after { position: absolute; top: -110px; right: -74px; width: 205px; height: 205px; border: 1px solid rgb(85 214 178 / 10%); border-radius: 50%; content: ""; pointer-events: none; }
 .panel-topline { position: relative; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
@@ -218,6 +219,11 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
   .storage-panel .saved-total { align-self: end; padding-bottom: 6px; }
   .storage-recordings { grid-column: 1 / -1; }
 }
+
+@media (max-width: 860px) {
+  .studio-grid { grid-template-columns: 1fr; }
+}
+
 @media (max-width: 520px) {
   .shell { width: min(100% - 30px, 1120px); padding-top: 20px; }
   .topbar { align-items: start; gap: 10px; margin-bottom: 35px; }

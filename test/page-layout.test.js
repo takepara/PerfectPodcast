@@ -70,6 +70,16 @@ test('places compact name-and-sequence WAV rows inside the device storage panel'
   assert.equal(source.includes('takeStatusLabel'), false);
 });
 
+test('places the invitation panel between recording and storage in a three-column studio grid', () => {
+  const record = recorder.indexOf('class="panel record-panel"');
+  const invite = recorder.indexOf('id="roomPanel" class="panel room-panel"');
+  const storage = recorder.indexOf('class="panel storage-panel"');
+  assert.ok(record < invite && invite < storage);
+  const css = readPrototype('recorder.css');
+  assert.match(css, /\.studio-grid \{ display: grid; grid-template-columns: repeat\(3, minmax\(0, 1fr\)\); gap: 18px; align-items: stretch;/);
+  assert.match(css, /@media \(max-width: 860px\) \{\s*\.studio-grid \{ grid-template-columns: 1fr; \}/);
+});
+
 test('role UI works with removed instruction elements and keeps invalid invitation errors', () => {
   const originalDocument = globalThis.document;
   const elements = new Map();
