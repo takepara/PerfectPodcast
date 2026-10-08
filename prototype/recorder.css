@@ -114,6 +114,20 @@ h1 { margin-bottom: 0; font-family: Georgia, "Yu Mincho", serif; font-size: clam
 .meter-fill.good { background: var(--teal); }
 .meter-fill.near-clip { background: #edc76a; }
 .meter-fill.clipping { background: var(--coral); }
+.audio-track-diagnostics { margin: 19px 0 25px; border-top: 1px solid var(--line); padding-top: 13px; }
+.audio-track-diagnostics summary { width: fit-content; cursor: pointer; color: var(--teal); font-size: 10px; font-weight: 850; }
+.audio-track-diagnostics-note { margin: 9px 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.audio-track-request-status { margin: 0 0 9px; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.audio-track-request-status.warning { color: var(--yellow); }
+.audio-track-settings { display: grid; gap: 8px; }
+.audio-track-settings .empty-state { font-size: 10px; }
+.audio-track-entry { border: 1px solid var(--line); border-radius: 4px; background: #14181e; padding: 10px 11px; }
+.audio-track-entry h3 { margin: 0 0 8px; font-size: 10px; font-weight: 850; overflow-wrap: anywhere; }
+.audio-track-entry dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; margin: 0; }
+.audio-track-entry dl div { min-width: 0; }
+.audio-track-entry dt { color: var(--muted); font-size: 8px; }
+.audio-track-entry dd { margin: 2px 0 0; color: #c5cbd3; font-size: 9px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.audio-track-rate-warning { grid-column: 1 / -1; color: var(--yellow) !important; }
 .controls { display: flex; flex-wrap: wrap; gap: 9px; }
 .button-record { min-width: 156px; background: var(--coral); color: white; }
 .button-stop { border: 1px solid #414853; background: #303640; color: var(--ink); }

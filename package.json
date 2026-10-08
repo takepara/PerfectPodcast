@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "build:auth": "esbuild src/auth-client.js --bundle --format=esm --target=es2022 --outfile=prototype/auth-client.bundle.js",
-    "dev": "npm run build:auth && wrangler dev --config wrangler.jsonc",
+    "dev": "npm run build:auth && wrangler dev --config wrangler.jsonc --port 8787",
     "deploy": "npm run build:auth && wrangler deploy --config wrangler.jsonc",
     "test": "node --test"
   },

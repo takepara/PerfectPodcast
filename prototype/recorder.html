@@ -80,6 +80,14 @@
               <div id="meterFill" class="meter-fill"></div>
             </div>
           </div>
+          <details class="audio-track-diagnostics" open>
+            <summary>マイク設定（トラック別）</summary>
+            <p class="audio-track-diagnostics-note">ブラウザーが報告する設定です。マイクのADCやOS内部の実際のビット深度を保証するものではありません。</p>
+            <p id="audioTrackRequestStatus" class="audio-track-request-status" role="status">マイク取得時に24-bitを要求します。実際の値は各トラックの報告値を確認してください。</p>
+            <div id="audioTrackSettings" class="audio-track-settings" aria-live="polite">
+              <p class="empty-state">マイク入力を取得すると設定を表示します。</p>
+            </div>
+          </details>
           <div id="recordControls" class="controls">
             <button id="recordButton" class="button button-record" type="button"><span aria-hidden="true">●</span> 録音開始</button>
             <button id="stopButton" class="button button-stop" type="button" disabled><span aria-hidden="true">■</span> 録音停止</button>

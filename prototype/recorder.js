@@ -46,6 +46,8 @@ let roomCall = null;
 let activeTake = null;
 let audioContext = null;
 let mediaStream = null;
+let recorderAudioContextSampleRate = null;
+let sampleSizeConstraintFallback = false;
 let sourceNode = null;
 let analyserNode = null;
 let recorderNode = null;
@@ -89,6 +91,7 @@ let transferProgressTimer = null;
 let transferProgressCache = null;
 let transferGraphSamples = [];
 let cleanupRecordingTrackMonitor = null;
+const captureTrackSettingsListeners = new Map();
 
 const requestResult = (request) => new Promise((resolve, reject) => {
   request.addEventListener('success', () => resolve(request.result), { once: true });
@@ -1251,12 +1254,124 @@ async function detectDevices(requestPermission = true) {
 }
 
 async function ensureCaptureStream() {
-  if (mediaStream?.getAudioTracks().some((track) => track.readyState === 'live')) return mediaStream;
+  if (mediaStream?.getAudioTracks().some((track) => track.readyState === 'live')) {
+    observeCaptureAudioTracks();
+    return mediaStream;
+  }
   if (!navigator.mediaDevices?.getUserMedia) throw new Error('マイク取得に対応していません。Chrome または Edge を使用してください。');
-  mediaStream = await navigator.mediaDevices.getUserMedia({
-    audio: { deviceId: { exact: micDevice.value }, ...RAW_AUDIO_CONSTRAINTS, sampleRate: TARGET_RATE }
-  });
+  clearCaptureTrackSettingsListeners();
+  recorderAudioContextSampleRate = null;
+  sampleSizeConstraintFallback = false;
+  const audioConstraints = {
+    deviceId: { exact: micDevice.value },
+    ...RAW_AUDIO_CONSTRAINTS,
+    sampleRate: TARGET_RATE
+  };
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { ...audioConstraints, sampleSize: { exact: 24 } }
+    });
+  } catch (error) {
+    const failedConstraint = error.constraint || error.constraintName;
+    const canRetryWithoutSampleSize = error.name === 'OverconstrainedError' ||
+      (['NotSupportedError', 'TypeError'].includes(error.name) &&
+        (!failedConstraint || failedConstraint === 'sampleSize'));
+    if (!canRetryWithoutSampleSize) throw error;
+    sampleSizeConstraintFallback = true;
+    renderCaptureAudioTrackSettings();
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+  }
+  observeCaptureAudioTracks();
   return mediaStream;
+}
+
+function clearCaptureTrackSettingsListeners() {
+  for (const [track, listener] of captureTrackSettingsListeners) {
+    for (const eventName of ['mute', 'unmute', 'ended']) {
+      track.removeEventListener(eventName, listener);
+    }
+  }
+  captureTrackSettingsListeners.clear();
+}
+
+function appendTrackSetting(list, label, value) {
+  const item = document.createElement('div');
+  const term = document.createElement('dt');
+  const description = document.createElement('dd');
+  term.textContent = label;
+  description.textContent = value;
+  item.append(term, description);
+  list.append(item);
+  return item;
+}
+
+function formatTrackValue(value, unit = '') {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return `${value.toLocaleString('ja-JP')}${unit}`;
+  }
+  if (typeof value === 'boolean') return value ? '有効' : '無効';
+  return '取得できません';
+}
+
+function renderCaptureAudioTrackSettings() {
+  const container = $('audioTrackSettings');
+  const requestStatus = $('audioTrackRequestStatus');
+  const tracks = mediaStream?.getAudioTracks() ?? [];
+  requestStatus.textContent = sampleSizeConstraintFallback
+    ? '24-bit指定を含む入力要求で取得できなかったため、指定を外して再試行しました。下の報告値を確認してください。'
+    : 'マイク取得時に sampleSize: { exact: 24 } を要求しています。実際の値は下の各トラックの報告値を確認してください。';
+  requestStatus.classList.toggle('warning', sampleSizeConstraintFallback);
+  container.replaceChildren();
+  if (!tracks.length) {
+    const message = document.createElement('p');
+    message.className = 'empty-state';
+    message.textContent = 'マイク入力トラックがありません。';
+    container.append(message);
+    return;
+  }
+
+  for (const [index, track] of tracks.entries()) {
+    const settings = typeof track.getSettings === 'function' ? track.getSettings() : {};
+    const entry = document.createElement('section');
+    const title = document.createElement('h3');
+    const list = document.createElement('dl');
+    const trackRate = settings.sampleRate;
+    const contextRate = recorderAudioContextSampleRate;
+    const titleLabel = track.label || `名前なし (${track.id.slice(0, 8)})`;
+    title.textContent = `トラック ${index + 1} · ${titleLabel}`;
+    entry.className = 'audio-track-entry';
+    entry.append(title, list);
+    appendTrackSetting(list, '状態', track.readyState === 'live'
+      ? (track.muted ? '一時停止中' : '有効')
+      : '終了');
+    appendTrackSetting(list, 'トラックのサンプルレート', formatTrackValue(trackRate, ' Hz'));
+    appendTrackSetting(list, 'トラックのサンプルサイズ', formatTrackValue(settings.sampleSize, ' bit'));
+    appendTrackSetting(list, 'チャンネル数', formatTrackValue(settings.channelCount));
+    appendTrackSetting(list, '録音AudioContext', formatTrackValue(contextRate, ' Hz'));
+    appendTrackSetting(list, 'エコーキャンセル', formatTrackValue(settings.echoCancellation));
+    appendTrackSetting(list, 'ノイズ抑制', formatTrackValue(settings.noiseSuppression));
+    appendTrackSetting(list, '自動ゲイン調整', formatTrackValue(settings.autoGainControl));
+    if (typeof trackRate === 'number' && typeof contextRate === 'number' && trackRate !== contextRate) {
+      appendTrackSetting(
+        list,
+        'サンプルレート',
+        `${trackRate.toLocaleString('ja-JP')} Hz → ${contextRate.toLocaleString('ja-JP')} Hz（変換が必要）`
+      ).className = 'audio-track-rate-warning';
+    }
+    container.append(entry);
+  }
+}
+
+function observeCaptureAudioTracks() {
+  for (const track of mediaStream?.getAudioTracks() ?? []) {
+    if (captureTrackSettingsListeners.has(track)) continue;
+    const listener = () => renderCaptureAudioTrackSettings();
+    for (const eventName of ['mute', 'unmute', 'ended']) {
+      track.addEventListener(eventName, listener);
+    }
+    captureTrackSettingsListeners.set(track, listener);
+  }
+  renderCaptureAudioTrackSettings();
 }
 
 async function checkRecordingReadiness() {
@@ -1267,6 +1382,8 @@ async function checkRecordingReadiness() {
   }
   if (!window.AudioContext) throw new Error('AudioContextを利用できません。');
   const context = new AudioContext({ sampleRate: TARGET_RATE });
+  recorderAudioContextSampleRate = context.sampleRate;
+  renderCaptureAudioTrackSettings();
   try {
     if (context.sampleRate !== TARGET_RATE) throw new Error('48 kHzのAudioContextを作成できません。');
     await context.audioWorklet.addModule('./recorder-worklet.js');
@@ -1286,8 +1403,10 @@ async function checkRecordingReadiness() {
 
 async function releaseCaptureStream() {
   if (recording) return;
+  clearCaptureTrackSettingsListeners();
   mediaStream?.getTracks().forEach((track) => track.stop());
   mediaStream = null;
+  renderCaptureAudioTrackSettings();
 }
 
 async function commitChunk(samples, isFinal, startFrame) {
@@ -1356,6 +1475,8 @@ async function createTake({ scheduledStartAt = null, event = null } = {}) {
   await ensureCaptureStream();
   stopLocalPreview();
   audioContext = new AudioContext({ sampleRate: TARGET_RATE });
+  recorderAudioContextSampleRate = audioContext.sampleRate;
+  renderCaptureAudioTrackSettings();
   if (audioContext.sampleRate !== TARGET_RATE) {
     throw new Error(`この端末のAudioContextは ${audioContext.sampleRate} Hzです。48,000 Hzが必要です。`);
   }
@@ -1676,9 +1797,14 @@ async function startRecording(remoteSchedule = null) {
       activeTake = null;
       await renderTakes();
     }
+    const errorDetails = [error.name, error.constraint || error.constraintName, error.message]
+      .filter(Boolean)
+      .join(' · ') || String(error);
     errorText.textContent ||= error.name === 'NotAllowedError'
       ? 'マイクの使用が許可されませんでした。ブラウザーのサイト設定を確認してください。'
-      : `録音を開始できませんでした: ${error.message}`;
+      : error.name === 'OverconstrainedError' && (error.constraint || error.constraintName) === 'deviceId'
+        ? '選択中のマイクが見つからないか利用できません。「デバイスを検出」で一覧を更新し、使用する入力を選び直してください。'
+        : `録音を開始できませんでした: ${errorDetails}`;
     setStatus('録音を開始できませんでした');
     recordButton.disabled = false;
     stopButton.disabled = true;
