@@ -100,6 +100,91 @@ test('transfers a verified WAV chunk and waits for the host manifest ACK', async
   }
 });
 
+test('automatically retries a paused guest transfer with increasing backoff', async () => {
+  const originalWindow = globalThis.window;
+  const timers = [];
+  globalThis.window = {
+    setTimeout(callback, delay) {
+      const timer = { callback, delay };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout() {}
+  };
+  let chunkReads = 0;
+  const statuses = [];
+  const transfer = new RecordingTransfer({
+    role: 'guest',
+    isAuthorized: () => true,
+    getNextChunk: async () => {
+      chunkReads += 1;
+      if (chunkReads === 1) throw new Error('temporary failure');
+      return null;
+    },
+    getNextManifest: async () => null,
+    onStatus: (message) => statuses.push(message)
+  });
+  transfer.channel = { readyState: 'open' };
+  transfer.inventoryReady = true;
+  try {
+    transfer.wake();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(timers[0].delay, 1_000);
+    assert.match(statuses.at(-1), /Retrying automatically in 1 second/u);
+
+    timers[0].callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(chunkReads, 2);
+    assert.equal(transfer.automaticRetryAttempt, 0);
+  } finally {
+    transfer.clearAutomaticRetry();
+    window.clearTimeout(transfer.inventoryTimer);
+    transfer.inventoryTimer = null;
+    transfer.channel = null;
+    if (originalWindow === undefined) delete globalThis.window;
+    else globalThis.window = originalWindow;
+  }
+});
+
+test('automatically requests a new host inventory when reconciliation times out', () => {
+  const originalWindow = globalThis.window;
+  const timers = [];
+  globalThis.window = {
+    setTimeout(callback, delay) {
+      const timer = { callback, delay };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout() {}
+  };
+  const generation = '0123456789abcdefghij_-';
+  const sent = [];
+  const transfer = new RecordingTransfer({
+    role: 'guest',
+    isAuthorized: () => true,
+    getGeneration: () => generation,
+    onStatus() {}
+  });
+  transfer.channel = {
+    readyState: 'open',
+    bufferedAmount: 0,
+    send(message) { sent.push(JSON.parse(message)); }
+  };
+  try {
+    transfer.refreshInventory();
+    assert.equal(sent[0].type, 'inventory-refresh');
+    timers[0].callback();
+    assert.equal(timers[1].delay, 1_000);
+    timers[1].callback();
+    assert.equal(sent[1].type, 'inventory-refresh');
+  } finally {
+    transfer.clearAutomaticRetry();
+    transfer.channel = null;
+    if (originalWindow === undefined) delete globalThis.window;
+    else globalThis.window = originalWindow;
+  }
+});
+
 test('rejects WAV payloads whose header or checksum does not match metadata', async () => {
   const originalWindow = globalThis.window;
   globalThis.window = { setTimeout, clearTimeout };

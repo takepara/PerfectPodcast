@@ -1097,9 +1097,14 @@ function updateTransferGraph(now, sendMbps, savePercent) {
   transferGraphSamples = transferGraphSamples.filter((sample) => now - sample.at <= 60_000).slice(-61);
   drawTransferGraph(now);
   const sample = transferGraphSamples.at(-1);
-  const sendText = sample.sendMbps === null ? '—' : `${sample.sendMbps.toFixed(2)} Mbps`;
-  const saveText = sample.savePercent === null ? '—' : `${Math.round(sample.savePercent)}%`;
-  $('transferGraphSummary').textContent = `Upload ${sendText} · Save Rate ${saveText}`;
+  updateTransferGraphSummary(sample.sendMbps, sample.savePercent);
+}
+
+function updateTransferGraphSummary(sendMbps, savePercent) {
+  const sendText = sendMbps === null ? '— Mbps' : `${sendMbps.toFixed(2)} Mbps`;
+  const saveText = savePercent === null ? '—%' : `${Math.round(savePercent)}%`;
+  $('transferUploadSummary').textContent = `Upload ${sendText}`;
+  $('transferSaveRateSummary').textContent = `Save Rate ${saveText}`;
 }
 
 async function updateTransferProgress() {
@@ -1115,7 +1120,7 @@ async function updateTransferProgress() {
     $('networkProgressError').textContent = '—';
     $('networkProgressErrorRow').hidden = true;
     drawTransferGraph(performance.now());
-    $('transferGraphSummary').textContent = 'Upload — · Save Rate —';
+    updateTransferGraphSummary(null, null);
     return;
   }
   const progress = await getTransferProgress(generation);

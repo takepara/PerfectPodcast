@@ -158,10 +158,11 @@ test('arranges capture, room, and network details in three desktop columns', () 
   assert.match(networkPanel, /class="network-metrics"/);
   assert.doesNotMatch(networkPanel, /<details|<summary/);
   assert.match(networkPanel, /id="connectionStats"/);
-  assert.match(networkPanel, /id="recordingReadiness"/);
+  assert.match(networkPanel, /id="connectionPath"/);
   assert.match(networkPanel, /id="networkProgressErrorRow" hidden/);
   assert.match(networkPanel, /id="transferGraph" width="600" height="96"/);
-  assert.equal((networkPanel.match(/<tr>/g) || []).length, 2);
+  assert.doesNotMatch(networkPanel, /transfer-graph-legend/);
+  assert.equal((networkPanel.match(/<tr>/g) || []).length, 3);
   assert.match(networkPanel, /Remaining \/ Total/);
   assert.doesNotMatch(networkPanel, /networkUnsubmitted|networkSending|networkAwaitingAck|networkManifest|manifest/);
   assert.match(recorder, /class="studio-grid terminal-grid"/);
@@ -179,6 +180,10 @@ test('arranges capture, room, and network details in three desktop columns', () 
   assert.match(css, /\.terminal-ui \.terminal-section-code \{[^}]*color: var\(--teal\);/);
   assert.match(css, /\.transfer-progress \{[^}]*padding: 0;[^}]*border: 0;[^}]*background: transparent;/);
   assert.match(css, /\.terminal-ui \.network-metrics \{ font-size: 11px; line-height: 1\.35; \}/);
+  const roomPanel = recorder.slice(invite, network);
+  assert.match(roomPanel, /id="recordingReadiness" class="recording-readiness" role="status"/);
+  assert.doesNotMatch(roomPanel, /id="checkReadinessButton"|id="retryTransferButton"/);
+  assert.match(roomPanel, /id="leaveRoomButton"[^>]*>End Call<\/button>/);
   assert.match(css, /\.terminal-ui \.waveform-panel \{ grid-area: wave;/);
   assert.match(css, /\.terminal-ui \.storage-panel \{ grid-area: storage;/);
   assert.match(css, /@media \(max-width: 860px\) \{[\s\S]*?\.terminal-ui \.studio-grid \{ grid-template-columns: 1fr; grid-template-areas: "record" "room" "network" "wave" "storage"; \}/);
@@ -225,10 +230,19 @@ test('plots saved-audio completion on a percentage axis at the right of the tran
     fillText(text, x, y) { labels.push({ text, x, y, align: this.textAlign || 'left' }); }
   };
   const summary = {};
+  const uploadSummary = { textContent: '' };
+  const saveRateSummary = { textContent: '' };
+  Object.defineProperty(summary, 'textContent', {
+    get: () => `${uploadSummary.textContent} · ${saveRateSummary.textContent}`
+  });
   const context = {
     transferGraphSamples: [],
     $: (id) => id === 'transferGraph'
       ? { width: 600, height: 96, getContext: () => canvasContext }
+      : id === 'transferUploadSummary'
+        ? uploadSummary
+        : id === 'transferSaveRateSummary'
+          ? saveRateSummary
       : summary
   };
   runInNewContext(source.slice(start, end), context);

@@ -132,12 +132,17 @@ export class RecordingTransfer {
     this.inventoryRequested = false;
     this.receivedInventory = null;
     this.inventoryTimer = null;
+    this.automaticRetryTimer = null;
+    this.automaticRetryAttempt = 0;
     this.boundOpen = () => this.wake();
     this.boundClose = () => this.rejectPending(new Error('The recovery DataChannel was disconnected.'));
     this.boundMessage = (event) => {
       this.receiveChain = this.receiveChain
         .then(() => this.receive(event.data))
-        .catch((error) => this.onStatus(`Unable to process audio recovery: ${error.message}`, true));
+        .catch((error) => {
+          this.onStatus(`Unable to process audio recovery: ${error.message}`, true);
+          this.scheduleAutomaticRetry();
+        });
     };
   }
 
@@ -154,6 +159,7 @@ export class RecordingTransfer {
     this.inventoryReady = this.role !== 'guest';
     this.inventoryRequested = false;
     this.receivedInventory = null;
+    this.clearAutomaticRetry();
     window.clearTimeout(this.inventoryTimer);
     this.inventoryTimer = null;
     if (!channel) return;
@@ -179,6 +185,7 @@ export class RecordingTransfer {
     this.receivedInventory = null;
     window.clearTimeout(this.inventoryTimer);
     this.inventoryTimer = null;
+    this.clearAutomaticRetry();
     this.rejectPending(new Error('The recovery DataChannel was disconnected.'));
   }
 
@@ -194,17 +201,25 @@ export class RecordingTransfer {
     this.workRequested = true;
     if (!this.isOpen()) return;
     if (this.role === 'host') {
+      this.clearAutomaticRetry();
       if (this.inventoryRequested) return;
       this.inventoryRequested = true;
       void this.sendInventorySnapshot();
       return;
     }
-    if (this.role !== 'guest' || !this.inventoryReady || this.transferTask) return;
+    if (this.role !== 'guest') return;
+    if (!this.inventoryReady) {
+      if (this.inventoryTimer === null) this.startInventoryTimer();
+      return;
+    }
+    if (this.transferTask) return;
+    this.clearAutomaticRetry();
     this.transferTask = this.drain().catch((error) => {
       this.onStatus(`Unable to transfer audio to the host: ${error.message}`, true);
+      this.scheduleAutomaticRetry();
     }).finally(() => {
       this.transferTask = null;
-      if (this.workRequested) this.wake();
+      if (this.workRequested && this.automaticRetryTimer === null) this.wake();
     });
   }
 
@@ -222,6 +237,7 @@ export class RecordingTransfer {
         continue;
       }
       if (this.workRequested) continue;
+      this.automaticRetryAttempt = 0;
       return;
     }
   }
@@ -271,6 +287,7 @@ export class RecordingTransfer {
         const response = await ack;
         if (!response.accepted) throw new Error(response.message || 'The host could not save the chunk.');
         await this.markChunkStored(take.id, chunk.sequence, sha256);
+        this.automaticRetryAttempt = 0;
         this.onStatus(`Saved on the host device · ${take.participant} · chunk ${chunk.sequence + 1}`);
         return;
       } catch (error) {
@@ -315,6 +332,7 @@ export class RecordingTransfer {
         const response = await ack;
         if (!response.accepted) throw new Error(response.message || 'The host could not save the take manifest.');
         await this.markManifestStored(take.id);
+        this.automaticRetryAttempt = 0;
         this.onStatus(`All chunks saved on the host device · ${take.participant}`);
         return;
       } catch (error) {
@@ -422,43 +440,66 @@ export class RecordingTransfer {
         requestId,
         count: items.length
       });
+      this.automaticRetryAttempt = 0;
       this.onStatus('Started comparing saved audio on the host with the recovery ledger.');
     } catch (error) {
       this.inventoryRequested = false;
       this.onStatus(`Unable to read the host recovery ledger: ${error.message}`, true);
-      try {
-        this.sendControl({
-          type: 'inventory-start',
-          generation: this.generation(),
-          requestId,
-          count: 0
-        });
-        this.sendControl({
-          type: 'inventory-end',
-          generation: this.generation(),
-          requestId,
-          count: 0
-        });
-      } catch (sendError) {
-        this.onStatus(`Unable to notify the other participant about the recovery inventory failure: ${sendError.message}`, true);
-      }
+      this.scheduleAutomaticRetry();
     }
   }
 
   refreshInventory() {
     if (!this.isOpen()) return;
+    this.clearAutomaticRetry();
     if (this.role === 'host') {
       this.inventoryRequested = false;
       this.wake();
     } else if (this.role === 'guest') {
       this.inventoryReady = false;
+      this.receivedInventory = null;
+      window.clearTimeout(this.inventoryTimer);
+      this.startInventoryTimer();
       try {
         this.sendControl({ type: 'inventory-refresh', generation: this.generation() });
-        this.onStatus('Requested that the host reconcile the recovery ledger again.');
+        this.onStatus('Checking saved audio with the host. Any unconfirmed chunks will be retried automatically.');
       } catch (error) {
         this.onStatus(`Unable to request reconciliation from the host: ${error.message}`, true);
+        this.scheduleAutomaticRetry();
       }
     }
+  }
+
+  scheduleAutomaticRetry() {
+    if (!this.isOpen() || this.automaticRetryTimer !== null) return;
+    const delay = Math.min(1_000 * 2 ** this.automaticRetryAttempt, 30_000);
+    this.automaticRetryAttempt = Math.min(this.automaticRetryAttempt + 1, 5);
+    const seconds = Math.ceil(delay / 1_000);
+    this.onStatus(`Transfer paused. Retrying automatically in ${seconds} ${seconds === 1 ? 'second' : 'seconds'}.`);
+    this.automaticRetryTimer = window.setTimeout(() => {
+      this.automaticRetryTimer = null;
+      if (!this.isOpen()) return;
+      if (this.role === 'guest' && !this.inventoryReady) {
+        this.refreshInventory();
+      } else {
+        this.wake();
+      }
+    }, delay);
+  }
+
+  clearAutomaticRetry() {
+    window.clearTimeout(this.automaticRetryTimer);
+    this.automaticRetryTimer = null;
+  }
+
+  startInventoryTimer() {
+    window.clearTimeout(this.inventoryTimer);
+    this.inventoryTimer = window.setTimeout(() => {
+      this.inventoryTimer = null;
+      this.receivedInventory = null;
+      this.onStatus('The host recovery ledger comparison timed out.');
+      this.scheduleAutomaticRetry();
+    }, ACK_TIMEOUT_MS);
   }
 
   async receive(data) {
@@ -527,13 +568,9 @@ export class RecordingTransfer {
         message.count > MAX_INVENTORY_ITEMS) {
       throw new Error('The host recovery inventory start information is invalid.');
     }
-    window.clearTimeout(this.inventoryTimer);
     this.inventoryReady = false;
     this.receivedInventory = { requestId: message.requestId, count: message.count, items: [] };
-    this.inventoryTimer = window.setTimeout(() => {
-      this.receivedInventory = null;
-      this.onStatus('The host recovery ledger comparison timed out. Please retry.');
-    }, ACK_TIMEOUT_MS);
+    this.startInventoryTimer();
   }
 
   receiveInventoryItems(message) {
@@ -559,6 +596,8 @@ export class RecordingTransfer {
     this.inventoryTimer = null;
     this.receivedInventory = null;
     this.inventoryReady = true;
+    this.automaticRetryAttempt = 0;
+    this.clearAutomaticRetry();
     this.onStatus('Reconciled the host recovery ledger. Any unsaved chunks will be sent again.');
     this.wake();
   }

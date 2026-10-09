@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   findSelectedIceCandidatePair,
+  formatSelectedIceConnectionPath,
   fingerprintFromSdp,
   invitationProof,
   RoomCall,
@@ -65,6 +66,48 @@ test('selects the ICE pair reported by the transport instead of another nominate
   ]);
 
   assert.equal(findSelectedIceCandidatePair(reports), selected);
+});
+
+test('formats the selected ICE path and identifies a TURN relay', () => {
+  const pair = {
+    id: 'selected-pair',
+    type: 'candidate-pair',
+    state: 'succeeded',
+    localCandidateId: 'local-candidate',
+    remoteCandidateId: 'remote-candidate'
+  };
+  const reports = new Map([
+    [pair.id, pair],
+    ['transport', {
+      id: 'transport',
+      type: 'transport',
+      selectedCandidatePairId: pair.id
+    }],
+    ['local-candidate', {
+      id: 'local-candidate',
+      type: 'local-candidate',
+      candidateType: 'relay',
+      protocol: 'udp'
+    }],
+    ['remote-candidate', {
+      id: 'remote-candidate',
+      type: 'remote-candidate',
+      candidateType: 'srflx',
+      protocol: 'udp'
+    }]
+  ]);
+
+  assert.equal(
+    formatSelectedIceConnectionPath(reports),
+    'TURN relay · relay/udp → srflx/udp'
+  );
+  reports.get('local-candidate').candidateType = 'host';
+  reports.get('remote-candidate').candidateType = 'host';
+  assert.equal(
+    formatSelectedIceConnectionPath(reports),
+    'Direct · host/udp → host/udp'
+  );
+  assert.equal(formatSelectedIceConnectionPath(new Map()), null);
 });
 
 test('uses selected or nominated ICE pair fields only when transport stats are unavailable', () => {

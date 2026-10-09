@@ -77,9 +77,9 @@ h1 { margin-bottom: 0; font-family: Georgia, "Yu Mincho", serif; font-size: clam
 .network-metrics tr:last-child th, .network-metrics tr:last-child td { border-bottom: 0; }
 .transfer-progress progress { width: 100%; height: 8px; accent-color: var(--teal); }
 .transfer-progress canvas { display: block; width: 100%; height: auto; border-radius: 3px; background: #0b0e12; }
-.transfer-graph-legend { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 10px !important; }
-.transfer-graph-legend span::before { display: inline-block; width: 12px; height: 2px; margin: 0 5px 3px 0; background: #59d6b2; content: ""; }
-.transfer-graph-legend span:nth-child(2)::before { background: #82aaff; }
+.transfer-graph-summary { display: flex; align-items: center; gap: 7px; white-space: nowrap; }
+.transfer-graph-summary span:first-child { color: #59d6b2; }
+.transfer-graph-summary span:last-child { color: #82aaff; }
 .network-event-panel { margin-top: 18px; padding: 18px; }
 .network-event-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
 .network-event-heading .terminal-section-code { margin: 0; }
@@ -177,6 +177,7 @@ h1 { margin-bottom: 0; font-family: Georgia, "Yu Mincho", serif; font-size: clam
 .room-role-label, .request-step { color: var(--teal); font-size: 9px; font-weight: 850; letter-spacing: .04em; }
 .room-status { margin-top: 13px; }
 .room-status.room-error { color: var(--coral); }
+.recording-readiness { margin: 8px 0 0; color: var(--muted); font-size: 10px; line-height: 1.6; }
 .room-actions { justify-content: start; flex-wrap: wrap; margin-top: 17px; }
 .room-actions .button-primary { width: auto; margin: 0; }
 .room-actions .button-quiet { margin: 0; }
@@ -413,6 +414,7 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
 .terminal-ui .room-heading .format-pill { flex: 0 0 auto; white-space: normal; }
 .terminal-ui .room-role-label, .terminal-ui .request-step { color: var(--teal); font-family: inherit; font-size: 12px; letter-spacing: .08em; }
 .terminal-ui .room-status, .terminal-ui .guest-request-copy p { color: #a5bca9; font-family: inherit; font-size: 12px; }
+.terminal-ui .recording-readiness { color: #a5bca9; font-family: inherit; font-size: 12px; }
 .terminal-ui .room-status.room-error { color: var(--coral); }
 .terminal-ui .room-actions { gap: 6px; margin-top: 12px; }
 .terminal-ui .room-actions .button, .terminal-ui .guest-request-actions .button { width: auto; min-height: 34px; margin: 0; }
@@ -425,7 +427,6 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
 .terminal-ui .transfer-progress canvas { background: #060a08; }
 .terminal-ui .transfer-diagnostics { color: #a5bca9; font-size: 12px; }
 .terminal-ui .transfer-diagnostics summary { color: var(--teal); }
-.terminal-ui .transfer-graph-legend { font-size: 12px !important; }
 .terminal-ui .invite-field { margin-top: 12px; }
 .terminal-ui .invite-input-row { align-items: stretch; gap: 6px; }
 .terminal-ui .invite-input-row input { min-width: 0; border: 1px solid var(--line); border-radius: 2px; background: #080e0b; color: var(--ink); padding: 8px; font-family: inherit; font-size: 12px; }

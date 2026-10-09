@@ -97,11 +97,10 @@
             <span class="format-pill">Opus · mono · up to 32 kbps</span>
           </div>
           <p id="roomStatus" class="room-status" role="status">Create an invitation link to invite a guest.</p>
+          <p id="recordingReadiness" class="recording-readiness" role="status">Recording readiness is checked automatically when connected.</p>
           <div class="room-actions">
             <button id="createRoomButton" class="button button-primary" type="button">Create Invitation Link</button>
             <button id="joinRoomButton" class="button button-primary" type="button" hidden>Request to Join Host</button>
-            <button id="checkReadinessButton" class="button button-quiet" type="button" hidden>Check Recording Readiness</button>
-            <button id="retryTransferButton" class="button button-quiet" type="button" hidden>Retry Transfer</button>
             <button id="leaveRoomButton" class="button button-quiet" type="button" hidden>End Call</button>
           </div>
           <label id="inviteField" class="field invite-field" hidden>
@@ -133,19 +132,22 @@
             <progress id="transferProgressBar" max="1" value="0" aria-label="Audio received"></progress>
             <table class="network-metrics" aria-label="Network and audio transfer status">
               <tbody>
-                <tr><th scope="row">Remaining / Total</th><td id="transferProgressText" role="status">— / — · —%</td></tr>
-                <tr><th scope="row">RTT · jitter · loss · audio kbps</th><td id="connectionStats" role="status">—</td></tr>
-                <tr id="networkProgressErrorRow" hidden><th scope="row">Error</th><td id="networkProgressError">—</td></tr>
+              <tr><th scope="row">Connection path</th><td id="connectionPath" role="status">Not connected</td></tr>
+              <tr><th scope="row">Remaining / Total</th><td id="transferProgressText" role="status">— / — · —%</td></tr>
+              <tr><th scope="row">RTT · jitter · loss · audio kbps</th><td id="connectionStats" role="status">—</td></tr>
+              <tr id="networkProgressErrorRow" hidden><th scope="row">Error</th><td id="networkProgressError">—</td></tr>
               </tbody>
             </table>
             <div class="visually-hidden">
               <span id="callState">Call is not connected</span>
-              <span id="recordingReadiness">Recording readiness has not been checked</span>
             </div>
             <div class="transfer-diagnostics">
               <canvas id="transferGraph" width="600" height="96" aria-hidden="true"></canvas>
-              <p id="transferGraphSummary" role="status"></p>
-              <p class="transfer-graph-legend"><span>Upload throughput (Mbps)</span><span>Save Rate (%)</span></p>
+              <p id="transferGraphSummary" class="transfer-graph-summary" role="status">
+                <span id="transferUploadSummary">Upload — Mbps</span>
+                <span aria-hidden="true">·</span>
+                <span id="transferSaveRateSummary">Save Rate —%</span>
+              </p>
             </div>
           </section>
           <div class="remote-audio-row">

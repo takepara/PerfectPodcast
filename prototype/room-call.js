@@ -159,6 +159,25 @@ export function findSelectedIceCandidatePair(reports) {
     null;
 }
 
+export function formatSelectedIceConnectionPath(reports) {
+  const pair = findSelectedIceCandidatePair(reports);
+  if (!pair) return null;
+  const reportList = [...reports.values()];
+  const localCandidate = reportList.find((report) => report.id === pair.localCandidateId);
+  const remoteCandidate = reportList.find((report) => report.id === pair.remoteCandidateId);
+  if (!localCandidate || !remoteCandidate) return null;
+  const candidateTypes = [localCandidate.candidateType, remoteCandidate.candidateType];
+  const protocols = [localCandidate.protocol, remoteCandidate.protocol];
+  const isRelay = candidateTypes.includes('relay');
+  const isDirect = candidateTypes.every((type) =>
+    ['host', 'srflx', 'prflx'].includes(type)
+  );
+  const route = isRelay ? 'TURN relay' : isDirect ? 'Direct' : 'Route unknown';
+  const describeCandidate = (type, protocol) =>
+    `${typeof type === 'string' ? type : 'unknown'}/${typeof protocol === 'string' ? protocol.toLowerCase() : 'unknown'}`;
+  return `${route} · ${describeCandidate(candidateTypes[0], protocols[0])} → ${describeCandidate(candidateTypes[1], protocols[1])}`;
+}
+
 export class RoomCall {
   constructor({
     getSession,
@@ -590,10 +609,8 @@ export class RoomCall {
     $('approveGuestButton').addEventListener('click', () => { void this.approveGuest(); });
     $('denyGuestButton').addEventListener('click', () => this.denyGuest());
     $('leaveRoomButton').addEventListener('click', () => { void this.requestLeave(); });
-    $('retryTransferButton').addEventListener('click', () => this.retryRecordingTransfer());
     $('copyInviteButton').addEventListener('click', () => { void this.copyInvite(); });
     $('playRemoteAudioButton').addEventListener('click', () => { void this.playRemoteAudio(); });
-    $('checkReadinessButton').addEventListener('click', () => { void this.checkLocalReadiness(); });
     this.applyRoleUI();
   }
 
@@ -759,15 +776,14 @@ export class RoomCall {
     const connected = this.connected && this.socket?.readyState === WebSocket.OPEN &&
       this.peerConnection?.connectionState === 'connected';
     const waitingForGuest = this.localRole === 'host' && !this.pendingGuest && !this.peerConnection;
-    $('checkReadinessButton').hidden = !connected;
-    $('retryTransferButton').hidden = !connected;
-    $('retryTransferButton').textContent = this.localRole === 'host'
-      ? 'Check Reception Status'
-      : 'Retry Transfer';
     $('recordingReadiness').textContent = waitingForGuest
-      ? 'Guest not connected · You can start recording alone'
+      ? 'Guest not connected · You can record locally'
+      : !this.localRole
+        ? 'Recording readiness is checked automatically when connected.'
       : !connected
-        ? 'Recording readiness has not been checked'
+        ? 'Checking call connection…'
+        : this.readinessCheckInProgress
+          ? 'Checking recording readiness…'
         : !this.localReady
           ? 'This device is not ready to record'
           : !this.remoteReady
@@ -828,14 +844,6 @@ export class RoomCall {
   clearPendingStartEvents() {
     for (const event of this.pendingStartEvents.values()) window.clearTimeout(event.timer);
     this.pendingStartEvents.clear();
-  }
-
-  retryRecordingTransfer() {
-    if (!this.connected) return;
-    this.recordingTransfer.refreshInventory();
-    this.setStatus(this.localRole === 'host'
-      ? 'Reconciling the ledger for audio saved on the host.'
-      : 'Rechecking unconfirmed audio and the ledger saved on the host.');
   }
 
   setHostRecordingState(recording, startAt = null, clockOffsetMs = null, eventId = crypto.randomUUID(), hostStartedAt = null) {
@@ -1896,7 +1904,10 @@ export class RoomCall {
       if (state === 'connected') {
         window.clearTimeout(this.disconnectTimer);
         this.retryCount = 0;
-        if (this.connected && this.authFields) this.recordingTransfer.refreshInventory();
+        if (this.connected && this.authFields) {
+          this.recordingTransfer.refreshInventory();
+          if (!this.localReady) void this.checkLocalReadiness();
+        }
         this.startConnectionStats();
         if ($('playRemoteAudioButton').hidden) {
           const track = $('remoteAudio').srcObject?.getAudioTracks().find((item) => item.readyState === 'live');
@@ -1905,15 +1916,15 @@ export class RoomCall {
             : 'Call connected · Waiting for audio from the other participant’s microphone');
         }
       } else if (state === 'failed') {
-        this.stopConnectionStats();
+        this.stopConnectionStats('Connection failed');
         this.setCallState('Connection failed. Reconnect or continue recording locally.');
         this.scheduleIceRestart(0);
       } else if (state === 'disconnected') {
-        this.stopConnectionStats();
+        this.stopConnectionStats('Reconnecting…');
         this.setCallState('Connection is unstable. Trying to reconnect…');
         this.scheduleIceRestart();
       } else if (state === 'connecting' || state === 'new') {
-        this.stopConnectionStats();
+        this.stopConnectionStats(state === 'connecting' ? 'Connecting…' : 'Not connected');
       }
     });
     this.peerConnection.addEventListener('iceconnectionstatechange', () => {
@@ -1927,18 +1938,20 @@ export class RoomCall {
     this.previousStats = null;
     this.previousTransferStats = null;
     this.transferSendMbps = null;
+    $('connectionPath').textContent = 'Connected · checking path…';
     $('connectionStats').hidden = false;
     $('connectionStats').textContent = '—';
     void this.updateConnectionStats();
     this.statsTimer = window.setInterval(() => { void this.updateConnectionStats(); }, 2000);
   }
 
-  stopConnectionStats() {
+  stopConnectionStats(pathStatus = 'Not connected') {
     window.clearInterval(this.statsTimer);
     this.statsTimer = null;
     this.previousStats = null;
     this.previousTransferStats = null;
     this.transferSendMbps = null;
+    $('connectionPath').textContent = pathStatus;
     const stats = $('connectionStats');
     stats.hidden = false;
     stats.textContent = '—';
@@ -1953,6 +1966,8 @@ export class RoomCall {
       if (this.peerConnection !== peerConnection || peerConnection.connectionState !== 'connected') return;
       const reportList = [...reports.values()];
       const pair = findSelectedIceCandidatePair(reports);
+      $('connectionPath').textContent = formatSelectedIceConnectionPath(reports) ||
+        'Connected · path unavailable';
       const inbound = reportList.find((report) =>
         report.type === 'inbound-rtp' && (report.kind === 'audio' || report.mediaType === 'audio') && !report.isRemote
       );
@@ -2011,6 +2026,7 @@ export class RoomCall {
       stats.textContent = parts.length ? parts.join(' · ') : '—';
     } catch (error) {
       if (this.peerConnection !== peerConnection) return;
+      $('connectionPath').textContent = 'Connected · path unavailable';
       $('connectionStats').hidden = false;
       $('connectionStats').textContent = `Unable to get connection statistics: ${error.message}`;
       this.logNetworkEvent('WebRTC stats error', error.message);
