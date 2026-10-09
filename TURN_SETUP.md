@@ -85,7 +85,8 @@ npx wrangler secret put TURN_CREDENTIAL_TTL_SECONDS --config wrangler.jsonc
 | Auth0 callback error | Callback、Logout、Web OriginsのURLがアクセス中の正確なオリジンと一致するか確認します。 |
 | ログイン後にホスト権限がないと表示される | API audience、RBAC、Access Tokenへのpermission追加、ユーザーまたはRoleへの`recording:host`割当てを確認します。 |
 | Auth0設定エラーが表示される | `AUTH0_DOMAIN`、`AUTH0_CLIENT_ID`、`AUTH0_AUDIENCE`、`AUTH0_HOST_PERMISSION`がローカルまたはWorkerに登録されているか確認します。 |
-| TURN資格の発行が拒否される | `TURN_API_TOKEN`のCalls: Write権限と対象アカウント、`TURN_KEY_ID`のUIDを確認します。API tokenはログやチャットに貼らないでください。 |
+| TURN資格の発行が拒否される | HTTP 401/403なら`TURN_API_TOKEN`のCalls: Write権限と対象アカウント、404なら`TURN_KEY_ID`のUIDを確認します。API tokenはログやチャットに貼らないでください。 |
+| invalid TURN credential response | API成功後の応答検証エラーです。Cloudflareが返すブラウザー非対応ポート53などはWorkerで除外し、利用可能なCloudflare URLと資格だけを渡します。古いWorkerでは非対応URLが1つあるだけで応答全体を拒否していました。修正版を反映後も続く場合は、エラー内のサーバー件数／配列形式の診断を確認します。資格値・API応答全体をログやチャットに貼らないでください。 |
 | bindingがない、または接続が制限される | `wrangler.jsonc`の`SIGNAL_RATE_LIMITER` bindingとデプロイ結果を確認します。 |
 | 接続がrelayにならない | TURNの有効期限、ブラウザーでHTTPSまたはlocalhostを使っていること、TURN通信がネットワークで許可されていることを確認します。 |
 | ブラウザーがポート53の候補で待つ | Cloudflareの説明どおり、Webブラウザーではポート53が遮断されることがあります。このページは当該URLを利用対象から除外します。 |

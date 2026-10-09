@@ -1,5 +1,12 @@
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
+export function usableOutputTimestamp(timestamp, nowPerfMs, currentContextTime) {
+  return Boolean(timestamp && Number.isFinite(timestamp.performanceTime) && timestamp.performanceTime > 0 &&
+    Number.isFinite(timestamp.contextTime) && timestamp.contextTime > 0 &&
+    Math.abs(timestamp.performanceTime - nowPerfMs) <= 1000 &&
+    Math.abs(timestamp.contextTime - currentContextTime) <= 1);
+}
+
 export function validWallTime(value) {
   return value === null || Number.isFinite(value) && value > 0 && value <= 8.64e15;
 }

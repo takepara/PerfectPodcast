@@ -1,6 +1,7 @@
 import { calculateIntervalStats } from './connection-stats.js';
 import { calculateClockSample, selectClockSample } from './clock-sync.js';
 import { RecordingTransfer } from './recording-transfer.js';
+import { createIceErrorLog } from './ice-error-log.js';
 import { appendAlignedWaveformPeak, resetWaveformHistory } from './waveform-history.js';
 
 const $ = (id) => document.getElementById(id);
@@ -412,7 +413,7 @@ export class RoomCall {
     this.lastClockSample = { hostPerfMs: selected.hostPerfMs, guestPerfMs: selected.guestPerfMs, roundTripMs: selected.roundTripMs };
     this.logNetworkEvent(
       'Clock sync selected',
-      `offset=${selected.offsetMs.toFixed(2)} ms RTT=${selected.roundTripMs.toFixed(2)} ms samples=${samples.length}`
+      `samples=${samples.length}/${CLOCK_PROBE_COUNT} offset=${selected.offsetMs.toFixed(2)} ms selectedRTT=${selected.roundTripMs.toFixed(2)} ms RTT range=${Math.min(...samples.map((sample) => sample.roundTripMs)).toFixed(2)}–${Math.max(...samples.map((sample) => sample.roundTripMs)).toFixed(2)} ms`
     );
     this.setStatus(`Start time synchronized (RTT ${Math.round(selected.roundTripMs)} ms).`);
     return this.clockOffsetMs;
@@ -463,10 +464,6 @@ export class RoomCall {
       );
       sample.hostPerfMs = (probe.sentAt + hostReceivedAt) / 2;
       sample.guestPerfMs = (message.receivedAt + message.repliedAt) / 2;
-      this.logNetworkEvent(
-        'Clock sync sample',
-        `probe=${message.probeId} offset=${sample.offsetMs.toFixed(2)} ms RTT=${sample.roundTripMs.toFixed(2)} ms`
-      );
       probe.resolve(sample);
     } catch {
       probe.resolve(null);
@@ -2025,26 +2022,30 @@ export class RoomCall {
         this.recordingTransfer.setChannel(channel);
       });
     }
+    this.iceErrorLog?.flush();
+    const iceErrorLog = createIceErrorLog((event, details) => this.logNetworkEvent(event, details));
+    this.iceErrorLog = iceErrorLog;
+    const candidateCounts = new Map();
     this.peerConnection.addEventListener('icecandidate', ({ candidate }) => {
       if (candidate) {
-        this.logNetworkEvent('ICE candidate generated', networkMessageSummary({
-          type: 'candidate',
-          candidate: candidate.toJSON()
-        }));
+        const summary = networkMessageSummary({ type: 'candidate', candidate: candidate.toJSON() });
+        const kind = summary.match(/candidate=(\S+)/u)?.[1] || 'unknown';
+        candidateCounts.set(kind, (candidateCounts.get(kind) || 0) + 1);
         if (this.socket?.readyState === WebSocket.OPEN) {
           this.send({ type: 'candidate', candidate: candidate.toJSON() });
         } else {
           this.logNetworkEvent('ICE candidate not sent', 'signaling socket is not open');
         }
       } else if (!candidate) {
-        this.logNetworkEvent('ICE gathering', 'local candidates complete');
+        const total = [...candidateCounts.values()].reduce((sum, count) => sum + count, 0);
+        const types = [...candidateCounts].sort(([left], [right]) => left.localeCompare(right))
+          .map(([kind, count]) => `${kind}=${count}`).join(' ');
+        this.logNetworkEvent('ICE candidates collected', `total=${total}${types ? ` ${types}` : ''}`);
+        candidateCounts.clear();
       }
     });
     this.peerConnection.addEventListener('icecandidateerror', (event) => {
-      this.logNetworkEvent(
-        'ICE candidate error',
-        `code=${event.errorCode} address=${event.address || 'unknown'} port=${event.port || 'unknown'} ${String(event.errorText || '').slice(0, 120)}`
-      );
+      iceErrorLog.add(event);
     });
     this.peerConnection.addEventListener('negotiationneeded', () => {
       this.logNetworkEvent('PeerConnection', 'negotiationneeded');
@@ -2468,6 +2469,8 @@ export class RoomCall {
     this.clockRoundTripMs = null;
     const previousRole = this.localRole;
     const wasConnected = this.connected;
+    this.iceErrorLog?.flush();
+    this.iceErrorLog = null;
     this.stopDriftMonitoring();
     this.lastClockSample = null;
     this.recordingTransfer.close();

@@ -595,11 +595,15 @@ export class RoomSignaling {
       throw Object.assign(new Error(`Cloudflare Realtime API returned HTTP ${response.status}.`), { status: 502 });
     }
     const payload = await response.json();
-    if (!validTurnIceServers(payload?.iceServers)) {
-      throw Object.assign(new Error('The Cloudflare Realtime API returned an invalid TURN credential response.'), { status: 502 });
+    const iceServers = browserTurnIceServers(payload?.iceServers);
+    if (!validTurnIceServers(iceServers)) {
+      const shape = Array.isArray(payload?.iceServers)
+        ? `servers=${payload.iceServers.length}, browser-compatible servers=${iceServers?.length ?? 0}`
+        : 'iceServers is not an array';
+      throw Object.assign(new Error(`The Cloudflare Realtime API returned an invalid TURN credential response (${shape}).`), { status: 502 });
     }
     this.turnCredentials = {
-      iceServers: payload.iceServers,
+      iceServers,
       expiresAt: now + ttl * 1000
     };
     this.turnCredentialsKey = credentialsKey;
@@ -661,6 +665,27 @@ async function readLimitedText(request, maxBytes) {
     offset += chunk.byteLength;
   }
   return new TextDecoder().decode(bytes);
+}
+
+export function browserTurnIceServers(iceServers) {
+  if (!Array.isArray(iceServers) || iceServers.length < 1 || iceServers.length > 6) return null;
+  const filtered = [];
+  for (const server of iceServers) {
+    const urls = typeof server?.urls === 'string' ? [server.urls] : server?.urls;
+    if (!Array.isArray(urls) || !urls.length || urls.length > 32) return null;
+    const usable = urls.filter((url) => typeof url === 'string' &&
+      /^(?:stun:stun\.cloudflare\.com:3478|turns?:turn\.cloudflare\.com:(?:3478|443|80|5349)(?:\?transport=(?:udp|tcp))?)$/u.test(url));
+    if (!usable.length) continue;
+    const entry = { urls: usable };
+    if (usable.some((url) => /^turns?:/u.test(url))) {
+      if (typeof server.username !== 'string' || !server.username ||
+          typeof server.credential !== 'string' || !server.credential) return null;
+      entry.username = server.username;
+      entry.credential = server.credential;
+    }
+    filtered.push(entry);
+  }
+  return filtered;
 }
 
 function validTurnIceServers(iceServers) {

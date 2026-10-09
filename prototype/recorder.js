@@ -12,9 +12,10 @@ import { createPcm24Wav, writePcm24Wav } from './wav-export.js';
 import { splitTransferBacklog, summarizeTransferChunks } from './transfer-progress.js';
 import { monitorRecordingTrack } from './recording-track-monitor.js';
 import { makeRecordingFilename } from './recording-filename.js';
-import { createStartPlan, sameStartPlan } from './recording-timing.js';
+import { createStartPlan, sameStartPlan, usableOutputTimestamp } from './recording-timing.js';
 import { assessAlignment, writeAlignedPcm24Wav, MAX_TIMING_POINTS } from './drift-correction.js';
 import { mergeRecordingMetadata, synchronizationForTake } from './recording-ledger.js';
+import { eventLogSeverity } from './event-log.js';
 import { connectFirstMicrophoneChannel } from './microphone-input.js';
 import { appendAlignedWaveformPeak, resetWaveformHistory } from './waveform-history.js';
 
@@ -193,12 +194,10 @@ function appendNetworkEvent(event, details = '') {
   const wasAtBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 8;
   const elapsed = (performance.now() - networkEventLogStartedAt).toFixed(1).padStart(9, ' ');
   const detailText = details ? ` ${details}` : '';
-  log.setRangeText(
-    `${new Date().toISOString()} +${elapsed} ms | ${event}${detailText}\n`,
-    log.value.length,
-    log.value.length,
-    'preserve'
-  );
+  const line = document.createElement('div');
+  line.className = `network-event-line network-event-${eventLogSeverity(event, details)}`;
+  line.textContent = `${new Date().toISOString()} +${elapsed} ms | ${event}${detailText}`;
+  log.append(line);
   networkEventCount += 1;
   $('networkEventCount').textContent = `${networkEventCount} EVENTS`;
   if (wasAtBottom) log.scrollTop = log.scrollHeight;
@@ -1539,16 +1538,13 @@ async function renderTakes() {
     meta.className = 'take-meta';
     const duration = formatDuration((take.frames || 0) / TARGET_RATE);
     const size = Number.isFinite(take.bytes) ? formatBytes(take.bytes) : '—';
-    const synchronization = synchronizationForTake(take, takes);
-    const timing = synchronization
-      ? `Start difference ${synchronization.differenceMs.toFixed(1)} ms`
-      : take.startPlan
-        ? 'Synchronization unconfirmed'
-        : take.startObservation ? 'Start observed' : 'Start unconfirmed';
-    const delivery = take.remote || take.transferGeneration
-      ? take.hostStored ? 'Saved on host' : 'Transfer pending'
-      : 'Saved locally';
-    meta.textContent = `${duration} · ${size} · ${timing} · ${delivery}`;
+    const messages = [];
+    if (take.status !== 'recording' && (take.remote || take.transferGeneration)) {
+      if (!take.hostStored) messages.push('Transfer pending. Keep both devices connected.');
+      else if (roomCall?.isGuest) messages.push('Saved on host.');
+    }
+    if (take.tailUnknown) messages.push('Recovered recording: the final section may be incomplete.');
+    meta.textContent = `${duration} · ${size}`;
     info.append(label, meta);
     const actions = document.createElement('div');
     actions.className = 'take-actions';
@@ -1561,9 +1557,7 @@ async function renderTakes() {
         (take.remote && take.hostStored !== true);
       exportButton.addEventListener('click', () => { void exportTake(take, exportButton); });
       actions.append(exportButton);
-      if (!take.remote) {
-        meta.textContent += ' · Host reference (unchanged)';
-      } else {
+      if (take.remote) {
         const reference = takes.find((item) => !item.remote && item.startPlan?.eventId === take.startPlan?.eventId &&
           item.startPlan?.sequence === take.startPlan?.sequence);
         const alignment = assessAlignment(take, reference);
@@ -1577,12 +1571,23 @@ async function renderTakes() {
           : alignment.reason;
         alignedButton.addEventListener('click', () => { void exportTake(take, alignedButton, alignment); });
         actions.append(alignedButton);
-        meta.textContent += alignment.available
-          ? ` · Drift ${alignment.driftPpm.toFixed(1)} ppm (experimental)`
-          : ` · Alignment unavailable: ${alignment.reason}`;
+        if (!exportButton.disabled && !alignment.available) {
+          messages.push(`Aligned WAV unavailable: ${alignment.reason} Original WAV can still be saved.`);
+        }
       }
     }
     row.append(info, actions);
+    if (messages.length) {
+      const notice = document.createElement('div');
+      notice.className = 'take-notices';
+      for (const message of messages) {
+        const text = document.createElement('p');
+        text.className = 'take-notice';
+        text.textContent = message;
+        notice.append(text);
+      }
+      row.append(notice);
+    }
     takeList.append(row);
   }
 }
@@ -1901,8 +1906,7 @@ function queueRecordingMetadata(patch) {
 function recordTimingPoint(data) {
   if (!activeTake || !audioContext) return;
   const timestamp = audioContext.getOutputTimestamp?.();
-  if (!timestamp || !Number.isFinite(timestamp.performanceTime) || timestamp.performanceTime <= 0 ||
-      !Number.isFinite(timestamp.contextTime) || timestamp.contextTime <= 0) {
+  if (!usableOutputTimestamp(timestamp, performance.now(), audioContext.currentTime)) {
     activeTake.timingDiscontinuous = true;
     queueRecordingMetadata({ timingDiscontinuous: true });
     appendNetworkEvent('Recording timing unavailable', `frame=${data.frame} output timestamp unavailable`);
@@ -1917,6 +1921,10 @@ function recordTimingPoint(data) {
   const points = activeTake.timingPoints ?? [];
   if (points.length >= MAX_TIMING_POINTS || points.at(-1)?.frame >= point.frame) return;
   activeTake.timingPoints = [...points, point];
+  const elapsedFramesMs = points.length ? (point.frame - points[0].frame) * 1000 / TARGET_RATE : 0;
+  const clockDifferenceMs = points.length ? point.localPerfMs - points[0].localPerfMs - elapsedFramesMs : 0;
+  appendNetworkEvent('Recording timing measurement',
+    `role=${roomCall?.localRole ?? 'local'} frame=${point.frame} audioElapsed=${elapsedFramesMs.toFixed(1)} ms clockDifference=${clockDifferenceMs.toFixed(3)} ms`);
   queueRecordingMetadata({ timingPoints: activeTake.timingPoints });
 }
 
@@ -2004,10 +2012,10 @@ async function createTake({
       captureStartPending = false;
       updateCaptureStatusBadge();
       const timestamp = audioContext?.getOutputTimestamp?.();
-      const observedAt = timestamp && Number.isFinite(timestamp.performanceTime) &&
-        Number.isFinite(timestamp.contextTime)
+      const nowPerfMs = performance.now();
+      const observedAt = usableOutputTimestamp(timestamp, nowPerfMs, audioContext?.currentTime)
         ? timestamp.performanceTime + (data.contextTime - timestamp.contextTime) * 1000
-        : performance.now() + (data.contextTime - (audioContext?.currentTime ?? data.contextTime)) * 1000;
+        : nowPerfMs + (data.contextTime - (audioContext?.currentTime ?? data.contextTime)) * 1000;
       if (data.event) {
         roomCall?.reportRecordingStarted(data.event, observedAt, data.frame);
       } else {
@@ -2334,7 +2342,8 @@ async function stopRecording(recoveryReason = null) {
 
 function audioContextTimeAtPerformanceTime(targetTime) {
   const timestamp = audioContext?.getOutputTimestamp?.();
-  if (timestamp && Number.isFinite(timestamp.contextTime) && Number.isFinite(timestamp.performanceTime)) {
+  const nowPerfMs = performance.now();
+  if (usableOutputTimestamp(timestamp, nowPerfMs, audioContext.currentTime)) {
     const contextTarget = timestamp.contextTime + (targetTime - timestamp.performanceTime) / 1000;
     appendNetworkEvent(
       'Recording start schedule mapping',
@@ -2342,10 +2351,10 @@ function audioContextTimeAtPerformanceTime(targetTime) {
     );
     return contextTarget;
   }
-  const contextTarget = audioContext.currentTime + (targetTime - performance.now()) / 1000;
+  const contextTarget = audioContext.currentTime + (targetTime - nowPerfMs) / 1000;
   appendNetworkEvent(
     'Recording start schedule mapping',
-    `targetPerf=${targetTime.toFixed(3)} ms nowPerf=${performance.now().toFixed(3)} ms context=${audioContext.state} currentTime=${audioContext.currentTime.toFixed(3)} s targetContext=${contextTarget.toFixed(3)} s`
+    `targetPerf=${targetTime.toFixed(3)} ms nowPerf=${nowPerfMs.toFixed(3)} ms context=${audioContext.state} currentTime=${audioContext.currentTime.toFixed(3)} s targetContext=${contextTarget.toFixed(3)} s mapping=currentTime outputTimestamp=unavailable`
   );
   return contextTarget;
 }

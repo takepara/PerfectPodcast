@@ -40,11 +40,12 @@ test('removes recorder instructions but retains live statuses and errors', () =>
 
 test('shows a scrollable event log for studio events below the studio panels', () => {
   const studio = recorder.slice(recorder.indexOf('<section id="studioView"'), recorder.indexOf('<div id="notice"'));
-  assert.match(studio, /class="panel network-event-panel"[\s\S]*>EVENT LOG<\/span>[\s\S]*id="networkEventCount"[\s\S]*id="networkEventLog"[^>]*aria-label="Event log"[^>]*readonly[^>]*wrap="off"/);
+  assert.match(studio, /class="panel network-event-panel"[\s\S]*>EVENT LOG<\/span>[\s\S]*id="networkEventCount"[\s\S]*id="networkEventLog"[^>]*aria-label="Event log"[^>]*role="log"[^>]*tabindex="0"/);
   assert.ok(studio.indexOf('class="panel network-event-panel"') > studio.indexOf('class="studio-grid terminal-grid"'));
   const source = readPrototype('recorder.js');
   assert.match(source, /function appendNetworkEvent\(event, details = ''\)/);
-  assert.match(source, /log\.setRangeText\([\s\S]*new Date\(\)\.toISOString\(\)/);
+  assert.match(source, /line\.textContent = `\$\{new Date\(\)\.toISOString\(\)\}/);
+  assert.match(source, /eventLogSeverity\(event, details\)/);
   assert.match(source, /if \(wasAtBottom\) log\.scrollTop = log\.scrollHeight/);
   assert.match(source, /onNetworkEvent: appendNetworkEvent/);
   const css = readPrototype('recorder.css');
@@ -117,11 +118,11 @@ test('places compact name-and-sequence WAV rows inside the device storage panel'
   assert.equal(storagePanel.includes('takeCount'), false);
   assert.equal(recorder.includes('class="panel takes-panel"'), false);
   const css = readPrototype('recorder.css');
-  assert.match(css, /\.storage-recordings \.take-row \{ grid-template-columns: minmax\(0, 1fr\) auto;/);
-  assert.match(css, /\.terminal-ui \.storage-recordings \.take-row \{ grid-template-columns: minmax\(0, 1fr\) auto;/);
+  assert.match(css, /\.storage-recordings \.take-row \{ grid-template-columns: minmax\(0, 1fr\);/);
+  assert.match(css, /\.terminal-ui \.storage-recordings \.take-row \{ grid-template-columns: minmax\(0, 1fr\);/);
   assert.match(css, /\.storage-recordings \.take-row:first-child \{ border-top: 0;/);
-  assert.match(css, /\.storage-recordings \.take-actions \{ flex-wrap: nowrap; justify-content: end;/);
-  assert.match(css, /\.terminal-ui \.storage-recordings \.take-actions \{ justify-content: end;/);
+  assert.match(css, /\.storage-recordings \.take-actions \{ flex-wrap: wrap; justify-content: start;/);
+  assert.match(css, /\.terminal-ui \.storage-recordings \.take-actions \{ justify-content: start;/);
   assert.match(css, /\.terminal-ui \.take-title \{[^}]*font-size: 14px;/);
   assert.match(css, /\.terminal-ui \.take-meta \{[^}]*font-size: 12px;/);
   assert.match(css, /\.terminal-ui \.take-action \{[^}]*min-height: 38px;[^}]*font-size: 12px;/);
@@ -129,7 +130,7 @@ test('places compact name-and-sequence WAV rows inside the device storage panel'
   assert.match(source, /label\.textContent = `\$\{participant\} \$\{String\(take\.number\)\.padStart\(2, '0'\)\}`/);
   assert.match(source, /const duration = formatDuration\(\(take\.frames \|\| 0\) \/ TARGET_RATE\)/);
   assert.match(source, /const size = Number\.isFinite\(take\.bytes\) \? formatBytes\(take\.bytes\) : '—'/);
-  assert.match(source, /meta\.textContent = `\$\{duration\} · \$\{size\} · \$\{timing\} · \$\{delivery\}`/);
+  assert.match(source, /meta\.textContent = `\$\{duration\} · \$\{size\}`/);
   assert.equal(source.includes('takeCount'), false);
   assert.equal(source.includes('takeStatusLabel'), false);
 });

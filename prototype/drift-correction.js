@@ -42,9 +42,15 @@ function fit(points, xKey, yKey, minimumSpan, maximumGap) {
   }
   const slope = numerator / denominator;
   const intercept = first[yKey] + yMean - slope * (first[xKey] + xMean);
-  const residualMs = Math.max(...points.map((point) => Math.abs(point[yKey] - (intercept + slope * point[xKey]))));
-  if (!Number.isFinite(slope) || !Number.isFinite(intercept) || residualMs > 2) {
-    throw new Error('Timing is unstable (more than 2 ms residual error).');
+  const errors = points.map((point) => point[yKey] - (intercept + slope * point[xKey]));
+  const residualMs = Math.max(...errors.map(Math.abs));
+  const rmsMs = Math.sqrt(errors.reduce((sum, error) => sum + error * error, 0) / errors.length);
+  if (!Number.isFinite(slope) || !Number.isFinite(intercept)) {
+    throw new Error('The timing model could not be calculated.');
+  }
+  if (residualMs > 2) {
+    const worst = errors.findIndex((error) => Math.abs(error) === residualMs);
+    throw new Error(`Timing is unstable (max residual=${residualMs.toFixed(2)} ms, RMS=${rmsMs.toFixed(2)} ms, points=${points.length}, worst ${xKey}=${points[worst][xKey]}; limit=2 ms).`);
   }
   return { slope, intercept, residualMs };
 }

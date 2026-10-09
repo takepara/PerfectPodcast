@@ -8,7 +8,21 @@ import {
   RoomCall,
   transcript
 } from '../prototype/room-call.js';
-import worker, { RoomSignaling } from '../worker/index.js';
+import worker, { RoomSignaling, browserTurnIceServers } from '../worker/index.js';
+
+test('filters browser-blocked Cloudflare TURN ports without discarding valid credentials', () => {
+  const servers = [
+    { urls: ['stun:stun.cloudflare.com:3478'] },
+    { urls: ['turn:turn.cloudflare.com:53?transport=udp', 'turn:turn.cloudflare.com:3478?transport=udp',
+      'turns:turn.cloudflare.com:443?transport=tcp'], username: 'user', credential: 'password' }
+  ];
+  const result = browserTurnIceServers(servers);
+  assert.equal(result.length, 2);
+  assert.deepEqual(result[1].urls, servers[1].urls.slice(1));
+  assert.equal(result[1].credential, 'password');
+  assert.equal(browserTurnIceServers([{ urls: ['turn:turn.cloudflare.com:3478'] }]), null);
+  assert.deepEqual(browserTurnIceServers([{ urls: ['turn:example.com:3478'], username: 'user', credential: 'password' }]), []);
+});
 
 test('reads the DTLS SHA-256 fingerprint from CRLF SDP', () => {
   const fingerprint = 'A1:B2:C3:D4';
