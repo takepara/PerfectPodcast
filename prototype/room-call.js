@@ -193,7 +193,6 @@ export class RoomCall {
     onRecordingPrepare,
     onRecordingState,
     onSynchronization,
-    onClockMeasurement,
     onLocalStream,
     onSessionName,
     onNetworkEvent,
@@ -221,9 +220,6 @@ export class RoomCall {
     this.onRecordingPrepare = onRecordingPrepare;
     this.onRecordingState = onRecordingState;
     this.onSynchronization = onSynchronization;
-    this.onClockMeasurement = onClockMeasurement;
-    this.driftTimer = null;
-    this.lastClockSample = null;
     this.onLocalStream = onLocalStream;
     this.onSessionName = onSessionName;
     this.onNetworkEvent = onNetworkEvent;
@@ -362,21 +358,6 @@ export class RoomCall {
     return this.clockSyncPromise;
   }
 
-  startDriftMonitoring() {
-    if (this.localRole !== 'host' || this.driftTimer !== null) return;
-    this.driftTimer = window.setInterval(() => {
-      if (!this.getRecordingState() || !this.isPeerReadyForRecording) return;
-      void this.synchronizeClock().then(() => {
-        this.onClockMeasurement?.(this.lastClockSample);
-      }).catch((error) => this.logNetworkEvent('Clock drift measurement unavailable', error.message));
-    }, 30_000);
-  }
-
-  stopDriftMonitoring() {
-    window.clearInterval(this.driftTimer);
-    this.driftTimer = null;
-  }
-
   async measureClockOffset() {
     const samples = [];
     for (let index = 0; index < CLOCK_PROBE_COUNT; index += 1) {
@@ -410,7 +391,6 @@ export class RoomCall {
     const selected = selectClockSample(samples, MIN_CLOCK_PROBE_SAMPLES);
     this.clockOffsetMs = selected.offsetMs;
     this.clockRoundTripMs = selected.roundTripMs;
-    this.lastClockSample = { hostPerfMs: selected.hostPerfMs, guestPerfMs: selected.guestPerfMs, roundTripMs: selected.roundTripMs };
     this.logNetworkEvent(
       'Clock sync selected',
       `samples=${samples.length}/${CLOCK_PROBE_COUNT} offset=${selected.offsetMs.toFixed(2)} ms selectedRTT=${selected.roundTripMs.toFixed(2)} ms RTT range=${Math.min(...samples.map((sample) => sample.roundTripMs)).toFixed(2)}–${Math.max(...samples.map((sample) => sample.roundTripMs)).toFixed(2)} ms`
@@ -462,8 +442,6 @@ export class RoomCall {
         message.repliedAt,
         hostReceivedAt
       );
-      sample.hostPerfMs = (probe.sentAt + hostReceivedAt) / 2;
-      sample.guestPerfMs = (message.receivedAt + message.repliedAt) / 2;
       probe.resolve(sample);
     } catch {
       probe.resolve(null);
@@ -2471,8 +2449,6 @@ export class RoomCall {
     const wasConnected = this.connected;
     this.iceErrorLog?.flush();
     this.iceErrorLog = null;
-    this.stopDriftMonitoring();
-    this.lastClockSample = null;
     this.recordingTransfer.close();
     this.inputMonitorChannel?.close();
     this.inputMonitorChannel = null;

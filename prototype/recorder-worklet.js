@@ -11,9 +11,20 @@ class LocalRecorderProcessor extends AudioWorkletProcessor {
     this.startAt = null;
     this.armed = false;
     this.started = false;
+    this.firstSampleContextTime = null;
+    this.endSampleContextTime = null;
+    this.expectedProcessFrame = null;
+    this.missingInputFrames = 0;
+    this.missingInputBlocks = 0;
+    this.contextGapFrames = 0;
+    this.contextGapBlocks = 0;
+    this.contextBackwardBlocks = 0;
+    this.contextBackwardFrames = 0;
+    this.firstContextBackward = null;
+    this.firstMissingInput = null;
+    this.firstContextGap = null;
     this.buffer = new Float32Array(SAMPLE_RATE_TARGET);
     this.chunkStartFrame = 0;
-    this.nextTimingFrame = 30 * SAMPLE_RATE_TARGET;
     this.levelFrames = 0;
     this.levelPeak = 0;
     this.port.onmessage = ({ data }) => {
@@ -26,6 +37,11 @@ class LocalRecorderProcessor extends AudioWorkletProcessor {
         this.event = typeof data.eventId === 'string' && Number.isSafeInteger(data.sequence)
           ? { eventId: data.eventId, sequence: data.sequence }
           : null;
+        this.startRequest = {
+          sentPerfMs: data.sentPerfMs,
+          sentContextTime: data.sentContextTime,
+          receivedContextTime: currentTime
+        };
         this.armed = true;
         this.port.postMessage({ type: 'armed', event: this.event });
       } else if (data.type === 'stop') {
@@ -33,7 +49,14 @@ class LocalRecorderProcessor extends AudioWorkletProcessor {
         this.startAt = null;
         this.recording = false;
         this.flush(true);
-        this.port.postMessage({ type: 'stopped' });
+        this.port.postMessage({ type: 'stopped', frames: this.totalFrames,
+          firstSampleContextTime: this.firstSampleContextTime,
+          endSampleContextTime: this.endSampleContextTime,
+          missingInputFrames: this.missingInputFrames, missingInputBlocks: this.missingInputBlocks,
+          contextGapFrames: this.contextGapFrames, contextGapBlocks: this.contextGapBlocks,
+          contextBackwardBlocks: this.contextBackwardBlocks, contextBackwardFrames: this.contextBackwardFrames,
+          firstMissingInput: this.firstMissingInput, firstContextGap: this.firstContextGap,
+          firstContextBackward: this.firstContextBackward });
       }
     };
   }
@@ -47,10 +70,27 @@ class LocalRecorderProcessor extends AudioWorkletProcessor {
     this.buffer = new Float32Array(SAMPLE_RATE_TARGET);
   }
 
-  process(inputs, outputs) {
+  process(inputs) {
     const input = inputs[0]?.[0];
-    const output = outputs[0]?.[0];
-    if (output) output.fill(0);
+    const processFrame = Math.round(currentTime * sampleRate);
+    if (this.recording) {
+      const gap = this.expectedProcessFrame === null ? 0 : processFrame - this.expectedProcessFrame;
+      if (gap > 0) {
+        this.contextGapFrames += gap;
+        this.contextGapBlocks += 1;
+        this.firstContextGap ??= { frame: this.totalFrames, contextTime: currentTime, frames: gap };
+      } else if (gap < 0) {
+        this.contextBackwardBlocks += 1;
+        this.contextBackwardFrames -= gap;
+        this.firstContextBackward ??= { frame: this.totalFrames, contextTime: currentTime, frames: -gap };
+      }
+      if (!input?.length) {
+        this.missingInputFrames += 128;
+        this.missingInputBlocks += 1;
+        this.firstMissingInput ??= { frame: this.totalFrames, contextTime: currentTime };
+      }
+    }
+    this.expectedProcessFrame = processFrame + (input?.length || 128);
 
     if (input) {
       for (let index = 0; index < input.length; index += 1) {
@@ -60,23 +100,22 @@ class LocalRecorderProcessor extends AudioWorkletProcessor {
           this.armed = false;
           this.started = true;
           this.recording = true;
-          const contextTime = currentTime + index / sampleRate;
+          const contextTime = (processFrame + index) / sampleRate;
+          this.firstSampleContextTime = contextTime;
           this.startAt = null;
           this.port.postMessage({
             type: 'started',
             frame: this.totalFrames,
             contextTime,
+            startRequest: this.startRequest,
             event: this.event
           });
         }
         if (this.recording && this.totalFrames < this.maximumFrames) {
-          if (this.totalFrames >= this.nextTimingFrame) {
-            this.port.postMessage({ type: 'timing', frame: this.totalFrames, contextTime: currentTime + index / sampleRate });
-            this.nextTimingFrame += 30 * SAMPLE_RATE_TARGET;
-          }
           this.buffer[this.frames] = input[index];
           this.frames += 1;
           this.totalFrames += 1;
+          this.endSampleContextTime = (processFrame + index + 1) / sampleRate;
           if (this.totalFrames === this.maximumFrames) {
             this.recording = false;
             this.flush(true);

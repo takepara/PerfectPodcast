@@ -32,9 +32,8 @@ test('host inventory separates name, duration-size, buttons and actionable notic
   assert.equal(host.children[0].children[0].textContent, 'Host 01');
   assert.equal(host.children[0].children[1].textContent, '00:01 · 144 KB');
   assert.equal(host.children[1].children.length, 1);
-  assert.equal(guest.children[1].children.length, 2);
-  assert.equal(guest.children[2].className, 'take-notices');
-  assert.match(guest.children[2].children[0].textContent, /Original WAV can still be saved/);
+  assert.equal(guest.children[1].children.length, 1);
+  assert.equal(guest.children.length, 2, 'no alignment diagnostics in normal inventory');
 });
 
 test('guest inventory shows delivery confirmation below details without misleading sync diagnostics', async () => {

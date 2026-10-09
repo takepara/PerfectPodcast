@@ -6,12 +6,10 @@ import { mergeRecordingMetadata, synchronizationForTake } from '../prototype/rec
 
 const source = readFileSync(new URL('../prototype/recorder.js', import.meta.url), 'utf8');
 const commitSource = source.slice(source.indexOf('async function commitChunk('), source.indexOf('\nfunction queueRecordingMetadata'));
-const queueSource = source.slice(source.indexOf('function queueRecordingMetadata('), source.indexOf('\nfunction recordTimingPoint('));
-const first = { frame: 0, localPerfMs: 1000, contextTime: 1, uncertaintyMs: 1 };
-const second = { frame: 1440000, localPerfMs: 31000, contextTime: 31, uncertaintyMs: 1 };
+const queueSource = source.slice(source.indexOf('function queueRecordingMetadata('), source.indexOf('\nasync function createTake('));
 
 function setup() {
-  const stored = new Map([['take', { id: 'take', frames: 0, chunks: 0, bytes: 0, timingPoints: [first], hostStoredChunks: [{ sequence: 4 }] }]]);
+  const stored = new Map([['take', { id: 'take', frames: 0, chunks: 0, bytes: 0, hostStoredChunks: [{ sequence: 4 }] }]]);
   const transactions = [];
   const context = vm.createContext({
     mergeRecordingMetadata, activeTake: structuredClone(stored.get('take')),
@@ -41,40 +39,31 @@ function setup() {
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
-test('timing and clock points arriving during a delayed chunk transaction survive memory replacement and later commits', async () => {
+test('start observation arriving during a delayed chunk transaction survives memory replacement and later commits', async () => {
   const { context, transactions, stored } = setup();
   const pending = context.commitChunk(new Float32Array(1), false, 0);
   await tick();
-  context.activeTake.timingPoints = [first, second];
-  context.activeTake.clockSamples = [{ hostPerfMs: 31000, guestPerfMs: 32000, roundTripMs: 1 }];
   context.activeTake.startObservation = { frame: 0, localPerfMs: 1000, contextTime: 1 };
-  context.activeTake.timingDiscontinuous = true;
-  context.queueRecordingMetadata({ timingPoints: [first, second], clockSamples: context.activeTake.clockSamples,
-    startObservation: context.activeTake.startObservation, timingDiscontinuous: true });
+  context.queueRecordingMetadata({ startObservation: context.activeTake.startObservation });
   transactions[0].finish();
   await pending;
-  assert.equal(context.activeTake.timingPoints.length, 2);
-  assert.equal(context.activeTake.clockSamples.length, 1);
-  assert.equal(context.activeTake.timingDiscontinuous, true);
+  assert.equal(context.activeTake.startObservation.frame, 0);
   await tick();
   transactions[1].finish();
   await context.commitChain;
   const next = context.commitChunk(new Float32Array(1), true, 1);
   await tick(); transactions[2].finish(); await next;
-  assert.equal(stored.get('take').timingPoints.length, 2);
-  assert.equal(stored.get('take').timingPoints[0].frame, 0);
-  assert.equal(stored.get('take').clockSamples.length, 1);
+  assert.equal(stored.get('take').startObservation.frame, 0);
   assert.equal(stored.get('take').frames, 2);
   assert.equal(stored.get('take').hostStoredChunks.length, 1);
 });
 
-test('a stale metadata update cannot remove newer measurements or confirmed transfer ledger entries', () => {
-  const stored = { id: 'take', frames: 200, timingPoints: [first, second],
-    timingDiscontinuous: true, hostStoredChunks: [{ sequence: 0 }], synchronization: { differenceMs: -0.1 } };
-  const result = mergeRecordingMetadata(stored, { id: 'take', frames: 0, timingPoints: [first], timingDiscontinuous: false });
-  assert.equal(result.timingPoints.length, 2);
+test('a stale metadata update preserves counters, start observation and confirmed transfer entries', () => {
+  const stored = { id: 'take', frames: 200, startObservation: { frame: 0, localPerfMs: 1000, contextTime: 1 },
+    hostStoredChunks: [{ sequence: 0 }], synchronization: { differenceMs: -0.1 } };
+  const result = mergeRecordingMetadata(stored, { id: 'take', frames: 0 });
   assert.equal(result.frames, 200);
-  assert.equal(result.timingDiscontinuous, true);
+  assert.equal(result.startObservation.frame, 0);
   assert.equal(result.hostStoredChunks.length, 1);
   assert.equal(result.synchronization.differenceMs, -0.1);
 });

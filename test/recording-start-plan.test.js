@@ -80,8 +80,7 @@ test('scheduled processor audio reaches host storage and manifest ACK with its i
   const take = { ...saved[0], id: event.eventId, number: 1, participant: 'Guest',
     transferGeneration: 'test-generation', status: 'stopped', frames: 100, chunks: 1,
     startObservation: { frame: 0, contextTime: observed.contextTime, localPerfMs: 1500 },
-    timingPoints: [{ frame: 0, contextTime: 1.5, localPerfMs: 1500, uncertaintyMs: 1 }],
-    timingDiscontinuous: false };
+    };
   const originalWindow = globalThis.window;
   globalThis.window = { setTimeout, clearTimeout };
   let hostSaved = false;
@@ -98,9 +97,6 @@ test('scheduled processor audio reaches host storage and manifest ACK with its i
     storeManifest: async (manifest) => {
       assert.equal(hostSaved, true);
       assert.equal(manifest.startObservation.contextTime, 1.5);
-      assert.equal(manifest.timingPoints.length, 1);
-      assert.equal(manifest.timingPoints[0].frame, 0);
-      assert.equal(manifest.timingDiscontinuous, false);
       assert.equal(manifest.startedAt, saved[0].startedAt);
     }
   });

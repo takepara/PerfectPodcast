@@ -1,5 +1,4 @@
 import { validWallTime, validStartPlan, validStartObservation } from './recording-timing.js';
-import { validTimingPoints } from './drift-correction.js';
 
 const CHUNK_BYTES_PER_FRAME = 3;
 const WAV_HEADER_BYTES = 44;
@@ -84,8 +83,6 @@ function validManifest(message) {
     validWallTime(message.startedAt) &&
     validStartPlan(message.startPlan ?? null) &&
     validStartObservation(message.startObservation ?? null) &&
-    validTimingPoints(message.timingPoints ?? []) &&
-    (message.timingDiscontinuous === undefined || typeof message.timingDiscontinuous === 'boolean') &&
     (message.startedAtEstimated === undefined || typeof message.startedAtEstimated === 'boolean') &&
     Number.isSafeInteger(message.frames) && message.frames > 0 &&
     Number.isSafeInteger(message.chunks) && message.chunks > 0 &&
@@ -341,8 +338,6 @@ export class RecordingTransfer {
       startedAt: take.startedAt ?? null,
       startPlan: take.startPlan ?? null,
       startObservation: take.startObservation ?? null,
-      timingPoints: take.timingPoints ?? [],
-      timingDiscontinuous: Boolean(take.timingDiscontinuous),
       startedAtEstimated: Boolean(take.startedAtEstimated),
       frames: take.frames,
       chunks: take.chunks,

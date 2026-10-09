@@ -60,6 +60,7 @@ test('marks the final full WAV chunk as final when the frame limit aligns to one
   assert.equal(processor.port.messages.filter((message) => message.type === 'limit-reached').length, 1);
 });
 
+
 test('immediate recording reports exactly one first-frame observation', async () => {
   const { processor } = await loadProcessor();
   processor.port.onmessage({ data: { type: 'start', maximumFrames: 1000 } });
@@ -72,19 +73,95 @@ test('immediate recording reports exactly one first-frame observation', async ()
   assert.equal(processor.port.messages[0].type, 'armed');
 });
 
-test('records frame-clock anchors every 30 seconds without changing captured samples', async () => {
+
+
+test('records and flushes the original input with no audio outputs', async () => {
   const { processor, context } = await loadProcessor();
-  processor.port.onmessage({ data: { type: 'start', maximumFrames: 48_000 * 32 } });
-  const block = new Float32Array(48_000).fill(0.25);
-  for (let second = 0; second < 32; second += 1) {
-    context.currentTime = second;
-    processor.process([[block]], [[new Float32Array(48_000)]]);
+  processor.port.onmessage({ data: { type: 'start', maximumFrames: 1000, startAt: 1 } });
+  processor.process([[new Float32Array(128).fill(0.25)]], []);
+  assert.equal(processor.totalFrames, 0);
+  context.currentTime = 1;
+  processor.process([[new Float32Array(128).fill(0.25)]], []);
+  processor.port.onmessage({ data: { type: 'stop' } });
+  assert.equal(processor.port.messages.filter((message) => message.type === 'started').length, 1);
+  const audio = processor.port.messages.find((message) => message.type === 'audio');
+  assert.equal(audio.samples.length, 128);
+  assert.ok(audio.samples.every((sample) => sample === 0.25));
+  assert.equal(audio.final, true);
+  const stopped = processor.port.messages.at(-1);
+  assert.equal(stopped.type, 'stopped');
+  assert.equal(stopped.frames, 128);
+  assert.equal(stopped.firstSampleContextTime, 1);
+  assert.ok(Math.abs(stopped.endSampleContextTime - 1 - 128 / 48000) < 1e-12);
+});
+
+test('stop summary exposes an input gap without modifying captured samples', async () => {
+  const { processor, context } = await loadProcessor();
+  processor.port.onmessage({ data: { type: 'start', maximumFrames: 1000 } });
+  processor.process([[new Float32Array(128)]], []);
+  context.currentTime = 128 / 48000;
+  processor.process([[]], []);
+  context.currentTime = 256 / 48000;
+  processor.process([[new Float32Array(128)]], []);
+  processor.port.onmessage({ data: { type: 'stop' } });
+  const stopped = processor.port.messages.at(-1);
+  assert.equal(stopped.frames, 256);
+  assert.equal(stopped.firstSampleContextTime, 0);
+  assert.ok(Math.abs(stopped.endSampleContextTime * 48000 - 384) < 1e-9);
+  assert.equal(stopped.missingInputFrames, 128);
+  assert.equal(stopped.missingInputBlocks, 1);
+  assert.equal(stopped.contextGapFrames, 0);
+  assert.equal(stopped.firstMissingInput.frame, 128);
+});
+
+test('identifies a 512-frame context gap separately from missing input', async () => {
+  const { processor, context } = await loadProcessor();
+  processor.port.onmessage({ data: { type: 'start', maximumFrames: 1000 } });
+  processor.process([[new Float32Array(128).fill(0.25)]], []);
+  context.currentTime = 640 / 48000;
+  processor.process([[new Float32Array(128).fill(0.5)]], []);
+  processor.port.onmessage({ data: { type: 'stop' } });
+  const stopped = processor.port.messages.at(-1);
+  assert.equal(stopped.frames, 256);
+  assert.equal(stopped.contextGapFrames, 512);
+  assert.equal(stopped.contextGapBlocks, 1);
+  assert.equal(stopped.firstContextGap.frame, 128);
+  assert.equal(stopped.missingInputFrames, 0);
+  assert.equal(stopped.contextBackwardBlocks, 0);
+});
+
+test('forward and backward context boundaries account for net span without dropping samples', async () => {
+  const { processor, context } = await loadProcessor();
+  processor.port.onmessage({ data: { type: 'start', maximumFrames: 1000 } });
+  for (const frame of [366080, 366720, 366720, 366976]) {
+    context.currentTime = frame / 48000;
+    processor.process([[new Float32Array(128).fill(0.25)]], []);
   }
-  const anchors = processor.port.messages.filter((message) => message.type === 'timing');
-  assert.equal(anchors.length, 1);
-  assert.equal(anchors[0].frame, 48_000 * 30);
-  assert.equal(anchors[0].contextTime, 30);
-  assert.equal(processor.totalFrames, 48_000 * 32);
+  processor.port.onmessage({ data: { type: 'stop' } });
+  const stopped = processor.port.messages.at(-1);
+  assert.equal(stopped.frames, 512);
+  assert.equal(stopped.contextGapFrames, 640);
+  assert.equal(stopped.contextBackwardFrames, 128);
+  assert.equal(stopped.contextBackwardBlocks, 1);
+  assert.equal(stopped.firstContextBackward.frame, 256);
+  const spanFrames = Math.round((stopped.endSampleContextTime - stopped.firstSampleContextTime) * 48000);
+  assert.equal(spanFrames - stopped.frames, stopped.contextGapFrames - stopped.contextBackwardFrames);
+  assert.equal(processor.port.messages.find((message) => message.type === 'audio').samples.length, 512);
+});
+
+test('start notification preserves request boundary clocks without changing first sample timing', async () => {
+  const { processor, context } = await loadProcessor();
+  context.currentTime = 9.077;
+  processor.port.onmessage({ data: { type: 'start', maximumFrames: 1000,
+    sentPerfMs: 12000, sentContextTime: 9.077 } });
+  context.currentTime = 9.061333333333334;
+  processor.process([[new Float32Array(128)]], []);
+  const start = processor.port.messages.find((message) => message.type === 'started');
+  assert.equal(start.startRequest.sentPerfMs, 12000);
+  assert.equal(start.startRequest.sentContextTime, 9.077);
+  assert.equal(start.startRequest.receivedContextTime, 9.077);
+  assert.equal(start.contextTime, 9.061333333333334);
+  assert.equal(processor.totalFrames, 128);
 });
 
 test('waits for the scheduled AudioContext time before recording frames', async () => {

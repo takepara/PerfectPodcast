@@ -2,14 +2,13 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
-import { usableOutputTimestamp } from '../prototype/recording-timing.js';
 
 const source = readFileSync(new URL('../prototype/recorder.js', import.meta.url), 'utf8');
 const mapping = source.slice(source.indexOf('function audioContextTimeAtPerformanceTime('), source.indexOf('\nfunction primeRecordingAudioContext'));
 
 test('zero output performance timestamp cannot postpone capture by the page uptime', () => {
   const events = [];
-  const context = vm.createContext({ usableOutputTimestamp,
+  const context = vm.createContext({
     audioContext: { state: 'running', currentTime: 26.843,
       getOutputTimestamp: () => ({ performanceTime: 0, contextTime: 26.837 }) },
     performance: { now: () => 29418.7 }, appendNetworkEvent: (...args) => events.push(args)
@@ -20,16 +19,16 @@ test('zero output performance timestamp cannot postpone capture by the page upti
   assert.match(events[0][1], /mapping=currentTime/);
 });
 
-test('recent valid output mapping is preserved while zero, stale and nonfinite mappings are rejected', () => {
-  assert.equal(usableOutputTimestamp({ performanceTime: 29410, contextTime: 26.83 }, 29418.7, 26.843), true);
-  for (const timestamp of [
-    { performanceTime: 0, contextTime: 26.83 },
-    { performanceTime: 29000, contextTime: 0 },
-    { performanceTime: 1000, contextTime: 26.83 },
-    { performanceTime: 29410, contextTime: NaN },
-    { performanceTime: 29410, contextTime: 1 }
-  ]) assert.equal(usableOutputTimestamp(timestamp, 29418.7, 26.843), false);
+test('start scheduling ignores even valid output timestamps and uses a nearby currentTime anchor', () => {
+  const context = vm.createContext({
+    audioContext: { state: 'running', currentTime: 10,
+      getOutputTimestamp() { assert.fail('output clock must not be used for input scheduling'); } },
+    performance: { now: () => 20000 }, appendNetworkEvent() {}
+  });
+  vm.runInContext(mapping, context);
+  assert.equal(context.audioContextTimeAtPerformanceTime(20500), 10.5);
 });
+
 
 test('fallback schedule actually starts the Worklet after half a second and captures subsequent audio', () => {
   let Processor;

@@ -189,6 +189,13 @@ test('reuses an already running preview AudioContext for scheduled recording', a
   assert.match(createTakeSource, /if \(primedRecordingAudioContext === audioContext\) \{\s*primedRecordingAudioContext = null;/);
 });
 
+test('recording uses an input-only Worklet without a silent speaker connection', () => {
+  const createTake = source.slice(source.indexOf('async function createTake('), source.indexOf('\nasync function activatePreparedTake'));
+  assert.match(createTake, /numberOfOutputs: 0/);
+  assert.match(createTake, /analyserNode\.connect\(recorderNode\)/);
+  assert.doesNotMatch(createTake, /recorderNode\.connect|silentGain/);
+});
+
 test('waits for both devices to prepare before scheduling a synchronized start', () => {
   const prepareGuest = startRecordingSource.indexOf('roomCall.prepareGuestRecording(');
   const announceStart = startRecordingSource.indexOf('roomCall.setHostRecordingState(');
