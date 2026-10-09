@@ -189,6 +189,26 @@ test('reuses an already running preview AudioContext for scheduled recording', a
   assert.match(createTakeSource, /if \(primedRecordingAudioContext === audioContext\) \{\s*primedRecordingAudioContext = null;/);
 });
 
+test('preview handoff disconnects every preview node while preserving the running AudioContext', () => {
+  const stopPreview = source.slice(source.indexOf('function stopLocalPreview('), source.indexOf('\nfunction stopWaveformRendering'));
+  const disconnected = [];
+  let closed = false;
+  const context = vm.createContext({
+    stopMeterMonitoring() {}, updateMicrophoneMuteButton() {},
+    previewSourceNode: { disconnect: () => disconnected.push('source') },
+    previewInputChannelNode: { disconnect: () => disconnected.push('input') },
+    previewAnalyserNode: { disconnect: () => disconnected.push('analyser') },
+    previewSilentGain: { disconnect: () => disconnected.push('gain') },
+    previewAudioContext: { state: 'running', close: () => { closed = true; } },
+    previewSamples: {}, previewStream: {}
+  });
+  vm.runInContext(stopPreview, context);
+  context.stopLocalPreview({ preserveAudioContext: true });
+  assert.deepEqual(disconnected, ['source', 'input', 'analyser', 'gain']);
+  assert.equal(closed, false);
+  assert.equal(context.previewSilentGain, null);
+});
+
 test('recording uses an input-only Worklet without a silent speaker connection', () => {
   const createTake = source.slice(source.indexOf('async function createTake('), source.indexOf('\nasync function activatePreparedTake'));
   assert.match(createTake, /numberOfOutputs: 0/);

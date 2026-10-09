@@ -164,6 +164,31 @@ test('start notification preserves request boundary clocks without changing firs
   assert.equal(processor.totalFrames, 128);
 });
 
+test('preparation waits for continuous input processing without recording warm-up audio', async () => {
+  const { processor, context } = await loadProcessor();
+  processor.port.onmessage({ data: { type: 'prepare' } });
+  processor.process([[]], []);
+  for (const frame of [0, 128, 768]) {
+    context.currentTime = frame / 48000;
+    processor.process([[new Float32Array(128)]], []);
+  }
+  assert.equal(processor.port.messages.some((message) => message.type === 'prepared'), false);
+  for (let frame = 896; frame <= 1664; frame += 128) {
+    context.currentTime = frame / 48000;
+    processor.process([[new Float32Array(128)]], []);
+  }
+  const ready = processor.port.messages.filter((message) => message.type === 'prepared');
+  assert.equal(ready.length, 1);
+  assert.equal(ready[0].blocks, 8);
+  assert.equal(processor.totalFrames, 0);
+  assert.equal(processor.port.messages.some((message) => message.type === 'audio'), false);
+  processor.port.onmessage({ data: { type: 'start', maximumFrames: 1000 } });
+  context.currentTime = 1792 / 48000;
+  processor.process([[new Float32Array(128).fill(0.25)]], []);
+  assert.equal(processor.totalFrames, 128);
+  assert.equal(processor.port.messages.find((message) => message.type === 'started').contextTime, 1792 / 48000);
+});
+
 test('waits for the scheduled AudioContext time before recording frames', async () => {
   const { processor, context } = await loadProcessor();
   const event = { eventId: 'start-event', sequence: 3 };

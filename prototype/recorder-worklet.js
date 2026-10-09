@@ -11,6 +11,9 @@ class LocalRecorderProcessor extends AudioWorkletProcessor {
     this.startAt = null;
     this.armed = false;
     this.started = false;
+    this.preparing = false;
+    this.readyBlocks = 0;
+    this.readyExpectedFrame = null;
     this.firstSampleContextTime = null;
     this.endSampleContextTime = null;
     this.expectedProcessFrame = null;
@@ -28,7 +31,12 @@ class LocalRecorderProcessor extends AudioWorkletProcessor {
     this.levelFrames = 0;
     this.levelPeak = 0;
     this.port.onmessage = ({ data }) => {
-      if (data.type === 'start') {
+      if (data.type === 'prepare') {
+        if (this.armed || this.started) return;
+        this.preparing = true;
+        this.readyBlocks = 0;
+        this.readyExpectedFrame = null;
+      } else if (data.type === 'start') {
         if (this.armed || this.started) return;
         this.maximumFrames = Number.isSafeInteger(data.maximumFrames) && data.maximumFrames > 0
           ? Math.min(data.maximumFrames, MAX_SESSION_FRAMES)
@@ -45,6 +53,7 @@ class LocalRecorderProcessor extends AudioWorkletProcessor {
         this.armed = true;
         this.port.postMessage({ type: 'armed', event: this.event });
       } else if (data.type === 'stop') {
+        this.preparing = false;
         this.armed = false;
         this.startAt = null;
         this.recording = false;
@@ -73,6 +82,19 @@ class LocalRecorderProcessor extends AudioWorkletProcessor {
   process(inputs) {
     const input = inputs[0]?.[0];
     const processFrame = Math.round(currentTime * sampleRate);
+    if (this.preparing) {
+      if (!input?.length) {
+        this.readyBlocks = 0;
+        this.readyExpectedFrame = null;
+      } else {
+        this.readyBlocks = this.readyExpectedFrame === processFrame ? this.readyBlocks + 1 : 1;
+        this.readyExpectedFrame = processFrame + input.length;
+        if (this.readyBlocks >= 8) {
+          this.preparing = false;
+          this.port.postMessage({ type: 'prepared', contextTime: currentTime, blocks: this.readyBlocks });
+        }
+      }
+    }
     if (this.recording) {
       const gap = this.expectedProcessFrame === null ? 0 : processFrame - this.expectedProcessFrame;
       if (gap > 0) {

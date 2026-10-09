@@ -391,7 +391,7 @@ function stopLocalPreview({ preserveAudioContext = false } = {}) {
   previewSourceNode?.disconnect();
   previewInputChannelNode?.disconnect();
   previewAnalyserNode?.disconnect();
-  if (!preserveAudioContext) previewSilentGain?.disconnect();
+  previewSilentGain?.disconnect();
   if (!preserveAudioContext && previewAudioContext && previewAudioContext.state !== 'closed') {
     void previewAudioContext.close();
   }
@@ -2061,6 +2061,25 @@ async function createTake({
     'Recording AudioContext ready',
     `state=${audioContext.state} currentTime=${audioContext.currentTime.toFixed(3)} s`
   );
+  await new Promise((resolve, reject) => {
+    const port = recorderNode.port;
+    const previousHandler = port.onmessage;
+    const timeout = window.setTimeout(() => {
+      port.onmessage = previousHandler;
+      reject(new Error('The recording AudioWorklet did not receive continuous microphone input. Check the microphone and try again.'));
+    }, 3000);
+    port.onmessage = (message) => {
+      if (message.data.type === 'prepared') {
+        window.clearTimeout(timeout);
+        port.onmessage = previousHandler;
+        appendNetworkEvent('Recording input ready', `blocks=${message.data.blocks} context=${message.data.contextTime.toFixed(6)} s`);
+        resolve();
+      } else {
+        previousHandler?.(message);
+      }
+    };
+    port.postMessage({ type: 'prepare' });
+  });
   if (track.readyState !== 'live') throw new Error('Microphone input ended before recording started. Check the device and try again.');
   if (scheduledStartAt !== null && scheduledStartAt < performance.now() + 250) {
     throw new Error('The synchronized start could not be prepared in time. Check recording readiness and try again.');
