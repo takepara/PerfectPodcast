@@ -1,3 +1,6 @@
+import { validWallTime, validStartPlan, validStartObservation } from './recording-timing.js';
+import { validTimingPoints } from './drift-correction.js';
+
 const CHUNK_BYTES_PER_FRAME = 3;
 const WAV_HEADER_BYTES = 44;
 const MAX_CHUNK_FRAMES = 48_000;
@@ -25,22 +28,33 @@ function sha256Hex(bytes) {
 }
 
 function validChunkMetadata(message) {
-  return UUID_PATTERN.test(message.takeId || '') &&
-    Number.isSafeInteger(message.sequence) && message.sequence >= 0 &&
-    message.sequence < MAX_TAKE_CHUNKS &&
-    Number.isSafeInteger(message.startFrame) && message.startFrame >= 0 &&
-    Number.isSafeInteger(message.frames) && message.frames > 0 && message.frames <= MAX_CHUNK_FRAMES &&
-    message.startFrame + message.frames <= MAX_TAKE_FRAMES &&
-    Number.isSafeInteger(message.totalBytes) &&
-    message.totalBytes === WAV_HEADER_BYTES + message.frames * CHUNK_BYTES_PER_FRAME &&
-    message.totalBytes <= MAX_CHUNK_BYTES &&
-    typeof message.final === 'boolean' && HASH_PATTERN.test(message.sha256 || '') &&
-    typeof message.participant === 'string' && message.participant.trim().length > 0 &&
-    message.participant.length <= 60 &&
-    Number.isSafeInteger(message.takeNumber) && message.takeNumber > 0 &&
-    message.takeNumber <= MAX_TAKE_NUMBER &&
-    Number.isFinite(message.startedAt) && message.startedAt > 0 &&
-    message.startedAt <= 8.64e15;
+  return invalidChunkMetadataFields(message).length === 0;
+}
+
+function invalidChunkMetadataFields(message) {
+  const invalid = [];
+  if (!UUID_PATTERN.test(message.takeId || '')) invalid.push('takeId');
+  if (!Number.isSafeInteger(message.sequence) || message.sequence < 0 ||
+      message.sequence >= MAX_TAKE_CHUNKS) invalid.push('sequence');
+  if (!Number.isSafeInteger(message.startFrame) || message.startFrame < 0) invalid.push('startFrame');
+  if (!Number.isSafeInteger(message.frames) || message.frames < 1 ||
+      message.frames > MAX_CHUNK_FRAMES ||
+      message.startFrame + message.frames > MAX_TAKE_FRAMES) invalid.push('frames');
+  if (!Number.isSafeInteger(message.totalBytes) ||
+      message.totalBytes !== WAV_HEADER_BYTES + message.frames * CHUNK_BYTES_PER_FRAME ||
+      message.totalBytes > MAX_CHUNK_BYTES) invalid.push('totalBytes');
+  if (typeof message.final !== 'boolean') invalid.push('final');
+  if (!HASH_PATTERN.test(message.sha256 || '')) invalid.push('sha256');
+  if (typeof message.participant !== 'string' || !message.participant.trim() ||
+      message.participant.length > 60) invalid.push('participant');
+  if (!Number.isSafeInteger(message.takeNumber) || message.takeNumber < 1 ||
+      message.takeNumber > MAX_TAKE_NUMBER) invalid.push('takeNumber');
+  if (!validWallTime(message.startedAt)) invalid.push('startedAt');
+  if (!validStartPlan(message.startPlan ?? null)) invalid.push('startPlan');
+  if (message.startedAtEstimated !== undefined && typeof message.startedAtEstimated !== 'boolean') {
+    invalid.push('startedAtEstimated');
+  }
+  return invalid;
 }
 
 function validWavChunk(bytes, frames) {
@@ -67,7 +81,12 @@ function validManifest(message) {
     message.takeNumber <= MAX_TAKE_NUMBER &&
     typeof message.participant === 'string' && message.participant.trim().length > 0 &&
     message.participant.length <= 60 &&
-    Number.isFinite(message.startedAt) && message.startedAt > 0 && message.startedAt <= 8.64e15 &&
+    validWallTime(message.startedAt) &&
+    validStartPlan(message.startPlan ?? null) &&
+    validStartObservation(message.startObservation ?? null) &&
+    validTimingPoints(message.timingPoints ?? []) &&
+    (message.timingDiscontinuous === undefined || typeof message.timingDiscontinuous === 'boolean') &&
+    (message.startedAtEstimated === undefined || typeof message.startedAtEstimated === 'boolean') &&
     Number.isSafeInteger(message.frames) && message.frames > 0 &&
     Number.isSafeInteger(message.chunks) && message.chunks > 0 &&
     message.frames <= MAX_TAKE_FRAMES &&
@@ -212,8 +231,7 @@ export class RecordingTransfer {
       if (this.inventoryTimer === null) this.startInventoryTimer();
       return;
     }
-    if (this.transferTask) return;
-    this.clearAutomaticRetry();
+    if (this.transferTask || this.automaticRetryTimer !== null) return;
     this.transferTask = this.drain().catch((error) => {
       this.onStatus(`Unable to transfer audio to the host: ${error.message}`, true);
       this.scheduleAutomaticRetry();
@@ -264,9 +282,14 @@ export class RecordingTransfer {
       sha256,
       participant: take.participant,
       takeNumber: take.number,
-      startedAt: take.startedAt
+      startedAt: take.startedAt ?? null,
+      startPlan: take.startPlan ?? null,
+      startedAtEstimated: Boolean(take.startedAtEstimated)
     };
-    if (!validChunkMetadata(metadata)) throw new Error('The ledger information for the chunk to send is invalid.');
+    const invalidFields = invalidChunkMetadataFields(metadata);
+    if (invalidFields.length) {
+      throw new Error(`The ledger information for the chunk to send is invalid (${invalidFields.join(', ')}).`);
+    }
     const id = transferId(take.id, chunk.sequence);
     if (!this.prepareChunk) throw new Error('Unable to save the chunk hash before transfer.');
     await this.prepareChunk(take.id, chunk.sequence, sha256);
@@ -315,7 +338,12 @@ export class RecordingTransfer {
       takeId: take.id,
       takeNumber: take.number,
       participant: take.participant,
-      startedAt: take.startedAt,
+      startedAt: take.startedAt ?? null,
+      startPlan: take.startPlan ?? null,
+      startObservation: take.startObservation ?? null,
+      timingPoints: take.timingPoints ?? [],
+      timingDiscontinuous: Boolean(take.timingDiscontinuous),
+      startedAtEstimated: Boolean(take.startedAtEstimated),
       frames: take.frames,
       chunks: take.chunks,
       status: take.status,

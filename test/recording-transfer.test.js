@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { RecordingTransfer, takeWithTransferParticipant } from '../prototype/recording-transfer.js';
+import {
+  RecordingTransfer,
+  takeWithTransferParticipant
+} from '../prototype/recording-transfer.js';
 import { makeWavHeader } from '../prototype/wav-export.js';
 
 class FakeDataChannel extends EventTarget {
@@ -35,7 +38,8 @@ test('transfers a verified WAV chunk and waits for the host manifest ACK', async
     transferGeneration: generation,
     participant: 'Guest',
     number: 1,
-    startedAt: 1000,
+    startedAt: null,
+    startedAtEstimated: false,
     frames: 1,
     chunks: 1,
     status: 'stopped',
@@ -54,7 +58,11 @@ test('transfers a verified WAV chunk and waits for the host manifest ACK', async
     getGeneration: () => generation,
     getTransferInventory: async () => [],
     storeChunk: async (metadata, receivedWav) => received.push({ metadata, receivedWav }),
-    storeManifest: async (manifest) => { assert.equal(manifest.takeId, takeId); },
+    storeManifest: async (manifest) => {
+      assert.equal(manifest.takeId, takeId);
+      assert.equal(manifest.startedAt, null);
+      assert.equal(manifest.startObservation, null);
+    },
     onStatus() {}
   });
   const guest = new RecordingTransfer({
@@ -91,6 +99,7 @@ test('transfers a verified WAV chunk and waits for the host manifest ACK', async
     assert.equal(received.length, 1);
     assert.equal(received[0].metadata.sequence, 0);
     assert.equal(received[0].metadata.participant, take.participant);
+    assert.equal(received[0].metadata.startedAt, null);
     assert.equal(received[0].receivedWav.size, wav.size);
   } finally {
     host.close();
@@ -98,6 +107,39 @@ test('transfers a verified WAV chunk and waits for the host manifest ACK', async
     if (originalWindow === undefined) delete globalThis.window;
     else globalThis.window = originalWindow;
   }
+});
+
+test('reports invalid take metadata and stops before sending chunk data', async () => {
+  const generation = '0123456789abcdefghij_-';
+  const takeId = '123e4567-e89b-42d3-a456-426614174000';
+  const wav = new Blob([makeWavHeader(1), new Uint8Array([1, 2, 3])], { type: 'audio/wav' });
+  let sent = 0;
+  let prepared = false;
+  const transfer = new RecordingTransfer({
+    role: 'guest',
+    isAuthorized: () => true,
+    getGeneration: () => generation,
+    prepareChunk: async () => { prepared = true; },
+    onStatus() {}
+  });
+  transfer.channel = {
+    readyState: 'open',
+    send() { sent += 1; }
+  };
+
+  await assert.rejects(transfer.sendChunkWithRetry({
+    take: {
+      id: takeId,
+      transferGeneration: generation,
+      participant: 'Guest',
+      number: 1,
+      startedAt: -1
+    },
+    chunk: { sequence: 0, startFrame: 0, frames: 1, final: true, wav }
+  }), /invalid \(startedAt\)/u);
+
+  assert.equal(prepared, false);
+  assert.equal(sent, 0);
 });
 
 test('automatically retries a paused guest transfer with increasing backoff', async () => {
@@ -131,6 +173,10 @@ test('automatically retries a paused guest transfer with increasing backoff', as
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(timers[0].delay, 1_000);
     assert.match(statuses.at(-1), /Retrying automatically in 1 second/u);
+
+    transfer.wake();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(chunkReads, 1, 'new chunks must not bypass transfer backoff');
 
     timers[0].callback();
     await new Promise((resolve) => setImmediate(resolve));

@@ -5,6 +5,8 @@ import { appendAlignedWaveformPeak, resetWaveformHistory } from './waveform-hist
 
 const $ = (id) => document.getElementById(id);
 const ROOM_ID_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const RECORDING_EVENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const GENERATION_PATTERN = /^[A-Za-z0-9_-]{22}$/u;
 const MAX_SIGNAL_RETRIES = 3;
 const CLOCK_PROBE_COUNT = 5;
 const CLOCK_PROBE_TIMEOUT_MS = 1500;
@@ -187,7 +189,10 @@ export class RoomCall {
     getRecordingState,
     checkReadiness,
     onReadinessState,
+    onRecordingPrepare,
     onRecordingState,
+    onSynchronization,
+    onClockMeasurement,
     onLocalStream,
     onSessionName,
     onNetworkEvent,
@@ -212,7 +217,12 @@ export class RoomCall {
     this.getRecordingState = getRecordingState || (() => false);
     this.checkReadiness = checkReadiness || (() => true);
     this.onReadinessState = onReadinessState;
+    this.onRecordingPrepare = onRecordingPrepare;
     this.onRecordingState = onRecordingState;
+    this.onSynchronization = onSynchronization;
+    this.onClockMeasurement = onClockMeasurement;
+    this.driftTimer = null;
+    this.lastClockSample = null;
     this.onLocalStream = onLocalStream;
     this.onSessionName = onSessionName;
     this.onNetworkEvent = onNetworkEvent;
@@ -259,7 +269,6 @@ export class RoomCall {
         return storeIncomingTransferManifest(...args);
       },
       onStatus: (message, isError = false) => {
-        if (isError) this.logNetworkEvent('Transfer error', message);
         this.setStatus(message, isError);
       }
     });
@@ -275,6 +284,8 @@ export class RoomCall {
     this.remoteSessionName = null;
     this.remoteRecordingState = null;
     this.recordingSequence = 0;
+    this.pendingRecordingPreparations = new Map();
+    this.guestRecordingPreparations = new Map();
     this.pendingRecordingCommands = new Map();
     this.guestRecordingCommands = new Map();
     this.lastGuestRecordingSequence = 0;
@@ -293,6 +304,7 @@ export class RoomCall {
     this.remoteReadySequence = 0;
     this.readinessCheckInProgress = false;
     this.clockOffsetMs = null;
+    this.clockRoundTripMs = null;
     this.clockSyncPromise = null;
     this.pendingClockProbes = new Map();
     this.pendingStartEvents = new Map();
@@ -349,8 +361,22 @@ export class RoomCall {
     return this.clockSyncPromise;
   }
 
+  startDriftMonitoring() {
+    if (this.localRole !== 'host' || this.driftTimer !== null) return;
+    this.driftTimer = window.setInterval(() => {
+      if (!this.getRecordingState() || !this.isPeerReadyForRecording) return;
+      void this.synchronizeClock().then(() => {
+        this.onClockMeasurement?.(this.lastClockSample);
+      }).catch((error) => this.logNetworkEvent('Clock drift measurement unavailable', error.message));
+    }, 30_000);
+  }
+
+  stopDriftMonitoring() {
+    window.clearInterval(this.driftTimer);
+    this.driftTimer = null;
+  }
+
   async measureClockOffset() {
-    this.clockOffsetMs = null;
     const samples = [];
     for (let index = 0; index < CLOCK_PROBE_COUNT; index += 1) {
       const sample = await new Promise((resolve) => {
@@ -382,6 +408,8 @@ export class RoomCall {
     if (!this.isPeerReadyForRecording) throw new Error('The call connection was lost during clock synchronization.');
     const selected = selectClockSample(samples, MIN_CLOCK_PROBE_SAMPLES);
     this.clockOffsetMs = selected.offsetMs;
+    this.clockRoundTripMs = selected.roundTripMs;
+    this.lastClockSample = { hostPerfMs: selected.hostPerfMs, guestPerfMs: selected.guestPerfMs, roundTripMs: selected.roundTripMs };
     this.logNetworkEvent(
       'Clock sync selected',
       `offset=${selected.offsetMs.toFixed(2)} ms RTT=${selected.roundTripMs.toFixed(2)} ms samples=${samples.length}`
@@ -426,12 +454,15 @@ export class RoomCall {
     this.pendingClockProbes.delete(message.probeId);
     window.clearTimeout(probe.timer);
     try {
+      const hostReceivedAt = performance.now();
       const sample = calculateClockSample(
         probe.sentAt,
         message.receivedAt,
         message.repliedAt,
-        performance.now()
+        hostReceivedAt
       );
+      sample.hostPerfMs = (probe.sentAt + hostReceivedAt) / 2;
+      sample.guestPerfMs = (message.receivedAt + message.repliedAt) / 2;
       this.logNetworkEvent(
         'Clock sync sample',
         `probe=${message.probeId} offset=${sample.offsetMs.toFixed(2)} ms RTT=${sample.roundTripMs.toFixed(2)} ms`
@@ -572,6 +603,14 @@ export class RoomCall {
     window.clearTimeout(pending.timer);
     this.pendingStartEvents.delete(pending.eventId);
     const driftMs = pending.remoteStartedAt - pending.localStartedAt;
+    void this.onSynchronization?.({
+      eventId: pending.eventId,
+      sequence: pending.sequence,
+      hostPerfMs: pending.localStartedAt,
+      guestInHostPerfMs: pending.remoteStartedAt,
+      differenceMs: driftMs,
+      roundTripMs: this.clockRoundTripMs
+    });
     this.logNetworkEvent(
       'Recording start comparison',
       `event=${pending.eventId} host=${pending.localStartedAt.toFixed(3)} ms guest=${pending.remoteStartedAt.toFixed(3)} ms difference=${driftMs.toFixed(3)} ms`
@@ -649,6 +688,10 @@ export class RoomCall {
   setStatus(message, isError = false) {
     const status = $('roomStatus');
     if (status) {
+      const isChunkSave = /^Saved on the host device · .* · chunk \d+$/u.test(message);
+      if (status.textContent !== message && !isChunkSave) {
+        this.logNetworkEvent(isError ? 'Application error' : 'Application event', message);
+      }
       status.textContent = message;
       status.classList.toggle('room-error', isError);
     }
@@ -775,26 +818,20 @@ export class RoomCall {
   updateReadinessUI() {
     const connected = this.connected && this.socket?.readyState === WebSocket.OPEN &&
       this.peerConnection?.connectionState === 'connected';
-    const waitingForGuest = this.localRole === 'host' && !this.pendingGuest && !this.peerConnection;
-    $('recordingReadiness').textContent = waitingForGuest
-      ? 'Guest not connected · You can record locally'
-      : !this.localRole
-        ? 'Recording readiness is checked automatically when connected.'
-      : !connected
-        ? 'Checking call connection…'
-        : this.readinessCheckInProgress
-          ? 'Checking recording readiness…'
-        : !this.localReady
-          ? 'This device is not ready to record'
-          : !this.remoteReady
-            ? 'This device is ready · Waiting for the other participant'
-            : 'Both devices are ready to record';
+    this.setReadyBadge(connected && this.canStartRecording);
     this.onReadinessState?.({
       connected: Boolean(connected),
       localReady: this.localReady,
       peerReady: this.remoteReady,
       canStartRecording: this.canStartRecording
     });
+  }
+
+  setReadyBadge(isReady) {
+    const badge = $('recordingReadiness');
+    badge.classList.toggle('on', isReady);
+    badge.classList.toggle('off', !isReady);
+    badge.setAttribute('aria-label', isReady ? 'Ready to record' : 'Not ready to record');
   }
 
   async checkLocalReadiness() {
@@ -844,6 +881,152 @@ export class RoomCall {
   clearPendingStartEvents() {
     for (const event of this.pendingStartEvents.values()) window.clearTimeout(event.timer);
     this.pendingStartEvents.clear();
+  }
+
+  prepareGuestRecording(eventId, sequence) {
+    if (this.localRole !== 'host' || !this.isPeerReadyForRecording ||
+        !this.authFields || !this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error('Both devices must be ready and connected before recording preparation.'));
+    }
+    const pending = {
+      eventId,
+      sequence,
+      generation: this.authFields.generation,
+      retries: 0,
+      timer: null,
+      resolve: null,
+      reject: null
+    };
+    const promise = new Promise((resolve, reject) => {
+      pending.resolve = resolve;
+      pending.reject = reject;
+    });
+    this.pendingRecordingPreparations.set(eventId, pending);
+    this.sendRecordingPreparation(pending);
+    return promise;
+  }
+
+  sendRecordingPreparation(pending) {
+    try {
+      this.send({
+        type: 'recording-prepare',
+        eventId: pending.eventId,
+        sequence: pending.sequence,
+        generation: pending.generation
+      });
+      pending.timer = window.setTimeout(() => {
+        if (this.pendingRecordingPreparations.get(pending.eventId) !== pending) return;
+        if (pending.retries < 3) {
+          pending.retries += 1;
+          this.sendRecordingPreparation(pending);
+          return;
+        }
+        this.pendingRecordingPreparations.delete(pending.eventId);
+        pending.reject(new Error('No recording preparation confirmation was received from the guest.'));
+      }, 5000);
+    } catch (error) {
+      window.clearTimeout(pending.timer);
+      this.pendingRecordingPreparations.delete(pending.eventId);
+      pending.reject(new Error(`Unable to request guest recording preparation: ${error.message}`));
+    }
+  }
+
+  async receiveRecordingPrepare(message) {
+    if (this.localRole !== 'guest' ||
+        !RECORDING_EVENT_ID_PATTERN.test(message.eventId || '') ||
+        !GENERATION_PATTERN.test(message.generation || '') ||
+        message.generation !== this.authFields?.generation ||
+        !Number.isSafeInteger(message.sequence) || message.sequence < 1) {
+      this.setStatus('Received an invalid recording preparation request from the host.', true);
+      return;
+    }
+    const prior = this.guestRecordingPreparations.get(message.eventId);
+    if (prior) {
+      if (prior.sequence !== message.sequence || prior.generation !== message.generation) {
+        this.setStatus('Conflicting recording preparation requests were received for the same event.', true);
+        return;
+      }
+      await prior.promise;
+      this.sendRecordingPrepared(prior);
+      return;
+    }
+    const preparation = {
+      eventId: message.eventId,
+      sequence: message.sequence,
+      generation: message.generation,
+      accepted: false,
+      promise: null
+    };
+    preparation.promise = Promise.resolve().then(async () => {
+      if (!this.isPeerReadyForRecording) {
+        this.setStatus('Recording could not be prepared because both devices are not ready and connected.', true);
+        return;
+      }
+      try {
+        if (!this.onRecordingPrepare) {
+          throw new Error('Recording preparation is not available on this device.');
+        }
+        preparation.accepted = (await this.onRecordingPrepare({
+          eventId: preparation.eventId,
+          sequence: preparation.sequence
+        })) !== false;
+      } catch (error) {
+        this.setStatus(`Unable to prepare recording on this device: ${error.message}`, true);
+      }
+    }).finally(() => {
+      if (this.guestRecordingPreparations.size > 32) {
+        const oldestId = this.guestRecordingPreparations.keys().next().value;
+        this.guestRecordingPreparations.delete(oldestId);
+      }
+    });
+    this.guestRecordingPreparations.set(message.eventId, preparation);
+    await preparation.promise;
+    this.sendRecordingPrepared(preparation);
+  }
+
+  sendRecordingPrepared(preparation) {
+    try {
+      this.send({
+        type: 'recording-prepared',
+        eventId: preparation.eventId,
+        sequence: preparation.sequence,
+        generation: preparation.generation,
+        accepted: preparation.accepted
+      });
+    } catch (error) {
+      this.setStatus(`Unable to send the recording preparation confirmation: ${error.message}`, true);
+    }
+  }
+
+  receiveRecordingPrepared(message) {
+    const pending = this.pendingRecordingPreparations.get(message.eventId);
+    if (!pending || pending.sequence !== message.sequence ||
+        pending.generation !== message.generation ||
+        typeof message.accepted !== 'boolean') return;
+    window.clearTimeout(pending.timer);
+    this.pendingRecordingPreparations.delete(message.eventId);
+    if (message.accepted) {
+      pending.resolve(true);
+    } else {
+      pending.reject(new Error('The guest could not prepare recording on this device.'));
+    }
+  }
+
+  cancelGuestRecordingPreparation(eventId) {
+    const pending = this.pendingRecordingPreparations.get(eventId);
+    if (!pending) return;
+    window.clearTimeout(pending.timer);
+    this.pendingRecordingPreparations.delete(eventId);
+    pending.resolve(false);
+  }
+
+  clearPendingRecordingPreparations(error = new Error('The call ended during recording preparation.')) {
+    for (const pending of this.pendingRecordingPreparations.values()) {
+      window.clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pendingRecordingPreparations.clear();
+    this.guestRecordingPreparations.clear();
   }
 
   setHostRecordingState(recording, startAt = null, clockOffsetMs = null, eventId = crypto.randomUUID(), hostStartedAt = null) {
@@ -1006,6 +1189,7 @@ export class RoomCall {
     this.lastGuestRecordingSequence = message.sequence;
     this.remoteRecordingState = message.recording;
     if (!message.recording) {
+      this.guestRecordingPreparations.clear();
       this.logNetworkEvent(
         'Recording stop command received',
         `event=${message.eventId} sequence=${message.sequence}`
@@ -1519,6 +1703,10 @@ export class RoomCall {
         await this.receiveAuthConfirm(message);
       } else if (message.type === 'recording-state') {
         await this.receiveRecordingState(message);
+      } else if (message.type === 'recording-prepare') {
+        await this.receiveRecordingPrepare(message);
+      } else if (message.type === 'recording-prepared' && this.localRole === 'host') {
+        this.receiveRecordingPrepared(message);
       } else if (message.type === 'recording-ack' && this.localRole === 'host') {
         this.receiveRecordingAck(message);
       } else if (message.type === 'ready-state') {
@@ -1547,7 +1735,9 @@ export class RoomCall {
         this.remoteReady = false;
         this.remoteReadySequence = 0;
         this.clockOffsetMs = null;
+        this.clockRoundTripMs = null;
         this.clearPendingClockProbes();
+        this.clearPendingRecordingPreparations();
         this.clearPendingStartEvents();
         for (const pending of this.pendingRecordingCommands.values()) window.clearTimeout(pending.timer);
         this.pendingRecordingCommands.clear();
@@ -2263,15 +2453,23 @@ export class RoomCall {
   }
 
   async leave({ keepMessage = false } = {}) {
+    if (this.localRole === 'guest' && this.guestRecordingPreparations.size &&
+        !this.getRecordingState()) {
+      await this.onRecordingState?.(false);
+    }
     window.clearTimeout(this.disconnectTimer);
     for (const pending of this.pendingRecordingCommands.values()) window.clearTimeout(pending.timer);
     this.pendingRecordingCommands.clear();
     this.clearPendingClockProbes();
+    this.clearPendingRecordingPreparations();
     this.clearPendingStartEvents();
     this.releasePreparedRecordingAudioContext?.();
     this.clockOffsetMs = null;
+    this.clockRoundTripMs = null;
     const previousRole = this.localRole;
     const wasConnected = this.connected;
+    this.stopDriftMonitoring();
+    this.lastClockSample = null;
     this.recordingTransfer.close();
     this.inputMonitorChannel?.close();
     this.inputMonitorChannel = null;

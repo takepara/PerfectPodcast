@@ -4,8 +4,8 @@ const ROOM_ID_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const AUTH_COOKIE = '__Host-perfectpodcast-host';
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const ALLOWED_MESSAGES = {
-  host: new Set(['approved', 'denied', 'offer', 'auth-confirm', 'candidate', 'ice-restart', 'recording-state', 'ready-state', 'clock-ping', 'turn-request', 'session-name']),
-  guest: new Set(['join-request', 'answer', 'candidate', 'ice-restart-answer', 'recording-ack', 'ready-state', 'clock-pong', 'recording-started', 'transfer-progress'])
+  host: new Set(['approved', 'denied', 'offer', 'auth-confirm', 'candidate', 'ice-restart', 'recording-state', 'recording-prepare', 'ready-state', 'clock-ping', 'turn-request', 'session-name']),
+  guest: new Set(['join-request', 'answer', 'candidate', 'ice-restart-answer', 'recording-ack', 'recording-prepared', 'ready-state', 'clock-pong', 'recording-started', 'transfer-progress'])
 };
 const RECORDING_EVENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const GENERATION_PATTERN = /^[A-Za-z0-9_-]{22}$/u;
@@ -392,12 +392,14 @@ export class RoomSignaling {
     }
     if (message.type === 'approved') this.approvedGuest = true;
     if (message.type === 'denied') this.approvedGuest = false;
-    if (message.type === 'recording-state' || message.type === 'recording-ack') {
-      if (typeof message.recording !== 'boolean' ||
-          !RECORDING_EVENT_ID_PATTERN.test(message.eventId || '') ||
+    if (['recording-state', 'recording-ack', 'recording-prepare', 'recording-prepared'].includes(message.type)) {
+      if (!RECORDING_EVENT_ID_PATTERN.test(message.eventId || '') ||
           !GENERATION_PATTERN.test(message.generation || '') ||
           !Number.isSafeInteger(message.sequence) || message.sequence < 1 ||
-          (message.type === 'recording-ack' && typeof message.accepted !== 'boolean')) {
+          (['recording-state', 'recording-ack'].includes(message.type) &&
+           typeof message.recording !== 'boolean') ||
+          (['recording-ack', 'recording-prepared'].includes(message.type) &&
+           typeof message.accepted !== 'boolean')) {
         this.reject(socket, 'Invalid recording status or acknowledgment format.');
         return;
       }
@@ -411,8 +413,8 @@ export class RoomSignaling {
       this.reject(socket, 'Invalid recording start time format.');
       return;
     }
-    if (message.type === 'recording-state' && role !== 'host') {
-      this.reject(socket, 'Only the host can send recording status.');
+    if (['recording-state', 'recording-prepare'].includes(message.type) && role !== 'host') {
+      this.reject(socket, 'Only the host can send recording commands.');
       return;
     }
     if (message.type === 'ready-state' &&
@@ -469,8 +471,8 @@ export class RoomSignaling {
       this.reject(socket, 'Invalid audio recovery status format.');
       return;
     }
-    if (message.type === 'recording-ack' && role !== 'guest') {
-      this.reject(socket, 'Only the guest can send a recording acknowledgment.');
+    if (['recording-ack', 'recording-prepared'].includes(message.type) && role !== 'guest') {
+      this.reject(socket, 'Only the guest can acknowledge recording commands.');
       return;
     }
     if (message.type === 'recording-started' && role !== 'guest') {

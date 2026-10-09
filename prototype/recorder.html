@@ -69,19 +69,20 @@
         <section class="panel record-panel" aria-labelledby="recordHeading">
           <div class="capture-heading">
             <div class="terminal-section-code">CAPTURE</div>
-            <span class="format-pill">24-bit / 48 kHz WAV</span>
-          </div>
-          <div class="panel-topline">
-            <div class="status-line visually-hidden"><span id="statusDot" class="status-dot"></span><span id="statusText" class="visually-hidden">Ready to start recording</span></div>
+            <div class="capture-heading-right">
+              <span id="captureStatusBadge" class="onair-badge off" role="status" aria-label="Not on air">
+                <span class="onair-light" aria-hidden="true"></span><span>ON AIR</span>
+              </span>
+            </div>
           </div>
           <h2 id="recordHeading" class="visually-hidden">Recording controls</h2>
           <div id="timer" class="timer" aria-live="off">00:00</div>
-          <p id="recordingPreparation" class="recording-preparation" role="status" aria-live="polite" hidden></p>
+          <p id="recordingPreparation" class="visually-hidden" hidden></p>
           <div id="recordControls" class="controls">
             <button id="recordButton" class="button button-record" type="button"><span aria-hidden="true">●</span> Start Recording</button>
             <button id="stopButton" class="button button-stop" type="button" disabled><span aria-hidden="true">■</span> Stop Recording</button>
           </div>
-          <div id="hostRecordingNotice" class="host-recording-notice" hidden role="status" aria-live="polite">
+          <div id="hostRecordingNotice" class="visually-hidden" hidden>
             <strong id="hostRecordingStatus">Waiting for the host to start recording</strong>
           </div>
           <div id="errorText" class="error-text" role="alert" aria-live="assertive"></div>
@@ -94,10 +95,11 @@
               <span id="roomRoleLabel" class="room-role-label visually-hidden">Host controls</span>
               <h2 id="roomHeading" class="visually-hidden">Invite a guest</h2>
             </div>
-            <span class="format-pill">Opus · mono · up to 32 kbps</span>
+            <div class="room-heading-right">
+              <span id="recordingReadiness" class="ready-badge off" role="status" aria-label="Not ready to record">READY</span>
+            </div>
           </div>
-          <p id="roomStatus" class="room-status" role="status">Create an invitation link to invite a guest.</p>
-          <p id="recordingReadiness" class="recording-readiness" role="status">Recording readiness is checked automatically when connected.</p>
+          <p id="roomStatus" class="visually-hidden">Create an invitation link to invite a guest.</p>
           <div class="room-actions">
             <button id="createRoomButton" class="button button-primary" type="button">Create Invitation Link</button>
             <button id="joinRoomButton" class="button button-primary" type="button" hidden>Request to Join Host</button>
@@ -129,7 +131,6 @@
           </div>
           <section id="transferProgressCard" class="transfer-progress" aria-labelledby="transferProgressHeading">
             <h3 id="transferProgressHeading" class="visually-hidden">Guest Audio Transfer Status</h3>
-            <progress id="transferProgressBar" max="1" value="0" aria-label="Audio received"></progress>
             <table class="network-metrics" aria-label="Network and audio transfer status">
               <tbody>
               <tr><th scope="row">Connection path</th><td id="connectionPath" role="status">Not connected</td></tr>
@@ -159,7 +160,6 @@
       <section class="panel waveform-panel" aria-labelledby="waveformHeading">
         <div class="waveform-panel-heading">
           <div><span class="terminal-section-code">TRACK MONITOR</span><h2 id="waveformHeading" class="visually-hidden">Participant Audio Waveforms</h2></div>
-          <span class="format-pill">60 SEC / PER-PARTICIPANT</span>
         </div>
         <div class="waveform-track">
           <div class="waveform-heading">
@@ -265,12 +265,12 @@
       <section class="panel network-event-panel" aria-labelledby="networkEventHeading">
         <div class="network-event-heading">
           <div>
-            <span class="terminal-section-code">NETWORK EVENT LOG</span>
-            <h2 id="networkEventHeading" class="visually-hidden">Network events</h2>
+            <span class="terminal-section-code">EVENT LOG</span>
+            <h2 id="networkEventHeading" class="visually-hidden">Events</h2>
           </div>
           <span id="networkEventCount" class="network-event-count">0 EVENTS</span>
         </div>
-        <textarea id="networkEventLog" class="network-event-log" aria-label="Network event log" readonly spellcheck="false" wrap="off"></textarea>
+        <textarea id="networkEventLog" class="network-event-log" aria-label="Event log" readonly spellcheck="false" wrap="off"></textarea>
       </section>
 
     </section>

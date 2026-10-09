@@ -60,6 +60,33 @@ test('marks the final full WAV chunk as final when the frame limit aligns to one
   assert.equal(processor.port.messages.filter((message) => message.type === 'limit-reached').length, 1);
 });
 
+test('immediate recording reports exactly one first-frame observation', async () => {
+  const { processor } = await loadProcessor();
+  processor.port.onmessage({ data: { type: 'start', maximumFrames: 1000 } });
+  processor.process([[new Float32Array(128)]], [[new Float32Array(128)]]);
+  processor.process([[new Float32Array(128)]], [[new Float32Array(128)]]);
+  const starts = processor.port.messages.filter((message) => message.type === 'started');
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].frame, 0);
+  assert.equal(starts[0].contextTime, 0);
+  assert.equal(processor.port.messages[0].type, 'armed');
+});
+
+test('records frame-clock anchors every 30 seconds without changing captured samples', async () => {
+  const { processor, context } = await loadProcessor();
+  processor.port.onmessage({ data: { type: 'start', maximumFrames: 48_000 * 32 } });
+  const block = new Float32Array(48_000).fill(0.25);
+  for (let second = 0; second < 32; second += 1) {
+    context.currentTime = second;
+    processor.process([[block]], [[new Float32Array(48_000)]]);
+  }
+  const anchors = processor.port.messages.filter((message) => message.type === 'timing');
+  assert.equal(anchors.length, 1);
+  assert.equal(anchors[0].frame, 48_000 * 30);
+  assert.equal(anchors[0].contextTime, 30);
+  assert.equal(processor.totalFrames, 48_000 * 32);
+});
+
 test('waits for the scheduled AudioContext time before recording frames', async () => {
   const { processor, context } = await loadProcessor();
   const event = { eventId: 'start-event', sequence: 3 };

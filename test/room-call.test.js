@@ -168,8 +168,27 @@ test('only the host can relay valid recording-state messages', async () => {
       clockOffsetMs: 0,
       hostStartedAt: Date.now()
     };
+    const recordingPrepare = {
+      type: 'recording-prepare',
+      eventId: recordingState.eventId,
+      sequence: recordingState.sequence,
+      generation: recordingState.generation
+    };
+    await signaling.onMessage(host, { data: JSON.stringify(recordingPrepare) });
+    assert.deepEqual(guest.messages, [recordingPrepare]);
+
+    const recordingPrepared = {
+      type: 'recording-prepared',
+      eventId: recordingState.eventId,
+      sequence: recordingState.sequence,
+      generation: recordingState.generation,
+      accepted: true
+    };
+    await signaling.onMessage(guest, { data: JSON.stringify(recordingPrepared) });
+    assert.deepEqual(host.messages, [recordingPrepared]);
+
     await signaling.onMessage(host, { data: JSON.stringify(recordingState) });
-    assert.deepEqual(guest.messages, [recordingState]);
+    assert.deepEqual(guest.messages, [recordingPrepare, recordingState]);
 
     const recordingAck = {
       type: 'recording-ack',
@@ -180,7 +199,7 @@ test('only the host can relay valid recording-state messages', async () => {
       accepted: true
     };
     await signaling.onMessage(guest, { data: JSON.stringify(recordingAck) });
-    assert.deepEqual(host.messages, [recordingAck]);
+    assert.deepEqual(host.messages, [recordingPrepared, recordingAck]);
 
     await signaling.onMessage(guest, { data: JSON.stringify({ type: 'recording-state', recording: false }) });
     assert.equal(guest.readyState, 3);
@@ -939,6 +958,103 @@ test('passes the host wall-clock start timestamp to the guest recorder', async (
   }
 });
 
+test('confirms guest recording preparation before the host schedules the start', async () => {
+  const originalWebSocket = globalThis.WebSocket;
+  const originalWindow = globalThis.window;
+  globalThis.WebSocket = { OPEN: 1 };
+  globalThis.window = { setTimeout, clearTimeout };
+  try {
+    const sent = [];
+    const generation = '0123456789abcdefghij_-';
+    const eventId = '123e4567-e89b-42d3-a456-426614174000';
+    const host = Object.create(RoomCall.prototype);
+    Object.assign(host, {
+      localRole: 'host',
+      connected: true,
+      localReady: true,
+      remoteReady: true,
+      socket: { readyState: 1 },
+      peerConnection: { connectionState: 'connected' },
+      authFields: { generation },
+      pendingRecordingPreparations: new Map(),
+      send(message) { sent.push(message); }
+    });
+
+    const prepared = host.prepareGuestRecording(eventId, 1);
+    assert.deepEqual(sent, [{
+      type: 'recording-prepare',
+      eventId,
+      sequence: 1,
+      generation
+    }]);
+    host.receiveRecordingPrepared({
+      type: 'recording-prepared',
+      eventId,
+      sequence: 1,
+      generation,
+      accepted: true
+    });
+    assert.equal(await prepared, true);
+
+    const cancelled = host.prepareGuestRecording(
+      '123e4567-e89b-42d3-a456-426614174001',
+      2
+    );
+    host.cancelGuestRecordingPreparation('123e4567-e89b-42d3-a456-426614174001');
+    assert.equal(await cancelled, false);
+  } finally {
+    if (originalWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = originalWebSocket;
+    if (originalWindow === undefined) delete globalThis.window;
+    else globalThis.window = originalWindow;
+  }
+});
+
+test('prepares guest recording resources and acknowledges duplicate preparation requests', async () => {
+  const originalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = { OPEN: 1 };
+  try {
+    const sent = [];
+    const prepared = [];
+    const generation = '0123456789abcdefghij_-';
+    const message = {
+      type: 'recording-prepare',
+      eventId: '123e4567-e89b-42d3-a456-426614174000',
+      sequence: 1,
+      generation
+    };
+    const guest = Object.create(RoomCall.prototype);
+    Object.assign(guest, {
+      localRole: 'guest',
+      connected: true,
+      localReady: true,
+      remoteReady: true,
+      socket: { readyState: 1 },
+      peerConnection: { connectionState: 'connected' },
+      authFields: { generation },
+      guestRecordingPreparations: new Map(),
+      onRecordingPrepare: async (event) => {
+        prepared.push(event);
+        return true;
+      },
+      send(response) { sent.push(response); },
+      setStatus() {}
+    });
+
+    await guest.receiveRecordingPrepare(message);
+    await guest.receiveRecordingPrepare(message);
+
+    assert.deepEqual(prepared, [{ eventId: message.eventId, sequence: 1 }]);
+    assert.deepEqual(sent, [
+      { type: 'recording-prepared', eventId: message.eventId, sequence: 1, generation, accepted: true },
+      { type: 'recording-prepared', eventId: message.eventId, sequence: 1, generation, accepted: true }
+    ]);
+  } finally {
+    if (originalWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = originalWebSocket;
+  }
+});
+
 test('logs guest recording-start confirmation dispatch and host unmatched confirmation', () => {
   const originalWebSocket = globalThis.WebSocket;
   globalThis.WebSocket = { OPEN: 1 };
@@ -989,6 +1105,69 @@ test('logs guest recording-start confirmation dispatch and host unmatched confir
   }
 });
 
+test('logs application status events without logging each transferred chunk', () => {
+  const originalDocument = globalThis.document;
+  const roomStatus = {
+    textContent: '',
+    classList: { toggle() {} }
+  };
+  globalThis.document = {
+    getElementById: (id) => id === 'roomStatus' ? roomStatus : null
+  };
+  const events = [];
+  const call = Object.create(RoomCall.prototype);
+  call.onNetworkEvent = (event, details) => events.push({ event, details });
+  try {
+    call.setStatus('Both devices are ready to record.');
+    call.setStatus('Both devices are ready to record.');
+    call.setStatus('The guest’s recording stop and save were confirmed.');
+    call.setStatus('Saved on the host device · Guest · chunk 4');
+    call.setStatus('All chunks saved on the host device · Guest');
+
+    assert.deepEqual(events, [
+      { event: 'Application event', details: 'Both devices are ready to record.' },
+      { event: 'Application event', details: 'The guest’s recording stop and save were confirmed.' },
+      { event: 'Application event', details: 'All chunks saved on the host device · Guest' }
+    ]);
+  } finally {
+    if (originalDocument === undefined) delete globalThis.document;
+    else globalThis.document = originalDocument;
+  }
+});
+
+test('renders recording readiness as a persistent accessible badge', () => {
+  const originalDocument = globalThis.document;
+  const classes = new Set(['off']);
+  const badge = {
+    textContent: 'READY',
+    attributes: {},
+    classList: {
+      toggle(name, enabled) {
+        if (enabled) classes.add(name);
+        else classes.delete(name);
+      }
+    },
+    setAttribute(name, value) {
+      this.attributes[name] = value;
+    }
+  };
+  globalThis.document = { getElementById: (id) => id === 'recordingReadiness' ? badge : null };
+  try {
+    const call = Object.create(RoomCall.prototype);
+    call.setReadyBadge(false);
+    assert.equal(badge.textContent, 'READY');
+    assert.equal(classes.has('off'), true);
+    assert.equal(badge.attributes['aria-label'], 'Not ready to record');
+    call.setReadyBadge(true);
+    assert.equal(badge.textContent, 'READY');
+    assert.equal(classes.has('on'), true);
+    assert.equal(badge.attributes['aria-label'], 'Ready to record');
+  } finally {
+    if (originalDocument === undefined) delete globalThis.document;
+    else globalThis.document = originalDocument;
+  }
+});
+
 test('logs synchronized recording stop commands when sent and received', async () => {
   const originalWindow = globalThis.window;
   globalThis.window = {
@@ -1031,6 +1210,7 @@ test('logs synchronized recording stop commands when sent and received', async (
       localRole: 'guest',
       authFields: { generation: 'generation' },
       guestRecordingCommands: new Map(),
+      guestRecordingPreparations: new Map(),
       lastGuestRecordingSequence: 0,
       onNetworkEvent: (event, details) => guestEvents.push({ event, details }),
       applyGuestRecordingCommand: async () => {},

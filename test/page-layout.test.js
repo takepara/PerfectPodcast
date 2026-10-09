@@ -38,9 +38,9 @@ test('removes recorder instructions but retains live statuses and errors', () =>
   assert.match(recorder, /id="trackMicDeviceHint"[^>]*><\/p>/);
 });
 
-test('shows a scrollable terminal log for studio network events below the studio panels', () => {
+test('shows a scrollable event log for studio events below the studio panels', () => {
   const studio = recorder.slice(recorder.indexOf('<section id="studioView"'), recorder.indexOf('<div id="notice"'));
-  assert.match(studio, /class="panel network-event-panel"[\s\S]*id="networkEventCount"[\s\S]*id="networkEventLog"[^>]*readonly[^>]*wrap="off"/);
+  assert.match(studio, /class="panel network-event-panel"[\s\S]*>EVENT LOG<\/span>[\s\S]*id="networkEventCount"[\s\S]*id="networkEventLog"[^>]*aria-label="Event log"[^>]*readonly[^>]*wrap="off"/);
   assert.ok(studio.indexOf('class="panel network-event-panel"') > studio.indexOf('class="studio-grid terminal-grid"'));
   const source = readPrototype('recorder.js');
   assert.match(source, /function appendNetworkEvent\(event, details = ''\)/);
@@ -51,12 +51,14 @@ test('shows a scrollable terminal log for studio network events below the studio
   assert.match(css, /\.terminal-ui \.network-event-log \{ height: 320px;[^}]*background: #050906;[^}]*font-size: 11px;/);
 });
 
-test('hides the requested redundant session labels while preserving accessible headings', () => {
-  for (const id of ['statusText', 'roomRoleLabel', 'roomHeading', 'networkHeading', 'transferProgressHeading', 'waveformHeading']) {
+test('hides the requested redundant session labels while preserving accessible headings and status badges', () => {
+  for (const id of ['roomRoleLabel', 'roomHeading', 'networkHeading', 'transferProgressHeading', 'waveformHeading']) {
     const label = recorder.match(new RegExp(`<[^>]*id="${id}"[^>]*>`));
     assert.ok(label, `expected ${id} to remain available to assistive technology`);
     assert.match(label[0], /class="[^"]*visually-hidden/);
   }
+  assert.match(recorder, /id="captureStatusBadge" class="onair-badge off" role="status" aria-label="Not on air"/);
+  assert.match(recorder, /<span class="onair-light" aria-hidden="true"><\/span><span>ON AIR<\/span>/);
 });
 
 test('allows editing and persists the studio session name for the session list', () => {
@@ -127,7 +129,7 @@ test('places compact name-and-sequence WAV rows inside the device storage panel'
   assert.match(source, /label\.textContent = `\$\{participant\} \$\{String\(take\.number\)\.padStart\(2, '0'\)\}`/);
   assert.match(source, /const duration = formatDuration\(\(take\.frames \|\| 0\) \/ TARGET_RATE\)/);
   assert.match(source, /const size = Number\.isFinite\(take\.bytes\) \? formatBytes\(take\.bytes\) : '—'/);
-  assert.match(source, /meta\.textContent = `\$\{duration\} · \$\{size\}`/);
+  assert.match(source, /meta\.textContent = `\$\{duration\} · \$\{size\} · \$\{timing\} · \$\{delivery\}`/);
   assert.equal(source.includes('takeCount'), false);
   assert.equal(source.includes('takeStatusLabel'), false);
 });
@@ -174,6 +176,10 @@ test('arranges capture, room, and network details in three desktop columns', () 
   assert.match(css, /\.terminal-ui \.record-panel, \.terminal-ui \.room-panel, \.terminal-ui \.network-panel \{ align-self: stretch; \}/);
   assert.match(css, /\.terminal-ui \.storage-panel \{ align-self: start; \}/);
   assert.match(css, /\.terminal-ui \.network-heading \.terminal-section-code \{[^}]*color: var\(--teal\);/);
+  const networkHeadingStyle = css.match(/\.terminal-ui \.network-heading \{([^}]*)\}/)?.[1] ?? '';
+  const remoteAudioRowStyle = css.match(/\.remote-audio-row \{([^}]*)\}/)?.[1] ?? '';
+  assert.doesNotMatch(networkHeadingStyle, /border-bottom/);
+  assert.doesNotMatch(remoteAudioRowStyle, /border-top/);
   assert.match(css, /\.terminal-ui \.storage-panel \.terminal-section-code \{[^}]*color: var\(--teal\);/);
   assert.match(css, /\.terminal-ui \.setup-panel \.panel-heading::before \{[^}]*color: var\(--teal\);/);
   assert.match(css, /\.terminal-ui \.terminal-breadcrumb \{[^}]*color: var\(--teal\);/);
@@ -181,7 +187,11 @@ test('arranges capture, room, and network details in three desktop columns', () 
   assert.match(css, /\.transfer-progress \{[^}]*padding: 0;[^}]*border: 0;[^}]*background: transparent;/);
   assert.match(css, /\.terminal-ui \.network-metrics \{ font-size: 11px; line-height: 1\.35; \}/);
   const roomPanel = recorder.slice(invite, network);
-  assert.match(roomPanel, /id="recordingReadiness" class="recording-readiness" role="status"/);
+  assert.match(roomPanel, /class="room-heading-right">[\s\S]*id="recordingReadiness" class="ready-badge off" role="status" aria-label="Not ready to record">READY/);
+  assert.doesNotMatch(roomPanel, /roomGuestCount|roomGuestCapacity|room-state-badges/);
+  assert.doesNotMatch(recorder, /id="transferProgressBar"|<progress\b/);
+  assert.match(recorder, /Remaining \/ Total/);
+  assert.match(readPrototype('room-call.js'), /setReadyBadge\(connected && this\.canStartRecording\)/);
   assert.doesNotMatch(roomPanel, /id="checkReadinessButton"|id="retryTransferButton"/);
   assert.match(roomPanel, /id="leaveRoomButton"[^>]*>End Call<\/button>/);
   assert.match(css, /\.terminal-ui \.waveform-panel \{ grid-area: wave;/);
@@ -189,15 +199,34 @@ test('arranges capture, room, and network details in three desktop columns', () 
   assert.match(css, /@media \(max-width: 860px\) \{[\s\S]*?\.terminal-ui \.studio-grid \{ grid-template-columns: 1fr; grid-template-areas: "record" "room" "network" "wave" "storage"; \}/);
 });
 
-test('places the recording format label at the capture panel top right without decorative curves', () => {
+test('places the ON AIR badge at the capture panel top right and removes media detail labels', () => {
   const recordPanel = recorder.slice(recorder.indexOf('class="panel record-panel"'), recorder.indexOf('id="roomPanel"'));
-  assert.match(recordPanel, /class="capture-heading">[\s\S]*?CAPTURE[\s\S]*?<span class="format-pill">24-bit \/ 48 kHz WAV<\/span>/);
+  assert.match(recordPanel, /class="capture-heading-right">[\s\S]*id="captureStatusBadge"/);
+  assert.match(recordPanel, /<span>ON AIR<\/span>/);
+  for (const label of ['24-bit / 48 kHz WAV', 'Opus · mono · up to 32 kbps', '60 SEC / PER-PARTICIPANT']) {
+    assert.equal(recorder.includes(label), false);
+  }
   for (const title of ['ROOM LINK', 'NETWORK', 'TRACK MONITOR']) {
     assert.ok(recorder.includes(`class="terminal-section-code">${title}</span>`));
   }
   assert.doesNotMatch(recorder, /class="terminal-section-code">0[1-5]\s*\/\/|00\s*\/\/ INITIALIZE/);
   assert.doesNotMatch(readPrototype('recorder.css'), /\.record-panel::after/);
   assert.match(readPrototype('recorder.css'), /\.capture-heading \{[^}]*justify-content: space-between;/);
+  assert.match(readPrototype('recorder.css'), /\.capture-heading \{[^}]*align-items: flex-start;/);
+  assert.match(readPrototype('recorder.css'), /\.terminal-ui \.room-heading \{ align-items: start;/);
+  assert.match(readPrototype('recorder.css'), /\.terminal-ui \.onair-badge, \.terminal-ui \.ready-badge \{ transform: translateY\(-4px\); \}/);
+});
+
+test('blinks the ON AIR indicator during startup and lights it on actual recording start', () => {
+  const source = readPrototype('recorder.js');
+  const updateBadge = source.slice(source.indexOf('function updateCaptureStatusBadge()'), source.indexOf('\nfunction setStatus'));
+  const startRecording = source.slice(source.indexOf('async function startRecording('), source.indexOf('\nfunction applyHostRecordingState'));
+  const startedHandler = source.slice(source.indexOf("if (data.type === 'started')"), source.indexOf("if (data.type === 'level')"));
+  assert.match(updateBadge, /const isPending = !isOnAir && \(captureStartPending \|\| starting\)/);
+  assert.match(updateBadge, /badge\.classList\.toggle\('pending', isPending\)/);
+  assert.match(startRecording, /captureStartPending = true;\s*updateCaptureStatusBadge\(\)/);
+  assert.match(startedHandler, /captureOnAir = true;\s*captureStartPending = false;\s*updateCaptureStatusBadge\(\)/);
+  assert.match(readPrototype('recorder.css'), /\.onair-badge\.pending \.onair-light[^}]*animation: onair-blink/);
 });
 
 test('formats transfer progress as remaining bytes, total bytes, and completion percentage', () => {
@@ -257,8 +286,8 @@ test('plots saved-audio completion on a percentage axis at the right of the tran
 test('uses readable text sizes throughout the session screen', () => {
   const css = readPrototype('recorder.css');
   assert.match(css, /\.terminal-ui \.button \{[^}]*font-size: 12px;/);
-  assert.match(css, /\.terminal-ui \.status-line \{[^}]*font-size: 12px;/);
-  assert.match(css, /\.terminal-ui \.room-status,[^{]*\{[^}]*font-size: 12px;/);
+  assert.match(css, /\.terminal-ui \.ready-badge \{[^}]*font-size: 12px;/);
+  assert.match(css, /\.terminal-ui \.onair-badge \{[^}]*font-size: 12px;/);
   assert.match(css, /\.terminal-ui \.waveform-timeline \{[^}]*font: 12px/);
   assert.match(css, /\.terminal-ui #studioView \.field,[^{]*\{ font-size: 12px; \}/);
 });
@@ -319,7 +348,7 @@ test('keeps waveform rendering limited to active recording for every participant
   assert.match(drawWaveform, /if \(!recording\) return/);
   assert.doesNotMatch(drawWaveform, /previewAnalyserNode|previewSamples/);
   assert.match(startHandler, /drawWaveform\(\)/);
-  assert.match(stopRecording, /recording = false;\s*stopWaveformRendering\(\)/);
+  assert.match(stopRecording, /recording = false;[\s\S]*?stopWaveformRendering\(\)/);
   assert.match(stopRecording, /appendNetworkEvent\(\s*'Recording stop local'/);
 
   const roomCall = readPrototype('room-call.js');

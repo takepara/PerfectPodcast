@@ -184,24 +184,28 @@ test('reuses an already running preview AudioContext for scheduled recording', a
     'prepared running microphone preview context'
   ]]);
 
-  const createTakeSource = source.slice(source.indexOf('async function createTake('), source.indexOf('\nasync function stopDiagnostics'));
+  const createTakeSource = source.slice(source.indexOf('async function createTake('), source.indexOf('\nasync function activatePreparedTake('));
   assert.match(createTakeSource, /const reusePreviewContext = previewAudioContext === preparedAudioContext;\s*stopLocalPreview\(\{ preserveAudioContext: reusePreviewContext \}\)/);
   assert.match(createTakeSource, /if \(primedRecordingAudioContext === audioContext\) \{\s*primedRecordingAudioContext = null;/);
 });
 
-test('announces a synchronized start before local setup so the guest can prepare in parallel', () => {
+test('waits for both devices to prepare before scheduling a synchronized start', () => {
+  const prepareGuest = startRecordingSource.indexOf('roomCall.prepareGuestRecording(');
   const announceStart = startRecordingSource.indexOf('roomCall.setHostRecordingState(');
-  const prepareHost = startRecordingSource.indexOf('await createTake({');
-  assert.ok(announceStart >= 0 && announceStart < prepareHost);
-  assert.match(startRecordingSource, /if \(synchronizedStartAnnounced && !cancelRecordingStart\) roomCall\.setHostRecordingState\(false\)/);
+  assert.ok(prepareGuest >= 0 && prepareGuest < announceStart);
+  assert.match(startRecordingSource, /const startLeadMs = Math\.max\(\s*SYNCHRONIZED_START_LEAD_MS,\s*\(roomCall\.clockRoundTripMs \?\? 0\) \+ SYNCHRONIZED_START_LEAD_MS\s*\)/);
+  assert.match(startRecordingSource, /if \(\(synchronizedStartAnnounced \|\| preparationAnnounced\) && !cancelRecordingStart\) \{\s*roomCall\.setHostRecordingState\(false\)/);
 
-  const createTakeSource = source.slice(source.indexOf('async function createTake('), source.indexOf('\nasync function stopDiagnostics'));
-  assert.match(startRecordingSource, /scheduledStartedAt: schedule\?\.hostStartedAt/);
-  assert.match(startRecordingSource, /schedule\.hostStartedAt\s*\)/);
-  assert.match(createTakeSource, /startedAt: scheduledStartedAt \?\?/);
-  assert.match(createTakeSource, /activeTake\.startedAt = scheduledRecordingStartAt !== null && scheduledRecordingWallStartAt !== null/);
-  assert.ok(createTakeSource.indexOf('await persistTake(activeTake)') <
-    createTakeSource.indexOf('recorderNode.port.postMessage'));
+  const createTakeSource = source.slice(source.indexOf('async function createTake('), source.indexOf('\nasync function activatePreparedTake('));
+  const activateTakeSource = source.slice(source.indexOf('async function activatePreparedTake('), source.indexOf('\nasync function stopDiagnostics'));
+  assert.match(startRecordingSource, /prepareOnly: true/);
+  assert.match(createTakeSource, /startedAt: prepareOnly \? null : scheduledStartedAt \?\?/);
+  assert.match(createTakeSource, /activeTake\.startObservation =/);
+  assert.doesNotMatch(createTakeSource, /activeTake\.startedAt =/);
+  assert.doesNotMatch(createTakeSource, /await persistTake\(activeTake\);\s*if \(cancelRecordingStart\)/);
+  assert.ok(activateTakeSource.indexOf('activeTake.startedAt = plan.displayStartedAt') <
+    activateTakeSource.indexOf('await persistTake(activeTake)'));
+  assert.match(activateTakeSource, /port\.postMessage/);
   assert.match(createTakeSource, /if \(cancelRecordingStart\)/);
 });
 

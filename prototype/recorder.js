@@ -1,7 +1,10 @@
 import { getAuth0Client, getHostDisplayName, getHostSession, signOut } from './auth-client.bundle.js';
 import { RoomCall } from './room-call.js';
 import { MAX_SESSION_FRAMES, remainingSessionFrames } from './recording-limits.js';
-import { RecordingTransfer, takeWithTransferParticipant } from './recording-transfer.js';
+import {
+  RecordingTransfer,
+  takeWithTransferParticipant
+} from './recording-transfer.js';
 import { canQueueRecordingCommit } from './recording-commit-queue.js';
 import { verifyIncomingStoredChunk, verifyIncomingStoredTake } from './recording-storage.js';
 import { reconcileTransferInventory } from './transfer-inventory.js';
@@ -9,10 +12,14 @@ import { createPcm24Wav, writePcm24Wav } from './wav-export.js';
 import { splitTransferBacklog, summarizeTransferChunks } from './transfer-progress.js';
 import { monitorRecordingTrack } from './recording-track-monitor.js';
 import { makeRecordingFilename } from './recording-filename.js';
+import { createStartPlan, sameStartPlan } from './recording-timing.js';
+import { assessAlignment, writeAlignedPcm24Wav, MAX_TIMING_POINTS } from './drift-correction.js';
+import { mergeRecordingMetadata, synchronizationForTake } from './recording-ledger.js';
 import { connectFirstMicrophoneChannel } from './microphone-input.js';
 import { appendAlignedWaveformPeak, resetWaveformHistory } from './waveform-history.js';
 
 const TARGET_RATE = 48000;
+const SYNCHRONIZED_START_LEAD_MS = 500;
 const BYTES_PER_FRAME = 3;
 const CHUNK_FRAMES = TARGET_RATE;
 const DB_NAME = 'perfectpodcast-local-v1';
@@ -70,6 +77,8 @@ let previewSamples = null;
 let previewStream = null;
 let microphoneMuted = false;
 let recording = false;
+let captureOnAir = false;
+let captureStartPending = false;
 let finalizing = false;
 let starting = false;
 let cancelRecordingStart = false;
@@ -81,12 +90,12 @@ let nextSequence = 0;
 let capturedFrames = 0;
 let takeFrameLimit = 0;
 let elapsedTimer = null;
-let preparationTimer = null;
 let scheduledRecordingStartAt = null;
 let scheduledRecordingWallStartAt = null;
 let takeRefreshTimer = null;
 let noticeTimer = null;
 let takeStartedAt = 0;
+let preparedRecordingEvent = null;
 let lastPeak = 0;
 let waveformSamples = null;
 let waveformFrame = null;
@@ -108,6 +117,7 @@ let transferProgressTimer = null;
 let transferProgressCache = null;
 let transferGraphSamples = [];
 let cleanupRecordingTrackMonitor = null;
+let checkRecordingTrackMute = null;
 let switchingMicrophone = false;
 let detectingDevices = false;
 let deletingSession = false;
@@ -194,34 +204,22 @@ function appendNetworkEvent(event, details = '') {
   if (wasAtBottom) log.scrollTop = log.scrollHeight;
 }
 
-function setStatus(text, kind = 'ready') {
-  $('statusText').textContent = text;
-  $('statusDot').className = `status-dot${kind === 'recording' ? ' live' : kind === 'saved' ? ' saved' : ''}`;
+function updateCaptureStatusBadge() {
+  const badge = $('captureStatusBadge');
+  const isOnAir = captureOnAir;
+  const isPending = !isOnAir && (captureStartPending || starting);
+  badge.classList.toggle('on', isOnAir);
+  badge.classList.toggle('pending', isPending);
+  badge.classList.toggle('off', !isOnAir && !isPending);
+  badge.setAttribute('aria-label', isOnAir ? 'On air' : isPending ? 'Waiting to go on air' : 'Not on air');
+}
+
+function setStatus(_text, _kind = 'ready') {
+  updateCaptureStatusBadge();
 }
 
 function updateRecordingPreparation() {
-  let message = '';
-  if (scheduledRecordingStartAt !== null) {
-    const seconds = Math.ceil((scheduledRecordingStartAt - performance.now()) / 1000);
-    message = seconds > 0
-      ? `Recording starts in ${seconds} seconds. Please wait until the recording indicator appears before speaking.`
-      : 'Confirming recording start. Please wait until the recording indicator appears.';
-  } else if (starting) {
-    message = 'Preparing to record and checking the start time and recording setup. Please wait until the recording indicator appears before speaking.';
-  }
-  if (!message) {
-    recordingPreparation.hidden = true;
-    window.clearInterval(preparationTimer);
-    preparationTimer = null;
-    if (recording && !finalizing) setStatus('Recording · Saving to this device', 'recording');
-    return;
-  }
-  recordingPreparation.hidden = false;
-  recordingPreparation.textContent = message;
-  if ($('statusText').textContent !== message) setStatus(message);
-  if (preparationTimer === null) {
-    preparationTimer = window.setInterval(updateRecordingPreparation, 200);
-  }
+  recordingPreparation.hidden = true;
 }
 
 function updateRecordButtonAvailability() {
@@ -1110,12 +1108,10 @@ function updateTransferGraphSummary(sendMbps, savePercent) {
 async function updateTransferProgress() {
   const card = $('transferProgressCard');
   const text = $('transferProgressText');
-  const bar = $('transferProgressBar');
   const generation = roomCall?.authFields?.generation;
   if (!roomCall?.localRole || !generation) {
     card.classList.remove('transfer-error');
     transferGraphSamples = [];
-    bar.value = 0;
     text.textContent = '— / — · — complete';
     $('networkProgressError').textContent = '—';
     $('networkProgressErrorRow').hidden = true;
@@ -1150,7 +1146,6 @@ async function updateTransferProgress() {
     const totalStored = progress.bytes > 0
       ? Math.min(1, progress.hostStoredBytes / progress.bytes)
       : 0;
-    bar.value = totalStored;
     updateTransferGraph(now, sendMbps, totalStored * 100);
     text.textContent = formatTransferRatio(progress.pendingBytes, progress.bytes);
     return;
@@ -1162,7 +1157,6 @@ async function updateTransferProgress() {
   const savePercent = guestIsFresh
     ? guestTotalBytes > 0 ? Math.min(100, progress.bytes / guestTotalBytes * 100) : 0
     : null;
-  bar.value = savePercent === null ? 0 : savePercent / 100;
   updateTransferGraph(now, guestIsFresh ? guestProgress.sendMbps : null, savePercent);
   text.textContent = guestIsFresh
     ? formatTransferRatio(Math.max(0, guestTotalBytes - progress.bytes), guestTotalBytes)
@@ -1200,7 +1194,9 @@ async function storeIncomingTransferChunk(metadata, wav, sha256) {
   const existingChunk = await runRequest('chunks', 'get', [takeId, metadata.sequence]);
   if (existingChunk) {
     if (!existingTake || existingChunk.sha256 !== sha256 ||
-        existingChunk.startFrame !== metadata.startFrame || existingChunk.frames !== metadata.frames) {
+        existingChunk.startFrame !== metadata.startFrame || existingChunk.frames !== metadata.frames ||
+        existingTake.participant !== metadata.participant || existingTake.number !== metadata.takeNumber ||
+        existingTake.startedAt !== metadata.startedAt || !sameStartPlan(existingTake.startPlan, metadata.startPlan)) {
       throw new Error('Different audio hashes were received for the same chunk number.');
     }
     try {
@@ -1231,7 +1227,13 @@ async function storeIncomingTransferChunk(metadata, wav, sha256) {
       throw new Error('Received audio from this participant exceeds the 2-hour limit.');
     }
   }
+  const synchronization = synchronizationForTake({
+    ...existingTake,
+    sessionId: activeSession.id,
+    startPlan: metadata.startPlan ?? null
+  }, await loadAll('takes'));
   const take = existingTake || {
+    synchronization,
     id: takeId,
     sessionId: activeSession.id,
     sourceTakeId: metadata.takeId,
@@ -1239,6 +1241,10 @@ async function storeIncomingTransferChunk(metadata, wav, sha256) {
     participant: metadata.participant,
     number: metadata.takeNumber,
     startedAt: metadata.startedAt,
+    startPlan: metadata.startPlan ?? null,
+    startObservation: null,
+    captureStatus: 'unconfirmed',
+    startedAtEstimated: metadata.startedAtEstimated === true,
     endedAt: null,
     status: 'recording',
     frames: 0,
@@ -1257,6 +1263,8 @@ async function storeIncomingTransferChunk(metadata, wav, sha256) {
   if (take.sessionId !== activeSession.id || take.sourceTakeId !== metadata.takeId ||
       take.transferGeneration !== metadata.generation || take.participant !== metadata.participant ||
       take.number !== metadata.takeNumber || take.startedAt !== metadata.startedAt ||
+      !sameStartPlan(take.startPlan, metadata.startPlan) ||
+      Boolean(take.startedAtEstimated) !== Boolean(metadata.startedAtEstimated) ||
       !validChunkPosition) {
     throw new Error('The received chunk does not match the existing take order or metadata.');
   }
@@ -1287,10 +1295,22 @@ async function storeIncomingTransferChunk(metadata, wav, sha256) {
   const transaction = database.transaction(stores, 'readwrite');
   const done = transactionComplete(transaction);
   transaction.objectStore('chunks').put(chunk);
-  if (takeStillRecording) transaction.objectStore('takes').put(nextTake);
+  if (takeStillRecording) {
+    const store = transaction.objectStore('takes');
+    const request = store.get(takeId);
+    request.addEventListener('success', () => {
+      store.put({ ...nextTake, synchronization: request.result?.synchronization ?? synchronization });
+    }, { once: true });
+  }
   await done;
   if (takeStillRecording) {
     receivedTransferFrames.set(metadata.generation, totalReceivedFrames + metadata.frames);
+  }
+  if (metadata.startedAtEstimated && metadata.sequence === 0 && !existingTake) {
+    appendNetworkEvent(
+      'Guest recording start time estimated',
+      'the displayed take timing may be approximate'
+    );
   }
   updateTransferProgressCache(metadata.generation, 'host', (progress) => ({
     bytes: progress.bytes + wav.size,
@@ -1311,7 +1331,9 @@ async function storeIncomingTransferManifest(manifest) {
   const take = await runRequest('takes', 'get', takeId);
   if (!take || take.frames !== manifest.frames || take.chunks !== manifest.chunks ||
       take.sourceTakeId !== manifest.takeId || take.participant !== manifest.participant ||
-      take.startedAt !== manifest.startedAt || take.number !== manifest.takeNumber) {
+      take.startedAt !== manifest.startedAt || take.number !== manifest.takeNumber ||
+      !sameStartPlan(take.startPlan, manifest.startPlan) ||
+      Boolean(take.startedAtEstimated) !== Boolean(manifest.startedAtEstimated)) {
     throw new Error('The manifest does not match the chunks saved on the host.');
   }
   const savedChunks = await loadTakeChunks(takeId);
@@ -1322,11 +1344,24 @@ async function storeIncomingTransferManifest(manifest) {
   const nextTake = {
     ...take,
     status: manifest.status,
-    endedAt: manifest.startedAt + (manifest.frames / TARGET_RATE) * 1000,
+    endedAt: manifest.startedAt === null ? null : manifest.startedAt + (manifest.frames / TARGET_RATE) * 1000,
+    startObservation: manifest.startObservation ?? null,
+    timingPoints: manifest.timingPoints ?? [],
+    timingDiscontinuous: Boolean(manifest.timingDiscontinuous),
+    captureStatus: manifest.startObservation ? 'started' : 'unconfirmed',
     tailUnknown: manifest.tailUnknown,
+    startedAtEstimated: manifest.startedAtEstimated === true,
     hostStored: true
   };
-  await persistTake(nextTake);
+  const transaction = database.transaction('takes', 'readwrite');
+  const done = transactionComplete(transaction);
+  const store = transaction.objectStore('takes');
+  const request = store.get(takeId);
+  request.addEventListener('success', () => {
+    if (!request.result) { transaction.abort(); return; }
+    store.put({ ...nextTake, synchronization: request.result.synchronization ?? nextTake.synchronization });
+  }, { once: true });
+  await done;
   updateTransferProgressCache(manifest.generation, 'host', (progress) => ({
     completeTakes: progress.completeTakes + 1
   }));
@@ -1504,7 +1539,16 @@ async function renderTakes() {
     meta.className = 'take-meta';
     const duration = formatDuration((take.frames || 0) / TARGET_RATE);
     const size = Number.isFinite(take.bytes) ? formatBytes(take.bytes) : '—';
-    meta.textContent = `${duration} · ${size}`;
+    const synchronization = synchronizationForTake(take, takes);
+    const timing = synchronization
+      ? `Start difference ${synchronization.differenceMs.toFixed(1)} ms`
+      : take.startPlan
+        ? 'Synchronization unconfirmed'
+        : take.startObservation ? 'Start observed' : 'Start unconfirmed';
+    const delivery = take.remote || take.transferGeneration
+      ? take.hostStored ? 'Saved on host' : 'Transfer pending'
+      : 'Saved locally';
+    meta.textContent = `${duration} · ${size} · ${timing} · ${delivery}`;
     info.append(label, meta);
     const actions = document.createElement('div');
     actions.className = 'take-actions';
@@ -1517,6 +1561,26 @@ async function renderTakes() {
         (take.remote && take.hostStored !== true);
       exportButton.addEventListener('click', () => { void exportTake(take, exportButton); });
       actions.append(exportButton);
+      if (!take.remote) {
+        meta.textContent += ' · Host reference (unchanged)';
+      } else {
+        const reference = takes.find((item) => !item.remote && item.startPlan?.eventId === take.startPlan?.eventId &&
+          item.startPlan?.sequence === take.startPlan?.sequence);
+        const alignment = assessAlignment(take, reference);
+        const alignedButton = document.createElement('button');
+        alignedButton.className = 'take-action';
+        alignedButton.type = 'button';
+        alignedButton.textContent = 'Save aligned WAV (experimental)';
+        alignedButton.disabled = exportButton.disabled || !alignment.available;
+        alignedButton.title = alignment.available
+          ? `Drift ${alignment.driftPpm.toFixed(1)} ppm · estimated uncertainty ${alignment.uncertaintyMs.toFixed(1)} ms`
+          : alignment.reason;
+        alignedButton.addEventListener('click', () => { void exportTake(take, alignedButton, alignment); });
+        actions.append(alignedButton);
+        meta.textContent += alignment.available
+          ? ` · Drift ${alignment.driftPpm.toFixed(1)} ppm (experimental)`
+          : ` · Alignment unavailable: ${alignment.reason}`;
+      }
     }
     row.append(info, actions);
     takeList.append(row);
@@ -1776,21 +1840,21 @@ async function commitChunk(samples, isFinal, startFrame) {
     const transaction = database.transaction(['chunks', 'takes'], 'readwrite');
     const done = transactionComplete(transaction);
     transaction.objectStore('chunks').put(chunk);
-    const nextTake = { ...activeTake };
-    nextTake.frames += samples.length;
-    nextTake.chunks += 1;
-    nextTake.bytes += wav.size;
     let committedTake;
-    const storedTakeRequest = transaction.objectStore('takes').get(activeTake.id);
+    const storedTakeRequest = transaction.objectStore('takes').get(chunk.takeId);
     storedTakeRequest.addEventListener('success', () => {
+      const storedTake = storedTakeRequest.result;
+      if (!storedTake || activeTake?.id !== chunk.takeId) { transaction.abort(); return; }
       committedTake = {
-        ...nextTake,
-        hostStoredChunks: storedTakeRequest.result?.hostStoredChunks || []
+        ...mergeRecordingMetadata(storedTake, activeTake),
+        frames: storedTake.frames + samples.length,
+        chunks: storedTake.chunks + 1,
+        bytes: storedTake.bytes + wav.size
       };
       transaction.objectStore('takes').put(committedTake);
     }, { once: true });
     await done;
-    activeTake = committedTake;
+    if (activeTake?.id === committedTake.id) activeTake = mergeRecordingMetadata(committedTake, activeTake);
   }).catch((error) => {
     commitError = error;
     throw error;
@@ -1813,10 +1877,54 @@ async function commitChunk(samples, isFinal, startFrame) {
   roomCall?.notifyChunkCommitted(chunk, take);
 }
 
+function queueRecordingMetadata(patch) {
+  const update = { id: activeTake?.id, ...patch };
+  if (!update.id) return;
+  commitChain = commitChain.then(async () => {
+    try {
+      const transaction = database.transaction('takes', 'readwrite');
+      const done = transactionComplete(transaction);
+      const store = transaction.objectStore('takes');
+      const request = store.get(update.id);
+      request.addEventListener('success', () => {
+        if (!request.result) { transaction.abort(); return; }
+        store.put(mergeRecordingMetadata(request.result, update));
+      }, { once: true });
+      await done;
+    } catch (error) {
+      appendNetworkEvent('Recording metadata save failed', error.message);
+      if (activeTake?.id === update.id) activeTake.timingDiscontinuous = true;
+    }
+  });
+}
+
+function recordTimingPoint(data) {
+  if (!activeTake || !audioContext) return;
+  const timestamp = audioContext.getOutputTimestamp?.();
+  if (!timestamp || !Number.isFinite(timestamp.performanceTime) || timestamp.performanceTime <= 0 ||
+      !Number.isFinite(timestamp.contextTime) || timestamp.contextTime <= 0) {
+    activeTake.timingDiscontinuous = true;
+    queueRecordingMetadata({ timingDiscontinuous: true });
+    appendNetworkEvent('Recording timing unavailable', `frame=${data.frame} output timestamp unavailable`);
+    return;
+  }
+  const point = {
+    frame: data.frame,
+    contextTime: data.contextTime,
+    localPerfMs: timestamp.performanceTime + (data.contextTime - timestamp.contextTime) * 1000,
+    uncertaintyMs: 1
+  };
+  const points = activeTake.timingPoints ?? [];
+  if (points.length >= MAX_TIMING_POINTS || points.at(-1)?.frame >= point.frame) return;
+  activeTake.timingPoints = [...points, point];
+  queueRecordingMetadata({ timingPoints: activeTake.timingPoints });
+}
+
 async function createTake({
   scheduledStartAt = null,
   scheduledStartedAt = null,
   event = null,
+  prepareOnly = false,
   preparedAudioContext = null,
   preparedAudioContextResume = null
 } = {}) {
@@ -1852,10 +1960,10 @@ async function createTake({
     sessionId: activeSession.id,
     number: sessionTakes.length + 1,
     participant: activeSession.participant,
-    status: 'recording',
+    status: prepareOnly ? 'preparing' : 'recording',
     transferGeneration: roomCall?.localRole === 'guest' ? roomCall.authFields?.generation : null,
     hostStored: roomCall?.localRole === 'guest' ? false : null,
-    startedAt: scheduledStartedAt ??
+    startedAt: prepareOnly ? null : scheduledStartedAt ??
       (scheduledStartAt === null ? Date.now() : Date.now() + (scheduledStartAt - performance.now())),
     endedAt: null,
     frames: 0,
@@ -1892,6 +2000,9 @@ async function createTake({
   recorderNode.port.onmessage = ({ data }) => {
     if (data.type === 'started') {
       if (!recording || finalizing) return;
+      captureOnAir = true;
+      captureStartPending = false;
+      updateCaptureStatusBadge();
       const timestamp = audioContext?.getOutputTimestamp?.();
       const observedAt = timestamp && Number.isFinite(timestamp.performanceTime) &&
         Number.isFinite(timestamp.contextTime)
@@ -1899,14 +2010,18 @@ async function createTake({
         : performance.now() + (data.contextTime - (audioContext?.currentTime ?? data.contextTime)) * 1000;
       if (data.event) {
         roomCall?.reportRecordingStarted(data.event, observedAt, data.frame);
+      } else {
+        appendNetworkEvent(
+          'Recording start local',
+          `frame=${data.frame} observedAt=${observedAt.toFixed(3)} ms`
+        );
       }
       takeStartedAt = observedAt;
-      activeTake.startedAt = scheduledRecordingStartAt !== null && scheduledRecordingWallStartAt !== null
-        ? scheduledRecordingWallStartAt + (observedAt - scheduledRecordingStartAt)
-        : Date.now() + (observedAt - performance.now());
-      void persistTake({ ...activeTake }).catch((error) => {
-        errorText.textContent = `Unable to save the actual recording start time: ${error.message}`;
-      });
+      recordTimingPoint(data);
+      roomCall?.startDriftMonitoring();
+      activeTake.startObservation = { frame: data.frame, localPerfMs: observedAt, contextTime: data.contextTime };
+      activeTake.captureStatus = 'started';
+      queueRecordingMetadata({ startObservation: activeTake.startObservation });
       resetWaveformHistory(localWaveform, observedAt, observedAt);
       waveformElapsedSeconds = 0;
       roomCall?.beginRecordingWaveform(observedAt);
@@ -1918,6 +2033,10 @@ async function createTake({
       $('waveformState').textContent = 'LIVE';
       $('waveformState').classList.add('live');
       drawWaveform();
+      return;
+    }
+    if (data.type === 'timing') {
+      if (recording && !finalizing) recordTimingPoint(data);
       return;
     }
     if (data.type === 'level') {
@@ -1965,7 +2084,9 @@ async function createTake({
     }
   });
   cleanupRecordingTrackMonitor = trackMonitor.cleanup;
+  checkRecordingTrackMute = trackMonitor.checkCurrentMute;
   audioContext.addEventListener('statechange', () => {
+    if (recording && audioContext?.state !== 'running' && activeTake) activeTake.timingDiscontinuous = true;
     if (recording && audioContext?.state === 'closed') {
       void stopRecording('AudioContext was closed. Saved chunks are available for recovery.')
         .catch((error) => setMessage(`Unable to stop recording: ${error.message}`, true));
@@ -1991,29 +2112,97 @@ async function createTake({
   if (cancelRecordingStart) {
     throw new Error('The synchronized recording start was canceled because the other participant could not prepare.');
   }
+  preparedRecordingEvent = event;
+  if (prepareOnly) {
+    appendNetworkEvent(
+      'Recording preparation complete',
+      `event=${event?.eventId ?? 'local'}`
+    );
+    setStatus('Recording prepared · Waiting for both devices', 'ready');
+    $('waveformState').textContent = 'Preparing';
+    $('waveformState').classList.remove('live');
+    return true;
+  }
+  await activatePreparedTake(event ? { startAt: scheduledStartAt, hostStartedAt: scheduledStartedAt, event } : null);
+}
+
+async function activatePreparedTake(schedule = null) {
+  const plan = schedule === null ? null : createStartPlan(schedule, performance.now());
+  const scheduledStartAt = plan?.localTargetPerfMs ?? null;
+  const event = schedule?.event ?? null;
+  if (!activeTake || !recorderNode || !audioContext) {
+    throw new Error('Recording resources are not prepared on this device.');
+  }
+  if (preparedRecordingEvent &&
+      (preparedRecordingEvent.eventId !== event?.eventId ||
+       preparedRecordingEvent.sequence !== event?.sequence)) {
+    throw new Error('The prepared recording event does not match the synchronized start.');
+  }
+  if (scheduledStartAt !== null && scheduledStartAt < performance.now() + 250) {
+    throw new Error('The synchronized start could not be prepared in time. Check recording readiness and try again.');
+  }
+  if (cancelRecordingStart) {
+    throw new Error('The synchronized recording start was canceled because the other participant could not prepare.');
+  }
+  if (plan) activeTake.startedAt = plan.displayStartedAt;
+  activeTake.startPlan = plan;
+  activeTake.startObservation = null;
+  activeTake.timingPoints = [];
+  activeTake.clockSamples = roomCall?.localRole === 'host' && roomCall.lastClockSample ? [roomCall.lastClockSample] : [];
+  activeTake.timingDiscontinuous = false;
+  activeTake.captureStatus = 'armed';
+  activeTake.status = 'recording';
   await persistTake(activeTake);
   if (cancelRecordingStart) {
     await deleteUnstartedTake(activeTake.id);
     activeTake = null;
+    preparedRecordingEvent = null;
     throw new Error('The synchronized recording start was canceled because the other participant could not prepare.');
+  }
+  if (scheduledStartAt !== null && scheduledStartAt < performance.now() + 250) {
+    throw new Error('The synchronized start could not be prepared in time. Check recording readiness and try again.');
   }
   const startAt = scheduledStartAt === null
     ? null
     : audioContextTimeAtPerformanceTime(scheduledStartAt);
-  recorderNode.port.postMessage({
-    type: 'start',
-    maximumFrames: takeFrameLimit,
-    startAt,
-    eventId: event?.eventId,
-    sequence: event?.sequence
-  });
   recording = true;
-  trackMonitor.checkCurrentMute();
-  takeStartedAt = scheduledStartAt ?? performance.now();
+  try {
+    await new Promise((resolve, reject) => {
+      const port = recorderNode.port;
+      const previousHandler = port.onmessage;
+      const timer = window.setTimeout(() => {
+        port.onmessage = previousHandler;
+        reject(new Error('The AudioWorklet did not confirm the recording start reservation.'));
+      }, 1000);
+      port.onmessage = (message) => {
+        if (message.data.type === 'armed') {
+          window.clearTimeout(timer);
+          port.onmessage = previousHandler;
+          appendNetworkEvent('Recording start armed', `event=${event?.eventId ?? 'local'}`);
+          resolve();
+        } else {
+          previousHandler?.(message);
+        }
+      };
+      port.postMessage({
+        type: 'start',
+        maximumFrames: takeFrameLimit,
+        startAt,
+        eventId: event?.eventId,
+        sequence: event?.sequence
+      });
+    });
+  } catch (error) {
+    recording = false;
+    throw error;
+  }
+  preparedRecordingEvent = null;
+  checkRecordingTrackMute?.();
+  if (!captureOnAir) takeStartedAt = scheduledStartAt ?? performance.now();
   elapsedTimer = window.setInterval(updateTimer, 200);
   recordButton.disabled = true;
   stopButton.disabled = false;
-  const scheduled = scheduledStartAt !== null;
+  const scheduled = scheduledStartAt !== null && !captureOnAir;
   setStatus(scheduled ? 'Recording scheduled · Saving to this device' : 'Recording · Saving to this device', scheduled ? 'ready' : 'recording');
   $('waveformState').textContent = scheduled ? 'Preparing' : 'LIVE';
   $('waveformState').classList.toggle('live', !scheduled);
@@ -2022,6 +2211,7 @@ async function createTake({
 
 async function stopDiagnostics({ stopCapture = true } = {}) {
   clearRecordingTrackMonitor();
+  checkRecordingTrackMute = null;
   if (sourceNode) sourceNode.disconnect();
   inputChannelNode?.disconnect();
   if (recorderNode) {
@@ -2042,13 +2232,18 @@ async function stopDiagnostics({ stopCapture = true } = {}) {
 }
 
 async function stopRecording(recoveryReason = null) {
+  if (preparedRecordingEvent && !recording) return discardPreparedTake();
   if (!activeTake || finalizing) return !recording && !finalizing;
   appendNetworkEvent(
     'Recording stop local',
     `requestedAt=${performance.now().toFixed(3)} ms frames=${activeTake.frames} recovery=${Boolean(recoveryReason)}`
   );
   finalizing = true;
+  roomCall?.stopDriftMonitoring();
   recording = false;
+  captureOnAir = false;
+  captureStartPending = false;
+  updateCaptureStatusBadge();
   stopWaveformRendering();
   updateRecordButtonAvailability();
   scheduledRecordingStartAt = null;
@@ -2093,15 +2288,32 @@ async function stopRecording(recoveryReason = null) {
     recoveryReason: failure ? String(failure) : null
   };
   try {
-    await persistTake(activeTake);
+    const completedTake = activeTake;
+    const transaction = database.transaction('takes', 'readwrite');
+    const done = transactionComplete(transaction);
+    const store = transaction.objectStore('takes');
+    const request = store.get(completedTake.id);
+    request.addEventListener('success', () => {
+      if (!request.result) { transaction.abort(); return; }
+      activeTake = { ...mergeRecordingMetadata(request.result, completedTake),
+        status, endedAt: completedTake.endedAt, tailUnknown: completedTake.tailUnknown,
+        recoveryReason: completedTake.recoveryReason };
+      store.put(activeTake);
+    }, { once: true });
+    await done;
   } catch (error) {
     failure ||= `Unable to save the take completion status: ${error.message}`;
   }
+  appendNetworkEvent(
+    'Recording save local',
+    `status=${failure ? 'recovered' : 'saved'} frames=${activeTake.frames} chunks=${activeTake.chunks}`
+  );
   if (activeTake.transferGeneration) roomCall?.notifyTakeFinalized(activeTake);
   $('timer').textContent = formatDuration(activeTake.frames / TARGET_RATE);
   stopButton.disabled = true;
   finalizing = false;
   takeFrameLimit = 0;
+  preparedRecordingEvent = null;
   setStatus(failure ? 'Recovery data saved. The unconfirmed final section is not included.' : 'Recording saved · Ready to export WAV', failure ? 'ready' : 'saved');
   $('waveformState').textContent = '';
   $('waveformState').classList.remove('live');
@@ -2193,7 +2405,7 @@ function releasePrimedRecordingAudioContext() {
   void context.close();
 }
 
-async function startRecording(remoteSchedule = null) {
+async function startRecording(remoteSchedule = null, { prepareOnly = false, prepareEvent = null } = {}) {
   if (recording) return true;
   if (finalizing || starting || switchingMicrophone || !activeSession) return false;
   if (roomCall?.isActive && !roomCall.isGuest && !roomCall.canStartRecording) {
@@ -2202,6 +2414,9 @@ async function startRecording(remoteSchedule = null) {
   }
   if (switchingMicrophone) return false;
   starting = true;
+  captureOnAir = false;
+  captureStartPending = true;
+  updateCaptureStatusBadge();
   cancelRecordingStart = false;
   updateRecordButtonAvailability();
   scheduledRecordingStartAt = remoteSchedule?.startAt ?? null;
@@ -2210,8 +2425,12 @@ async function startRecording(remoteSchedule = null) {
   recordButton.disabled = true;
   let preparedAudioContext = null;
   let synchronizedStartAnnounced = false;
+  let preparationAnnounced = false;
+  let preparationEvent = null;
   try {
-    const prepared = primeRecordingAudioContext();
+    const prepared = preparedRecordingEvent
+      ? { context: audioContext, resume: Promise.resolve(null) }
+      : primeRecordingAudioContext();
     preparedAudioContext = prepared.context;
     if (!roomCall?.isGuest) {
       try {
@@ -2225,15 +2444,50 @@ async function startRecording(remoteSchedule = null) {
         return false;
       }
     }
+    if (prepareOnly) {
+      await createTake({
+        prepareOnly: true,
+        event: prepareEvent,
+        preparedAudioContext: prepared.context,
+        preparedAudioContextResume: prepared.resume
+      });
+      preparedAudioContext = null;
+      return preparedRecordingEvent !== null;
+    }
     let schedule = remoteSchedule;
     if (roomCall?.isPeerReadyForRecording && !roomCall.isGuest && !schedule) {
       const clockOffsetMs = await roomCall.synchronizeClock();
-      const startAt = performance.now() + 5000;
+      const event = { eventId: crypto.randomUUID(), sequence: roomCall.recordingSequence + 1 };
+      preparationEvent = event;
+      preparationAnnounced = true;
+      const localPreparation = createTake({
+        prepareOnly: true,
+        event,
+        preparedAudioContext: prepared.context,
+        preparedAudioContextResume: prepared.resume
+      });
+      preparedAudioContext = null;
+      const guestPreparation = roomCall.prepareGuestRecording(event.eventId, event.sequence);
+      try {
+        await Promise.all([localPreparation, guestPreparation]);
+      } catch (error) {
+        roomCall.cancelGuestRecordingPreparation(event.eventId);
+        await localPreparation.catch(() => {});
+        throw error;
+      }
+      if (cancelRecordingStart) {
+        throw new Error('The synchronized recording start was canceled because the other participant could not prepare.');
+      }
+      const startLeadMs = Math.max(
+        SYNCHRONIZED_START_LEAD_MS,
+        (roomCall.clockRoundTripMs ?? 0) + SYNCHRONIZED_START_LEAD_MS
+      );
+      const startAt = performance.now() + startLeadMs;
       schedule = {
         startAt,
         hostStartedAt: Date.now() + (startAt - performance.now()),
         clockOffsetMs,
-        event: { eventId: crypto.randomUUID(), sequence: roomCall.recordingSequence + 1 }
+        event
       };
       scheduledRecordingStartAt = schedule.startAt;
       scheduledRecordingWallStartAt = schedule.hostStartedAt;
@@ -2250,6 +2504,13 @@ async function startRecording(remoteSchedule = null) {
       if (!command) throw new Error('Unable to send the synchronized recording start to the guest.');
       synchronizedStartAnnounced = true;
     }
+    if (schedule && preparedRecordingEvent) {
+      await activatePreparedTake(schedule);
+      return recording;
+    }
+    if (schedule && roomCall?.localRole === 'guest') {
+      throw new Error('The synchronized start arrived before recording preparation completed.');
+    }
     await createTake({
       scheduledStartAt: schedule?.startAt ?? null,
       scheduledStartedAt: schedule?.hostStartedAt ?? null,
@@ -2260,12 +2521,17 @@ async function startRecording(remoteSchedule = null) {
     preparedAudioContext = null;
     return recording;
   } catch (error) {
+    const unstartedPreparedTake = Boolean(preparedRecordingEvent && !recording);
     await stopDiagnostics({ stopCapture: false });
-    if (synchronizedStartAnnounced && !cancelRecordingStart) roomCall.setHostRecordingState(false);
-    if (activeTake?.status === 'recording') {
-      if (cancelRecordingStart && !recording) {
+    if (preparationEvent) roomCall?.cancelGuestRecordingPreparation(preparationEvent.eventId);
+    if ((synchronizedStartAnnounced || preparationAnnounced) && !cancelRecordingStart) {
+      roomCall.setHostRecordingState(false);
+    }
+    if (activeTake && ['preparing', 'recording'].includes(activeTake.status)) {
+      if ((cancelRecordingStart || unstartedPreparedTake || prepareOnly || preparationAnnounced) && !recording) {
         const cancelledTake = activeTake;
         activeTake = null;
+        preparedRecordingEvent = null;
         try {
           await deleteUnstartedTake(cancelledTake.id);
         } catch (deleteError) {
@@ -2283,6 +2549,7 @@ async function startRecording(remoteSchedule = null) {
           errorText.textContent ||= `Unable to discard canceled take: ${deleteError.message}`;
           await renderTakes();
         }
+        preparedRecordingEvent = null;
       } else {
         activeTake = { ...activeTake, status: 'recovered', endedAt: Date.now(), tailUnknown: true, recoveryReason: error.message };
         await persistTake(activeTake).catch((saveError) => { errorText.textContent = `${error.message} Unable to save take status: ${saveError.message}`; });
@@ -2298,6 +2565,8 @@ async function startRecording(remoteSchedule = null) {
       : error.name === 'OverconstrainedError' && (error.constraint || error.constraintName) === 'deviceId'
         ? 'The selected microphone was not found or is unavailable. Select “Detect Devices” to refresh the list and choose another input.'
         : `Unable to start recording: ${errorDetails}`;
+    captureOnAir = false;
+    captureStartPending = false;
     setStatus('Unable to start recording');
     recordButton.disabled = false;
     stopButton.disabled = true;
@@ -2311,10 +2580,32 @@ async function startRecording(remoteSchedule = null) {
     }
     starting = false;
     cancelRecordingStart = false;
+    if (!recording && !captureOnAir && !preparedRecordingEvent) captureStartPending = false;
+    updateCaptureStatusBadge();
     updateRecordingPreparation();
     updateRecordButtonAvailability();
-    if (!recording && activeSession && !studioView.hidden && mediaStream) startLocalPreview(mediaStream);
+    if (!recording && !preparedRecordingEvent && activeSession && !studioView.hidden && mediaStream) {
+      startLocalPreview(mediaStream);
+    }
   }
+}
+
+async function discardPreparedTake() {
+  if (!preparedRecordingEvent || recording) return false;
+  const take = activeTake;
+  await stopDiagnostics({ stopCapture: false });
+  activeTake = null;
+  preparedRecordingEvent = null;
+  captureOnAir = false;
+  captureStartPending = false;
+  scheduledRecordingStartAt = null;
+  scheduledRecordingWallStartAt = null;
+  if (take) await deleteUnstartedTake(take.id);
+  updateCaptureStatusBadge();
+  updateRecordingPreparation();
+  updateRecordButtonAvailability();
+  if (activeSession && !studioView.hidden && mediaStream) startLocalPreview(mediaStream);
+  return true;
 }
 
 function applyHostRecordingState(isRecording, schedule = null) {
@@ -2340,6 +2631,13 @@ function applyHostRecordingState(isRecording, schedule = null) {
         : 'Unable to confirm the stop or save. Check the error.';
       return stopped;
     }
+    if (preparedRecordingEvent) {
+      const discarded = await discardPreparedTake();
+      $('hostRecordingStatus').textContent = discarded
+        ? 'Recording preparation was canceled by the host'
+        : 'Waiting for the host to record';
+      return discarded;
+    }
     $('hostRecordingStatus').textContent = previousState
       ? 'Stopped in sync with the host and saved on this device'
       : 'Waiting for the host to record';
@@ -2361,8 +2659,15 @@ async function getTakeChunks(takeId) {
   return chunks.sort((left, right) => left.sequence - right.sequence);
 }
 
-async function exportTake(take, exportButton) {
-  const totalBytes = 44 + take.frames * BYTES_PER_FRAME;
+async function exportTake(take, exportButton, alignment = null) {
+  const outputFrames = alignment?.outputFrames ?? take.frames;
+  const totalBytes = 44 + outputFrames * BYTES_PER_FRAME;
+  const filename = alignment
+    ? makeRecordingFilename(activeSession, take).replace(/\.wav$/u, '_aligned.wav')
+    : makeRecordingFilename(activeSession, take);
+  const writeOutput = (chunks, writable) => alignment
+    ? writeAlignedPcm24Wav(take, chunks, writable, alignment)
+    : writePcm24Wav(take, chunks, writable);
   if (!Number.isSafeInteger(take.frames) || take.frames <= 0 || totalBytes > MAX_WAV_BYTES) {
     setMessage('Export WAV files no larger than 1 GiB.', true);
     return;
@@ -2371,7 +2676,7 @@ async function exportTake(take, exportButton) {
   try {
     const fileHandle = typeof window.showSaveFilePicker === 'function'
       ? await window.showSaveFilePicker({
-          suggestedName: makeRecordingFilename(activeSession, take),
+          suggestedName: filename,
           types: [{ description: 'WAV audio', accept: { 'audio/wav': ['.wav'] } }]
         })
       : null;
@@ -2379,7 +2684,7 @@ async function exportTake(take, exportButton) {
     if (fileHandle) {
       const writable = await fileHandle.createWritable();
       try {
-        await writePcm24Wav(take, chunks, writable);
+        await writeOutput(chunks, writable);
         await writable.close();
       } catch (error) {
         try {
@@ -2397,7 +2702,7 @@ async function exportTake(take, exportButton) {
       return;
     }
     const blobParts = [];
-    await writePcm24Wav(take, chunks, {
+    await writeOutput(chunks, {
       async write(data) {
         blobParts.push(data);
       }
@@ -2406,7 +2711,7 @@ async function exportTake(take, exportButton) {
     const url = URL.createObjectURL(output);
     const downloadLink = document.createElement('a');
     downloadLink.href = url;
-    downloadLink.download = makeRecordingFilename(activeSession, take);
+    downloadLink.download = filename;
     downloadLink.className = 'take-action';
     downloadLink.textContent = 'Download';
     exportButton.replaceWith(downloadLink);
@@ -2425,6 +2730,8 @@ async function exportTake(take, exportButton) {
 
 async function recoverInterruptedTakes() {
   const takes = await loadAll('takes');
+  const preparing = takes.filter((take) => take.status === 'preparing');
+  for (const take of preparing) await deleteUnstartedTake(take.id);
   const interrupted = takes.filter((take) => take.status === 'recording');
   for (const take of interrupted) {
     await persistTake({
@@ -2572,7 +2879,40 @@ async function initialize() {
       getRecordingState: () => recording,
       checkReadiness: checkRecordingReadiness,
       onReadinessState: () => updateRecordButtonAvailability(),
+      onRecordingPrepare: ({ eventId, sequence }) => startRecording(null, {
+        prepareOnly: true,
+        prepareEvent: { eventId, sequence }
+      }),
       onRecordingState: applyHostRecordingState,
+      onClockMeasurement: (sample) => {
+        if (!recording || finalizing || !activeTake || !sample) return;
+        const samples = activeTake.clockSamples ?? [];
+        if (samples.length < MAX_TIMING_POINTS && (!samples.length || sample.hostPerfMs > samples.at(-1).hostPerfMs)) {
+          activeTake.clockSamples = [...samples, sample];
+          queueRecordingMetadata({ clockSamples: activeTake.clockSamples });
+        }
+      },
+      onSynchronization: async (result) => {
+        try {
+          const transaction = database.transaction('takes', 'readwrite');
+          const done = transactionComplete(transaction);
+          const cursorRequest = transaction.objectStore('takes').openCursor();
+          cursorRequest.addEventListener('success', () => {
+            const cursor = cursorRequest.result;
+            if (!cursor) return;
+            const take = cursor.value;
+            if (take.startPlan?.eventId === result.eventId && take.startPlan.sequence === result.sequence) {
+              cursor.update({ ...take, synchronization: result });
+            }
+            cursor.continue();
+          });
+          await done;
+          if (activeTake?.startPlan?.eventId === result.eventId) activeTake.synchronization = result;
+          scheduleTakeRefresh();
+        } catch (error) {
+          appendNetworkEvent('Synchronization result save failed', error.message);
+        }
+      },
       onNetworkEvent: appendNetworkEvent,
       prepareRecordingAudioContext: () => { primeRecordingAudioContext(); },
       releasePreparedRecordingAudioContext: releasePrimedRecordingAudioContext,
