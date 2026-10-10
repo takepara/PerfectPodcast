@@ -712,7 +712,9 @@ export class RoomCall {
         this.localInputMonitorState.deviceLabel
       );
     });
-    channel.addEventListener('message', ({ data }) => this.receiveInputMonitorMessage(data));
+    channel.addEventListener('message', ({ data }) => {
+      if (this.inputMonitorChannel === channel && !this.remoteHostEnded) this.receiveInputMonitorMessage(data);
+    });
     channel.addEventListener('close', () => {
       if (this.inputMonitorChannel !== channel) return;
       this.inputMonitorChannel = null;
@@ -721,9 +723,15 @@ export class RoomCall {
       this.updateRemoteInputMonitor({ level: 0, muted: null, deviceLabel: '' });
     });
     channel.addEventListener('error', () => {
-      if (this.inputMonitorChannel === channel) {
-        this.setStatus('Unable to synchronize the other participant’s microphone input level.', true);
-      }
+      if (this.inputMonitorChannel !== channel || this.remoteHostEnded) return;
+      // Channel shutdown can precede the signaling notification that the host left.
+      window.clearTimeout(this.inputMonitorErrorTimer);
+      this.inputMonitorErrorTimer = window.setTimeout(() => {
+        this.inputMonitorErrorTimer = null;
+        if (this.inputMonitorChannel === channel && channel.readyState === 'open' && !this.remoteHostEnded) {
+          this.setStatus('Unable to synchronize the other participant’s microphone input level.', true);
+        }
+      }, 0);
     });
     if (channel.readyState === 'open') {
       this.lastInputMonitorSentAt = -Infinity;
@@ -1567,6 +1575,7 @@ export class RoomCall {
     return new Promise((resolve, reject) => {
       const socket = new WebSocket(signalingUrl(roomId));
       this.socket = socket;
+      this.remoteHostEnded = false;
       this.incomingMessageChain = Promise.resolve();
       let settled = false;
       const timeout = window.setTimeout(() => {
@@ -1616,6 +1625,12 @@ export class RoomCall {
           settled = true;
           window.clearTimeout(timeout);
           reject(new Error('The signaling server rejected the connection.'));
+        } else if (this.socket === socket && this.localRole === 'guest' && event.code === 1000 && event.reason === 'Host left') {
+          this.remoteHostEnded = true;
+          void this.leave({ keepMessage: true }).then(() => {
+            if (this.socket) return;
+            this.setStatus('The host ended the call. Local recordings remain on this device.');
+          }).catch((error) => this.setStatus(`Unable to finish call cleanup: ${error.message}`, true));
         } else if (this.socket === socket && this.localRole) {
           this.connected = false;
           this.localReady = false;
@@ -1716,8 +1731,11 @@ export class RoomCall {
         this.clearPendingStartEvents();
         for (const pending of this.pendingRecordingCommands.values()) window.clearTimeout(pending.timer);
         this.pendingRecordingCommands.clear();
-        this.inputMonitorChannel?.close();
+        window.clearTimeout(this.inputMonitorErrorTimer);
+        this.inputMonitorErrorTimer = null;
+        const inputMonitorChannel = this.inputMonitorChannel;
         this.inputMonitorChannel = null;
+        inputMonitorChannel?.close();
         this.remoteInputMonitorState = { level: 0, muted: null, deviceLabel: '' };
         this.peerConnection?.close();
         this.peerConnection = null;
@@ -1965,6 +1983,10 @@ export class RoomCall {
     this.peerConnection = new RTCPeerConnection({
       iceServers: this.turnIceServers || [{ urls: 'stun:stun.cloudflare.com:3478' }]
     });
+    const peer = this.peerConnection;
+    const observePeer = (event, handler) => peer.addEventListener(event, (...args) => {
+      if (this.peerConnection === peer && !this.remoteHostEnded) handler(...args);
+    });
     this.logNetworkEvent(
       'PeerConnection created',
       `iceServers=${this.turnIceServers ? 'TURN' : 'STUN'}`
@@ -1980,7 +2002,7 @@ export class RoomCall {
       this.observeDataChannel(monitorChannel, true);
       this.setInputMonitorChannel(monitorChannel);
     } else {
-      this.peerConnection.addEventListener('datachannel', ({ channel }) => {
+      observePeer('datachannel', ({ channel }) => {
         this.observeDataChannel(channel);
         if (channel.label === 'input-monitor-v1') {
           if (channel.ordered || channel.maxRetransmits !== 0 || channel.maxPacketLifeTime !== null) {
@@ -2004,7 +2026,7 @@ export class RoomCall {
     const iceErrorLog = createIceErrorLog((event, details) => this.logNetworkEvent(event, details));
     this.iceErrorLog = iceErrorLog;
     const candidateCounts = new Map();
-    this.peerConnection.addEventListener('icecandidate', ({ candidate }) => {
+    observePeer('icecandidate', ({ candidate }) => {
       if (candidate) {
         const summary = networkMessageSummary({ type: 'candidate', candidate: candidate.toJSON() });
         const kind = summary.match(/candidate=(\S+)/u)?.[1] || 'unknown';
@@ -2022,19 +2044,19 @@ export class RoomCall {
         candidateCounts.clear();
       }
     });
-    this.peerConnection.addEventListener('icecandidateerror', (event) => {
+    observePeer('icecandidateerror', (event) => {
       iceErrorLog.add(event);
     });
-    this.peerConnection.addEventListener('negotiationneeded', () => {
+    observePeer('negotiationneeded', () => {
       this.logNetworkEvent('PeerConnection', 'negotiationneeded');
     });
-    this.peerConnection.addEventListener('signalingstatechange', () => {
+    observePeer('signalingstatechange', () => {
       this.logNetworkEvent('PeerConnection signaling state', this.peerConnection?.signalingState || 'unknown');
     });
-    this.peerConnection.addEventListener('icegatheringstatechange', () => {
+    observePeer('icegatheringstatechange', () => {
       this.logNetworkEvent('ICE gathering state', this.peerConnection?.iceGatheringState || 'unknown');
     });
-    this.peerConnection.addEventListener('track', (event) => {
+    observePeer('track', (event) => {
       this.logNetworkEvent('Remote track', `kind=${event.track.kind} readyState=${event.track.readyState}`);
       const audio = $('remoteAudio');
       audio.srcObject = event.streams[0] || new MediaStream([event.track]);
@@ -2045,16 +2067,19 @@ export class RoomCall {
         this.setStatus(`Unable to display the other participant’s waveform: ${error.message}`, true);
       });
       event.track.addEventListener('unmute', () => {
+        if (this.peerConnection !== peer || this.remoteHostEnded) return;
         this.logNetworkEvent('Remote track', `kind=${event.track.kind} unmute`);
         void this.playRemoteAudio();
       });
       event.track.addEventListener('mute', () => {
+        if (this.peerConnection !== peer || this.remoteHostEnded) return;
         this.logNetworkEvent('Remote track', `kind=${event.track.kind} mute`);
         $('playRemoteAudioButton').hidden = true;
         this.setRemoteWaveState('Audio stopped', false, event.track.id);
         this.setCallState('The other participant’s audio is temporarily paused. Check their microphone status.');
       });
       event.track.addEventListener('ended', () => {
+        if (this.peerConnection !== peer || this.remoteHostEnded) return;
         this.logNetworkEvent('Remote track', `kind=${event.track.kind} ended`);
         $('playRemoteAudioButton').hidden = true;
         this.stopRemoteWaveform(event.track.id);
@@ -2066,7 +2091,7 @@ export class RoomCall {
         void this.playRemoteAudio();
       }
     });
-    this.peerConnection.addEventListener('connectionstatechange', () => {
+    observePeer('connectionstatechange', () => {
       const state = this.peerConnection?.connectionState;
       this.logNetworkEvent('PeerConnection state', `connection=${state || 'unknown'} ice=${this.peerConnection?.iceConnectionState || 'unknown'}`);
       this.updateReadinessUI();
@@ -2096,7 +2121,7 @@ export class RoomCall {
         this.stopConnectionStats(state === 'connecting' ? 'Connecting…' : 'Not connected');
       }
     });
-    this.peerConnection.addEventListener('iceconnectionstatechange', () => {
+    observePeer('iceconnectionstatechange', () => {
       this.logNetworkEvent('ICE connection state', this.peerConnection?.iceConnectionState || 'unknown');
       if (this.peerConnection?.iceConnectionState === 'disconnected') this.scheduleIceRestart();
     });
@@ -2432,6 +2457,8 @@ export class RoomCall {
   }
 
   async leave({ keepMessage = false } = {}) {
+    window.clearTimeout(this.inputMonitorErrorTimer);
+    this.inputMonitorErrorTimer = null;
     if (this.localRole === 'guest' && this.guestRecordingPreparations.size &&
         !this.getRecordingState()) {
       await this.onRecordingState?.(false);
@@ -2450,8 +2477,9 @@ export class RoomCall {
     this.iceErrorLog?.flush();
     this.iceErrorLog = null;
     this.recordingTransfer.close();
-    this.inputMonitorChannel?.close();
+    const inputMonitorChannel = this.inputMonitorChannel;
     this.inputMonitorChannel = null;
+    inputMonitorChannel?.close();
     this.remoteInputMonitorState = { level: 0, muted: null, deviceLabel: '' };
     this.peerConnection?.close();
     this.peerConnection = null;
