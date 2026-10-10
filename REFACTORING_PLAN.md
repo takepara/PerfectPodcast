@@ -1,7 +1,23 @@
 # 録音基盤の段階的リファクタリング計画
 
 作成日: 2026-10-10
-状態: Phase 0・1の実装と短時間ブラウザー検証を実施（2026-10-10）。実機・長時間・通話中の検証が未完了のため、Phase 1の最終完了判定は保留。DB形式・本番環境は未変更。
+状態: Phase 2の状態統廃合・完了契約修正・公開APIテストと短時間ブラウザー検証を実施（2026-10-10）。Phase 1で実機単独／同時／同期録音の結果も記録済み。Phase 2変更後の実機通話・長時間・背景化検証は未完了。DB形式・本番環境は未変更。
+
+## Phase 2 実施記録（2026-10-10）
+
+- `prototype/recording-controller.js`へ録音主状態を集約。idle／preparing／prepared／armed／capturing／finalizingを明示し、recording／starting／onAir／pending／finalizingは読み取り専用snapshotから導出する。収録画面の6個の書き換え可能な録音真偽値を撤去した。
+- Context・Track・通話・転送・永続take statusは独立して維持。prepared中も録音開始・マイク変更を禁止し、停止ボタンでは準備取消を可能にした。準備中の戻る／ログアウトを禁止する。
+- operation IDとtake IDで遅延通知を照合。開始準備の非同期境界で取消を確認し、古いfirst-sample通知や退出後の応答を無効にする。停止中はon-air／開始待ち表示を出さない。
+- 多重stopはControllerの同じPromiseへ合流し、開始処理が終了するまで待ってから一度だけ後始末する。prepared take取消は未開始takeを削除し、共有Context／マイクを維持してidleへ戻す。
+- `confirmWorkletStop`を公開APIへ抽出。最終audioを既存ハンドラーへ渡してからstoppedを確認し、timeout／例外でもハンドラーを復元する。
+- 完了契約: 停止ACK、キューの保存成功、ACKと保存フレームの一致、完了台帳transaction成功が正常保存の条件。停止未確認はrecovered／tailUnknown:true。完了台帳保存失敗は完了未確認と表示し、manifestを通知しない。既存chunkは維持し、ページ再読込で復旧する。
+- `test/recording-stop-confirmation.test.js`の切り出しTODO 2件を撤去し、`test/recording-controller.test.js`の公開APIテストへ移行した。両不具合は通常の成功テストとして検証済み。既存の音声・同期・転送のテストも維持する。一部の旧画面／開始計画テストは切り出し方式を残すが、主状態・停止完了の契約はその方式に依存しない。
+- Chrome／Edgeの実収録ページで、開始直後の取消→正常録音→停止→再録音、停止連打、stop送信抑止、完了transaction abortを検証。取消後の不要takeなし、timeoutはrecovered、完了保存失敗はDB上recordingのまま（正常完了とせず次回初期化で復旧対象）、エラー表示あり。Context生成1回・退出時close1回を維持した。
+- ブラウザー検証コマンド: `AUDIO_BROWSER_TESTS=1 AUDIO_DELAY_HOST=1 node --test test/local-audio-browser.test.js`。偽マイク・認証模擬・headless・専用一時プロファイルであり、実機通話／転送の代替ではない。
+- Phase 2変更後のユーザー実機確認（2026-10-10、Chromeホスト／Edgeゲスト、通話・転送あり）: 共通eventのprepared／armed／実開始を確認し、推定開始差−1.887 ms。Chrome 4,707,619フレーム（98.075396秒）、Edge 4,707,956フレーム（98.082417秒）、入力欠落／context飛び／逆行は双方0。取得・保存ログと提出WAVのフレーム数が一致し、PCM24／48 kHz／mono、ヘッダーのサイズも整合。音声長−推定経過時間は約+0.367／+0.300 ms。長さ差337フレーム＝7.021 msは開始・非同期停止境界の差を含むためドリフトと断定しない。Edge時刻3〜23／35〜55／70〜90秒の10 ms刻みRMS包絡比較では対応Chromeオフセット各0 ms、相関約0.995／0.983／0.974。今回の分解能で累積的な位置差を観測せず。ホストのゲスト停止保存確認、ゲストの全chunkホスト保存表示あり。ICE 701警告はあるが提示ログに接続状態のfailed／disconnectedや録音欠落はない。正常同期録音・停止の実機確認として記録し、再録音・取消・退出競合・長時間・背景化の合格とはしない。
+- 最終検証: npm testは204件中202成功・ブラウザー用2件skip・失敗0・TODO0。別実行のChrome／Edgeブラウザーテスト2件は成功。構文チェック・エディター診断・diff空白チェックも成功。
+- 未検証: Phase 2変更後の実機同期録音・準備取消、通話退出と準備完了の競合、長時間・背景化、物理マイク比較。既存Phase 1結果は変更後の合格証明に流用しない。Phase 3・DB移行・転送方式変更・本番デプロイは実施しない。
+
 
 ## 実施記録（2026-10-10）
 

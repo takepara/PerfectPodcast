@@ -4,6 +4,7 @@ import test from 'node:test';
 import vm from 'node:vm';
 import { createStartPlan } from '../prototype/recording-timing.js';
 import { RecordingTransfer } from '../prototype/recording-transfer.js';
+import { RecordingController } from '../prototype/recording-controller.js';
 import { createPcm24Wav } from '../prototype/wav-export.js';
 
 const source = readFileSync(new URL('../prototype/recorder.js', import.meta.url), 'utf8');
@@ -13,7 +14,11 @@ const event = { eventId: '123e4567-e89b-42d3-a456-426614174000', sequence: 1 };
 function setup() {
   const saved = [];
   const messages = [];
+  const recordingController = new RecordingController();
+  recordingController.transition('preparing');
+  recordingController.prepared(recordingController.operation);
   const context = vm.createContext({
+    recordingController,
     createStartPlan, performance: { now: () => 1000 },
     activeTake: { id: 'take', startedAt: null },
     preparedRecordingEvent: event, cancelRecordingStart: false,
@@ -47,7 +52,7 @@ test('prepared recording persists and arms the canonical schedule instead of sta
   assert.equal(saved[0].captureStatus, 'armed');
   assert.equal(messages[0].startAt, 1.5);
   assert.equal(messages[0].eventId, event.eventId);
-  assert.equal(context.recording, true);
+  assert.equal(context.recordingController.snapshot.recording, true);
 });
 
 test('missing and late synchronized schedules fail before persisting or arming', async () => {

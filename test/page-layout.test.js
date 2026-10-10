@@ -98,7 +98,7 @@ test('removes the placeholder avatar and offers checkbox-based bulk session dele
   assert.match(recorder, /<div class="panel-heading compact">[\s\S]*?<button id="deleteSelectedSessionsButton"[^>]*>\s*Delete Sessions/);
   const source = readFileSync(new URL('../prototype/recorder.js', import.meta.url), 'utf8');
   assert.match(source, /deleteSessionButton\.hidden = !activeSession \|\| roomCall\?\.isGuest === true/);
-  assert.match(source, /deleteSessionButton\.disabled = recording \|\| starting \|\| finalizing \|\| switchingMicrophone \|\|/);
+  assert.match(source, /deleteSessionButton\.disabled = recordingController\.snapshot\.recording \|\| recordingController\.snapshot\.starting \|\| recordingController\.snapshot\.finalizing \|\| switchingMicrophone \|\|/);
   assert.match(source, /Boolean\(roomCall\?\.isActive\)/);
   assert.match(source, /function guestTakesAreStored\(takes\)/);
   assert.match(source, /function deleteSelectedSessions\(\)/);
@@ -233,10 +233,9 @@ test('blinks the ON AIR indicator during startup and lights it on actual recordi
   const updateBadge = source.slice(source.indexOf('function updateCaptureStatusBadge()'), source.indexOf('\nfunction setStatus'));
   const startRecording = source.slice(source.indexOf('async function startRecording('), source.indexOf('\nfunction applyHostRecordingState'));
   const startedHandler = source.slice(source.indexOf("if (data.type === 'started')"), source.indexOf("if (data.type === 'level')"));
-  assert.match(updateBadge, /const isPending = !isOnAir && \(captureStartPending \|\| starting\)/);
+  assert.match(updateBadge, /const isPending = !isOnAir && !recordingController\.snapshot\.finalizing && \(recordingController\.snapshot\.pending \|\| recordingController\.snapshot\.starting\)/);
   assert.match(updateBadge, /badge\.classList\.toggle\('pending', isPending\)/);
-  assert.match(startRecording, /captureStartPending = true;\s*updateCaptureStatusBadge\(\)/);
-  assert.match(startedHandler, /captureOnAir = true;\s*captureStartPending = false;\s*updateCaptureStatusBadge\(\)/);
+  assert.match(startedHandler, /recordingController\.captured\(operation\)/);
   assert.match(readPrototype('recorder.css'), /\.onair-badge\.pending \.onair-light[^}]*animation: onair-blink/);
 });
 
@@ -354,12 +353,12 @@ test('keeps waveform rendering limited to active recording for every participant
   const openSession = source.slice(source.indexOf('async function openSession('), source.indexOf('\nasync function deleteActiveSession'));
   const drawWaveform = source.slice(source.indexOf('function drawWaveform()'), source.indexOf('\nasync function runRequest'));
   const startHandler = source.slice(source.indexOf("if (data.type === 'started')"), source.indexOf("if (data.type === 'level')"));
-  const stopRecording = source.slice(source.indexOf('async function stopRecording('), source.indexOf('\nfunction audioContextTimeAtPerformanceTime'));
+  const stopRecording = source.slice(source.indexOf('function stopRecording('), source.indexOf('\nfunction audioContextTimeAtPerformanceTime'));
   assert.doesNotMatch(openSession, /drawWaveform\(\)/);
-  assert.match(drawWaveform, /if \(!recording\) return/);
+  assert.match(drawWaveform, /if \(!recordingController\.snapshot\.recording\) return/);
   assert.doesNotMatch(drawWaveform, /previewAnalyserNode|previewSamples/);
   assert.match(startHandler, /drawWaveform\(\)/);
-  assert.match(stopRecording, /recording = false;[\s\S]*?stopWaveformRendering\(\)/);
+  assert.match(stopRecording, /stopWaveformRendering\(\)/);
   assert.match(stopRecording, /appendNetworkEvent\(\s*'Recording stop local'/);
 
   const roomCall = readPrototype('room-call.js');

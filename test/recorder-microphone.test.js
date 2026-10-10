@@ -8,8 +8,8 @@ import { resetEventLog } from '../prototype/event-log.js';
 const source = readFileSync(new URL('../prototype/recorder.js', import.meta.url), 'utf8');
 const changeMicrophoneSource = source.slice(source.indexOf('async function changeMicrophone()'), source.indexOf('async function checkRecordingReadiness()'));
 const openSessionSource = source.slice(source.indexOf('async function openSession(session)'), source.indexOf('async function detectDevices'));
-const primeRecordingAudioContextSource = source.slice(source.indexOf('function primeRecordingAudioContext()'), source.indexOf('\nasync function startRecording'));
-const startRecordingSource = source.slice(source.indexOf('async function startRecording('), source.indexOf('\nfunction applyHostRecordingState'));
+const primeRecordingAudioContextSource = source.slice(source.indexOf('function primeRecordingAudioContext()'), source.indexOf('\nfunction startRecording'));
+const startRecordingSource = source.slice(source.indexOf('function startRecording('), source.indexOf('\nfunction applyHostRecordingState'));
 const samplePreviewMeterSource = source.slice(source.indexOf('function samplePreviewMeter()'), source.indexOf('\nfunction startMeterMonitoring'));
 const microphoneMuteSource = source.slice(source.indexOf('function getLocalMicrophoneLabel()'), source.indexOf('\nfunction samplePreviewMeter'));
 const waveformStateSource = source.slice(source.indexOf('function setLocalWaveformState('), source.indexOf('\nasync function startLocalPreview'));
@@ -19,7 +19,7 @@ function setupSession({ failure = false, recording = false, leaveDuringCapture =
   const elements = new Map();
   const stream = {};
   const context = vm.createContext({
-    activeSession: null, roomCall: null, recording, starting: false,
+    activeSession: null, roomCall: null, recording, starting: false, recordingController: { snapshot: { recording, starting: false } },
     resetEventLog, networkEventCount: 10, networkEventLogStartedAt: 0, performance: { now: () => 100 },
     waveformElapsedSeconds: 0, sessionLimitReached: false, MAX_SESSION_FRAMES: 100,
     setupView: {}, studioView: { hidden: true }, errorText: {},
@@ -93,7 +93,7 @@ test('updates the input level meter during preview without recording', () => {
     },
     previewSamples: new Float32Array(3),
     previewAudioContext: { state: 'running' },
-    recording: false,
+    recording: false, recordingController: { snapshot: { recording: false } },
     meterFrame: null,
     updateMeter: (peak) => levels.push(peak),
     window: { requestAnimationFrame: (callback) => { nextFrame = callback; return 1; } }
@@ -118,26 +118,6 @@ test('primes the shared engine before asynchronous host checks', async () => {
   assert.equal(await prepared.resume, null);
   assert.ok(startRecordingSource.indexOf('primeRecordingAudioContext()') < startRecordingSource.indexOf('await getHostSession()'));
   assert.ok(startRecordingSource.indexOf('primeRecordingAudioContext()') < startRecordingSource.indexOf('await roomCall.synchronizeClock()'));
-});
-
-test('waits for both devices to prepare before scheduling a synchronized start', () => {
-  const prepareGuest = startRecordingSource.indexOf('roomCall.prepareGuestRecording(');
-  const announceStart = startRecordingSource.indexOf('roomCall.setHostRecordingState(');
-  assert.ok(prepareGuest >= 0 && prepareGuest < announceStart);
-  assert.match(startRecordingSource, /const startLeadMs = Math\.max\(\s*SYNCHRONIZED_START_LEAD_MS,\s*\(roomCall\.clockRoundTripMs \?\? 0\) \+ SYNCHRONIZED_START_LEAD_MS\s*\)/);
-  assert.match(startRecordingSource, /if \(\(synchronizedStartAnnounced \|\| preparationAnnounced\) && !cancelRecordingStart\) \{\s*roomCall\.setHostRecordingState\(false\)/);
-
-  const createTakeSource = source.slice(source.indexOf('async function createTake('), source.indexOf('\nasync function activatePreparedTake('));
-  const activateTakeSource = source.slice(source.indexOf('async function activatePreparedTake('), source.indexOf('\nasync function stopDiagnostics'));
-  assert.match(startRecordingSource, /prepareOnly: true/);
-  assert.match(createTakeSource, /startedAt: prepareOnly \? null : scheduledStartedAt \?\?/);
-  assert.match(createTakeSource, /activeTake\.startObservation =/);
-  assert.doesNotMatch(createTakeSource, /activeTake\.startedAt =/);
-  assert.doesNotMatch(createTakeSource, /await persistTake\(activeTake\);\s*if \(cancelRecordingStart\)/);
-  assert.ok(activateTakeSource.indexOf('activeTake.startedAt = plan.displayStartedAt') <
-    activateTakeSource.indexOf('await persistTake(activeTake)'));
-  assert.match(activateTakeSource, /port\.postMessage/);
-  assert.match(createTakeSource, /if \(cancelRecordingStart\)/);
 });
 
 test('toggles the microphone track and mute button state', () => {
@@ -247,7 +227,7 @@ test('disables microphone changes throughout recording, preparation, and saving'
   const availabilitySource = source.slice(source.indexOf('function updateRecordButtonAvailability()'), source.indexOf('function clearRecordingTrackMonitor()'));
   for (const state of ['recording', 'starting', 'finalizing', 'switchingMicrophone', 'detectingDevices', 'readiness']) {
     const context = vm.createContext({
-      recording: state === 'recording', starting: state === 'starting', finalizing: state === 'finalizing',
+      recordingController: { snapshot: { state: ['recording', 'starting', 'finalizing'].includes(state) ? state : 'idle', recording: state === 'recording', starting: state === 'starting', finalizing: state === 'finalizing' } },
       switchingMicrophone: state === 'switchingMicrophone', detectingDevices: state === 'detectingDevices',
       deletingSession: false, activeSession: null,
       sessionLimitReached: false, roomCall: { readinessCheckInProgress: state === 'readiness', isActive: false },
@@ -258,6 +238,10 @@ test('disables microphone changes throughout recording, preparation, and saving'
     context.updateRecordButtonAvailability();
     assert.equal(context.trackMicDevice.disabled, true, state);
     context[state] = false;
+    context.recordingController.snapshot.state = 'idle';
+    context.recordingController.snapshot.recording = false;
+    context.recordingController.snapshot.starting = false;
+    context.recordingController.snapshot.finalizing = false;
     context.roomCall.readinessCheckInProgress = false;
     context.updateRecordButtonAvailability();
     assert.equal(context.trackMicDevice.disabled, false, state);

@@ -127,6 +127,8 @@ async function recorderScenario() {
     }
   };
   await waitFor(() => document.getElementById('micDevice')?.options.length > 0);
+  await waitFor(() => document.getElementById('logoutButton') && !document.getElementById('logoutButton').hidden);
+  await new Promise((resolve) => setTimeout(resolve, 100));
   document.getElementById('participantName').value = 'Browser test';
   await waitFor(() => document.getElementById('participantName').value !== '' && document.getElementById('micDevice').value !== '');
   document.getElementById('networkEventLog').textContent = 'previous studio marker';
@@ -142,6 +144,11 @@ async function recorderScenario() {
   if (panel.open) throw new Error('event panel did not collapse');
   panel.querySelector('summary').click();
   if (!panel.open) throw new Error('event panel did not expand');
+  await waitFor(() => !document.getElementById('recordButton').disabled);
+  document.getElementById('recordButton').click();
+  document.getElementById('stopButton').click();
+  await waitFor(() => !document.getElementById('recordButton').disabled);
+  if (document.getElementById('captureStatusBadge').classList.contains('on')) throw new Error('canceled preparation went on air');
   for (let index = 0; index < 2; index += 1) {
     await waitFor(() => !document.getElementById('recordButton').disabled);
     document.getElementById('recordButton').click();
@@ -169,12 +176,33 @@ async function recorderScenario() {
   }
   const logs = document.getElementById('networkEventLog').textContent;
   const contextEvents = (logs.match(/shared local context/g) || []).length;
+  const failureStatuses = [];
+  for (const failure of ['timeout', 'completion']) {
+    document.getElementById('recordButton').click();
+    await waitFor(() => document.getElementById('captureStatusBadge').classList.contains('on'));
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    window.dropRecordingStop = failure === 'timeout';
+    window.failRecordingCompletion = failure === 'completion';
+    document.getElementById('stopButton').click();
+    document.getElementById('stopButton').click();
+    await waitFor(() => !document.getElementById('recordButton').disabled);
+    window.dropRecordingStop = false;
+    const readFailure = db.transaction('takes', 'readonly');
+    const failedTakes = readFailure.objectStore('takes').getAll();
+    await new Promise((resolve, reject) => { readFailure.oncomplete = resolve; readFailure.onabort = () => reject(readFailure.error); });
+    const last = failedTakes.result.sort((a, b) => a.startedAt - b.startedAt).at(-1);
+    const expected = failure === 'timeout' ? 'recovered' : 'recording';
+    if (last.status !== expected) throw new Error(`failure falsely certified: ${failure} ${last.status}`);
+    if (failure === 'timeout' && !last.tailUnknown) throw new Error('unknown tail not marked');
+    if (!document.getElementById('errorText').textContent) throw new Error('failure not displayed');
+    failureStatuses.push(last.status);
+  }
   if (window.audioContextCounts.created !== 1 || window.audioContextCounts.closed !== 0) throw new Error('UI context was recreated between takes');
   document.getElementById('backButton').click();
   await waitFor(() => document.getElementById('studioView').hidden);
   await waitFor(() => window.audioContextCounts.closed === 1);
   db.close();
-  return { takes: takes.result.length, contextEvents, counts: window.audioContextCounts, frames: takes.result.map((take) => take.frames) };
+  return { takes: takes.result.length, contextEvents, failureStatuses, counts: window.audioContextCounts, frames: takes.result.map((take) => take.frames) };
 }
 
 for (const [name, executable] of Object.entries(browserPaths)) {
@@ -185,9 +213,15 @@ for (const [name, executable] of Object.entries(browserPaths)) {
     const root = resolve('.');
     const server = createServer(async (request, response) => {
       if (request.url === '/') { response.setHeader('Content-Type', 'text/html'); response.end('<!doctype html><title>Audio test</title>'); return; }
+      if (request.url === '/test-host-session') {
+        if (process.env.AUDIO_DELAY_HOST === '1') await new Promise((resolve) => setTimeout(resolve, 250));
+        response.setHeader('Content-Type', 'application/json');
+        response.end('{"sub":"test"}');
+        return;
+      }
       if (request.url === '/prototype/auth-client.bundle.js') {
         response.setHeader('Content-Type', 'text/javascript');
-        response.end('export async function getHostSession(){return {sub:"test"}}; export async function getHostDisplayName(){return "Test"}; export async function getAuth0Client(){return {}}; export async function signOut(){};');
+        response.end('export async function getHostSession(){return (await fetch("/test-host-session")).json()}; export async function getHostDisplayName(){return "Test"}; export async function getAuth0Client(){return {}}; export async function signOut(){};');
         return;
       }
       const path = resolve(root, `.${request.url}`);
@@ -237,6 +271,20 @@ for (const [name, executable] of Object.entries(browserPaths)) {
       await command('Page.enable', {});
       await command('Page.addScriptToEvaluateOnNewDocument', { source: `
         window.audioContextCounts = { created: 0, closed: 0 };
+        const postMessage = MessagePort.prototype.postMessage;
+        MessagePort.prototype.postMessage = function(message, ...args) {
+          if (window.dropRecordingStop && message?.type === 'stop') return;
+          return postMessage.call(this, message, ...args);
+        };
+        const transaction = IDBDatabase.prototype.transaction;
+        IDBDatabase.prototype.transaction = function(stores, mode, ...args) {
+          const result = transaction.call(this, stores, mode, ...args);
+          if (window.failRecordingCompletion && stores === 'takes' && mode === 'readwrite') {
+            window.failRecordingCompletion = false;
+            queueMicrotask(() => result.abort());
+          }
+          return result;
+        };
         const NativeAudioContext = window.AudioContext;
         window.AudioContext = class extends NativeAudioContext {
           constructor(options) { super(options); window.audioContextCounts.created += 1; }
@@ -258,7 +306,7 @@ for (const [name, executable] of Object.entries(browserPaths)) {
       });
       assert.equal(uiResult.exceptionDetails, undefined, JSON.stringify(uiResult.exceptionDetails));
       assert.equal(uiResult.result.value.takes, 2);
-      assert.equal(uiResult.result.value.contextEvents, 2);
+      assert.equal(uiResult.result.value.contextEvents, 3);
       console.log(`${name} recorder page verification: ${JSON.stringify(uiResult.result.value)}`);
     } finally {
       socket?.close();

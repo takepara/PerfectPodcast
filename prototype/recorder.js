@@ -16,6 +16,7 @@ import { createStartPlan, sameStartPlan } from './recording-timing.js';
 import { mergeRecordingMetadata, synchronizationForTake } from './recording-ledger.js';
 import { eventLogSeverity, resetEventLog } from './event-log.js';
 import { LocalAudioEngine } from './local-audio-engine.js';
+import { RecordingController, confirmWorkletStop } from './recording-controller.js';
 import { appendAlignedWaveformPeak, resetWaveformHistory } from './waveform-history.js';
 
 const TARGET_RATE = 48000;
@@ -62,7 +63,7 @@ let audioContext = null;
 const localAudioEngine = new LocalAudioEngine({
   onStateChange(state) {
     appendNetworkEvent('Recording AudioContext state', state);
-    if (recording && state === 'closed') {
+    if (recordingController.snapshot.recording && state === 'closed') {
       void stopRecording('AudioContext was closed. Saved chunks are available for recovery.')
         .catch((error) => setMessage(`Unable to stop recording: ${error.message}`, true));
     }
@@ -78,12 +79,16 @@ let previewAnalyserNode = null;
 let previewSamples = null;
 let previewStream = null;
 let microphoneMuted = false;
-let recording = false;
-let captureOnAir = false;
-let captureStartPending = false;
-let finalizing = false;
-let starting = false;
-let cancelRecordingStart = false;
+const recordingController = new RecordingController({
+  onStateChange() {
+    updateCaptureStatusBadge();
+    updateRecordButtonAvailability();
+    stopButton.disabled = recordingController.snapshot.state === 'idle' || recordingController.snapshot.finalizing;
+    if (recordingController.snapshot.state === 'idle' && !recordingController.snapshot.starting && activeSession && !studioView.hidden && mediaStream) {
+      void startLocalPreview(mediaStream);
+    }
+  }
+});
 let sessionLimitReached = false;
 let pendingCommits = 0;
 let commitChain = Promise.resolve();
@@ -206,8 +211,8 @@ function appendNetworkEvent(event, details = '') {
 
 function updateCaptureStatusBadge() {
   const badge = $('captureStatusBadge');
-  const isOnAir = captureOnAir;
-  const isPending = !isOnAir && (captureStartPending || starting);
+  const isOnAir = recordingController.snapshot.onAir;
+  const isPending = !isOnAir && !recordingController.snapshot.finalizing && (recordingController.snapshot.pending || recordingController.snapshot.starting);
   badge.classList.toggle('on', isOnAir);
   badge.classList.toggle('pending', isPending);
   badge.classList.toggle('off', !isOnAir && !isPending);
@@ -223,15 +228,15 @@ function updateRecordingPreparation() {
 }
 
 function updateRecordButtonAvailability() {
-  trackMicDevice.disabled = recording || starting || finalizing || switchingMicrophone || detectingDevices ||
+  trackMicDevice.disabled = recordingController.snapshot.state !== 'idle' || recordingController.snapshot.starting || switchingMicrophone || detectingDevices ||
     Boolean(roomCall?.readinessCheckInProgress) || !trackMicDevice.value;
   const deleteSessionButton = $('deleteSessionButton');
   if (deleteSessionButton) {
     deleteSessionButton.hidden = !activeSession || roomCall?.isGuest === true;
-    deleteSessionButton.disabled = recording || starting || finalizing || switchingMicrophone ||
+    deleteSessionButton.disabled = recordingController.snapshot.recording || recordingController.snapshot.starting || recordingController.snapshot.finalizing || switchingMicrophone ||
       deletingSession || Boolean(roomCall?.isActive);
   }
-  recordButton.disabled = sessionLimitReached || recording || starting || finalizing || switchingMicrophone ||
+  recordButton.disabled = sessionLimitReached || recordingController.snapshot.state !== 'idle' || recordingController.snapshot.starting || switchingMicrophone ||
     Boolean(roomCall?.isActive && !roomCall.isGuest && !roomCall.canStartRecording);
 }
 
@@ -256,7 +261,7 @@ function setMessage(message, isError = false) {
 }
 
 function updateTimer() {
-  if (!recording) return;
+  if (!recordingController.snapshot.recording) return;
   const elapsed = performance.now() - takeStartedAt;
   $('timer').textContent = formatDuration(elapsed / 1000);
   if (elapsed >= takeFrameLimit / TARGET_RATE * 1000) {
@@ -317,7 +322,7 @@ function toggleMicrophoneMute() {
 
 function samplePreviewMeter() {
   meterFrame = null;
-  if (!previewStream || !previewAnalyserNode || !previewSamples || recording) return;
+  if (!previewStream || !previewAnalyserNode || !previewSamples || recordingController.snapshot.recording) return;
   if (previewAudioContext?.state === 'running') {
     previewAnalyserNode.getFloatTimeDomainData(previewSamples);
     let peak = 0;
@@ -342,7 +347,7 @@ function setLocalWaveformState(text, live = false) {
 }
 
 async function startLocalPreview(stream) {
-  if (!stream || recording || starting) return false;
+  if (!stream || recordingController.snapshot.recording || recordingController.snapshot.starting) return false;
   if (previewStream === stream && localAudioEngine.graph?.mode === 'preview') return true;
   for (const track of stream.getAudioTracks()) track.enabled = !microphoneMuted;
   try {
@@ -360,7 +365,7 @@ async function startLocalPreview(stream) {
     return true;
   } catch (error) {
     if (switchingMicrophone) throw error;
-    if (recording || starting || !activeSession || studioView.hidden) return;
+    if (recordingController.snapshot.recording || recordingController.snapshot.starting || !activeSession || studioView.hidden) return;
     setLocalWaveformState('Waveform error');
     setMessage(`Unable to start your waveform: ${error.message}`, true);
   }
@@ -387,7 +392,7 @@ function stopWaveformRendering() {
 
 function drawWaveform() {
   waveformFrame = null;
-  if (!recording) return;
+  if (!recordingController.snapshot.recording) return;
   const context = waveformCanvas.getContext('2d');
   if (!context || !waveformCanvas.parentElement) return;
   const bounds = waveformCanvas.parentElement.getBoundingClientRect();
@@ -441,7 +446,7 @@ function drawWaveform() {
     }
     localWaveform.rulerSecond = rulerSecond;
   }
-  if (recording) waveformFrame = window.requestAnimationFrame(drawWaveform);
+  if (recordingController.snapshot.recording) waveformFrame = window.requestAnimationFrame(drawWaveform);
 }
 
 async function runRequest(storeName, method, ...args) {
@@ -1591,7 +1596,7 @@ async function openSession(session) {
   if (sessionLimitReached) setStatus('This session has reached the 2-hour recording limit.');
   $('chunkCount').textContent = String(takes.at(-1)?.chunks || 0);
   await updateSessionSavedSize();
-  if (!recording && !starting) {
+  if (!recordingController.snapshot.recording && !recordingController.snapshot.starting) {
     try {
       const stream = await ensureCaptureStream();
       if (activeSession === session && !studioView.hidden) startLocalPreview(stream);
@@ -1774,7 +1779,7 @@ async function checkRecordingReadiness() {
 }
 
 async function releaseCaptureStream() {
-  if (recording) return;
+  if (recordingController.snapshot.recording) return;
   if (activeSession && !studioView.hidden) return;
   stopLocalPreview();
   mediaStream?.getTracks().forEach((track) => {
@@ -1880,12 +1885,16 @@ async function createTake({
   preparedAudioContext = null,
   preparedAudioContextResume = null
 } = {}) {
+  const operation = recordingController.operation;
+  const takeSession = activeSession;
+  const isCurrent = () => recordingController.isCurrent(operation) && activeSession === takeSession;
   errorText.textContent = '';
   if (!navigator.mediaDevices?.getUserMedia || !window.AudioWorkletNode) {
     throw new Error('AudioWorklet recording is not supported. Use Chrome or Edge.');
   }
   await stopDiagnostics({ stopCapture: false });
   await ensureCaptureStream();
+  if (!isCurrent()) throw new Error('The recording preparation was canceled.');
   stopLocalPreview();
   audioContext = localAudioEngine.prime().context;
   if (preparedAudioContext && preparedAudioContext !== audioContext) {
@@ -1896,6 +1905,7 @@ async function createTake({
   }
   const sessionTakes = (await loadAll('takes'))
     .filter((take) => take.sessionId === activeSession.id && !take.remote);
+  if (!isCurrent()) throw new Error('The recording preparation was canceled.');
   const savedFrames = sessionTakes.reduce((total, take) => total + (take.frames || 0), 0);
   takeFrameLimit = remainingSessionFrames(savedFrames);
   if (takeFrameLimit === 0) {
@@ -1930,19 +1940,20 @@ async function createTake({
   pendingCommits = 0;
   commitError = null;
   commitChain = Promise.resolve();
-  finalizing = false;
 
   const graph = await localAudioEngine.startTake(mediaStream);
+  if (!isCurrent()) throw new Error('The recording preparation was canceled.');
+  const takeId = activeTake.id;
   sourceNode = graph.source;
   inputChannelNode = graph.input;
   analyserNode = graph.analyser;
   waveformSamples = new Float32Array(analyserNode.fftSize);
   recorderNode = graph.recorder;
   recorderNode.port.onmessage = ({ data }) => {
+    if (operation !== recordingController.operation || activeTake?.id !== takeId) return;
     if (data.type === 'started') {
-      if (!recording || finalizing) return;
-      captureOnAir = true;
-      captureStartPending = false;
+      if (!recordingController.snapshot.recording || recordingController.snapshot.finalizing) return;
+      if (!recordingController.captured(operation)) return;
       updateCaptureStatusBadge();
       const nowPerfMs = performance.now();
       const receivedContextTime = audioContext?.currentTime ?? data.contextTime;
@@ -1989,7 +2000,7 @@ async function createTake({
       });
       return;
     }
-    if (data.type === 'limit-reached' && recording) {
+    if (data.type === 'limit-reached' && recordingController.snapshot.recording) {
       void stopRecording().then((saved) => setMessage(
         saved
           ? 'Recording stopped and saved because this session reached its 2-hour limit.'
@@ -2002,7 +2013,7 @@ async function createTake({
   if (!track) throw new Error('No active microphone input is available.');
   clearRecordingTrackMonitor();
   const trackMonitor = monitorRecordingTrack(track, {
-    isRecording: () => recording,
+    isRecording: () => recordingController.snapshot.recording,
     onMuted: () => {
       setStatus('Microphone input is paused. Waiting for it to resume…');
     },
@@ -2056,9 +2067,11 @@ async function createTake({
   if (scheduledStartAt !== null && scheduledStartAt < performance.now() + 250) {
     throw new Error('The synchronized start could not be prepared in time. Check recording readiness and try again.');
   }
-  if (cancelRecordingStart) {
+  if (recordingController.snapshot.cancelRequested) {
     throw new Error('The synchronized recording start was canceled because the other participant could not prepare.');
   }
+  if (!isCurrent()) throw new Error('The recording preparation was canceled.');
+  recordingController.prepared(operation);
   preparedRecordingEvent = event;
   if (prepareOnly) {
     appendNetworkEvent(
@@ -2074,6 +2087,7 @@ async function createTake({
 }
 
 async function activatePreparedTake(schedule = null) {
+  const operation = recordingController.operation;
   const plan = schedule === null ? null : createStartPlan(schedule, performance.now());
   const scheduledStartAt = plan?.localTargetPerfMs ?? null;
   const event = schedule?.event ?? null;
@@ -2088,7 +2102,7 @@ async function activatePreparedTake(schedule = null) {
   if (scheduledStartAt !== null && scheduledStartAt < performance.now() + 250) {
     throw new Error('The synchronized start could not be prepared in time. Check recording readiness and try again.');
   }
-  if (cancelRecordingStart) {
+  if (recordingController.snapshot.cancelRequested) {
     throw new Error('The synchronized recording start was canceled because the other participant could not prepare.');
   }
   if (plan) activeTake.startedAt = plan.displayStartedAt;
@@ -2097,7 +2111,7 @@ async function activatePreparedTake(schedule = null) {
   activeTake.captureStatus = 'armed';
   activeTake.status = 'recording';
   await persistTake(activeTake);
-  if (cancelRecordingStart) {
+  if (recordingController.snapshot.cancelRequested) {
     await deleteUnstartedTake(activeTake.id);
     activeTake = null;
     preparedRecordingEvent = null;
@@ -2109,7 +2123,7 @@ async function activatePreparedTake(schedule = null) {
   const startAt = scheduledStartAt === null
     ? null
     : audioContextTimeAtPerformanceTime(scheduledStartAt);
-  recording = true;
+  recordingController.arm(operation);
   try {
     await new Promise((resolve, reject) => {
       const port = recorderNode.port;
@@ -2139,16 +2153,16 @@ async function activatePreparedTake(schedule = null) {
       });
     });
   } catch (error) {
-    recording = false;
     throw error;
   }
+  if (!recordingController.isCurrent(operation)) throw new Error('The recording start was canceled.');
   preparedRecordingEvent = null;
   checkRecordingTrackMute?.();
-  if (!captureOnAir) takeStartedAt = scheduledStartAt ?? performance.now();
+  if (!recordingController.snapshot.onAir) takeStartedAt = scheduledStartAt ?? performance.now();
   elapsedTimer = window.setInterval(updateTimer, 200);
   recordButton.disabled = true;
   stopButton.disabled = false;
-  const scheduled = scheduledStartAt !== null && !captureOnAir;
+  const scheduled = scheduledStartAt !== null && !recordingController.snapshot.onAir;
   setStatus(scheduled ? 'Recording scheduled · Saving to this device' : 'Recording · Saving to this device', scheduled ? 'ready' : 'recording');
   $('waveformState').textContent = scheduled ? 'Preparing' : 'LIVE';
   $('waveformState').classList.toggle('live', !scheduled);
@@ -2169,122 +2183,101 @@ async function stopDiagnostics({ stopCapture = true } = {}) {
   waveformSamples = null;
 }
 
-async function stopRecording(recoveryReason = null) {
-  if (preparedRecordingEvent && !recording) return discardPreparedTake();
-  if (!activeTake || finalizing) return !recording && !finalizing;
+function stopRecording(recoveryReason = null) {
+  return recordingController.stop(() => finishRecording(recoveryReason));
+}
+
+function logRecordingDuration(data, stopRequestedAt, take) {
+  const receivedAt = performance.now();
+  const audioMs = data.frames * 1000 / TARGET_RATE;
+  const contextMs = Number.isFinite(data.firstSampleContextTime) && Number.isFinite(data.endSampleContextTime)
+    ? (data.endSampleContextTime - data.firstSampleContextTime) * 1000 : null;
+  const elapsedMs = take?.startObservation
+    ? stopRequestedAt - take.startObservation.localPerfMs : null;
+  const spanDifferenceFrames = contextMs === null ? null : Math.round(contextMs * TARGET_RATE / 1000) - data.frames;
+  const accountedDifferenceFrames = (data.missingInputFrames ?? 0) + (data.contextGapFrames ?? 0) - (data.contextBackwardFrames ?? 0);
+  appendNetworkEvent('Recording duration summary',
+    `frames=${data.frames} firstContext=${data.firstSampleContextTime ?? 'none'} s endContext=${data.endSampleContextTime ?? 'none'} s audio=${audioMs.toFixed(3)} ms contextSpan=${contextMs === null ? 'unknown' : contextMs.toFixed(3)} ms elapsedToStop=${elapsedMs === null ? 'unknown' : elapsedMs.toFixed(3)} ms stopAckDelay=${(receivedAt - stopRequestedAt).toFixed(3)} ms missingInputFrames=${data.missingInputFrames ?? 0} missingInputBlocks=${data.missingInputBlocks ?? 0} contextGapFrames=${data.contextGapFrames ?? 0} contextGapBlocks=${data.contextGapBlocks ?? 0} contextBackwardBlocks=${data.contextBackwardBlocks ?? 0} contextBackwardFrames=${data.contextBackwardFrames ?? 0} spanDifferenceFrames=${spanDifferenceFrames ?? 'unknown'} accountedDifferenceFrames=${accountedDifferenceFrames} firstContextBackward=${data.firstContextBackward ? JSON.stringify(data.firstContextBackward) : 'none'} firstMissingInput=${data.firstMissingInput ? JSON.stringify(data.firstMissingInput) : 'none'} firstContextGap=${data.firstContextGap ? JSON.stringify(data.firstContextGap) : 'none'}`);
+
+}
+
+async function finishRecording(recoveryReason = null) {
+  if (!activeTake) {
+    await stopDiagnostics({ stopCapture: false });
+    return true;
+  }
+  if (activeTake.status === 'preparing' && !activeTake.startObservation) return discardPreparedTake();
+  const takeId = activeTake.id;
   const stopRequestedAt = performance.now();
-  appendNetworkEvent(
-    'Recording stop local',
-    `requestedAt=${stopRequestedAt.toFixed(3)} ms frames=${activeTake.frames} recovery=${Boolean(recoveryReason)}`
-  );
-  finalizing = true;
-  recording = false;
-  captureOnAir = false;
-  captureStartPending = false;
-  updateCaptureStatusBadge();
+  appendNetworkEvent('Recording stop local',
+    `requestedAt=${stopRequestedAt.toFixed(3)} ms frames=${activeTake.frames} recovery=${Boolean(recoveryReason)}`);
   stopWaveformRendering();
-  updateRecordButtonAvailability();
   scheduledRecordingStartAt = null;
   scheduledRecordingWallStartAt = null;
-  updateRecordingPreparation();
   roomCall?.endRecordingWaveform();
   roomCall?.setHostRecordingState(false);
   window.clearInterval(elapsedTimer);
   window.clearTimeout(takeRefreshTimer);
   takeRefreshTimer = null;
-  recordButton.disabled = true;
-  stopButton.disabled = true;
-  setStatus(recoveryReason ? 'Recovering from saved chunks…' : 'Saving final chunk…');
-  if (recorderNode) {
-    await new Promise((resolve) => {
-      const port = recorderNode.port;
-      const existingHandler = port.onmessage;
-      const timeout = window.setTimeout(() => {
-        port.onmessage = existingHandler;
-        appendNetworkEvent('Recording stop confirmation warning', 'AudioWorklet confirmation timed out');
-        resolve();
-      }, 3000);
-      port.onmessage = (event) => {
-        existingHandler?.(event);
-        if (event.data.type === 'stopped') {
-          window.clearTimeout(timeout);
-          port.onmessage = existingHandler;
-          const data = event.data;
-          const receivedAt = performance.now();
-          const audioMs = data.frames * 1000 / TARGET_RATE;
-          const contextMs = Number.isFinite(data.firstSampleContextTime) && Number.isFinite(data.endSampleContextTime)
-            ? (data.endSampleContextTime - data.firstSampleContextTime) * 1000 : null;
-          const elapsedMs = activeTake?.startObservation
-            ? stopRequestedAt - activeTake.startObservation.localPerfMs : null;
-          const spanDifferenceFrames = contextMs === null ? null : Math.round(contextMs * TARGET_RATE / 1000) - data.frames;
-          const accountedDifferenceFrames = (data.missingInputFrames ?? 0) + (data.contextGapFrames ?? 0) - (data.contextBackwardFrames ?? 0);
-          appendNetworkEvent('Recording duration summary',
-            `frames=${data.frames} firstContext=${data.firstSampleContextTime ?? 'none'} s endContext=${data.endSampleContextTime ?? 'none'} s audio=${audioMs.toFixed(3)} ms contextSpan=${contextMs === null ? 'unknown' : contextMs.toFixed(3)} ms elapsedToStop=${elapsedMs === null ? 'unknown' : elapsedMs.toFixed(3)} ms stopAckDelay=${(receivedAt - stopRequestedAt).toFixed(3)} ms missingInputFrames=${data.missingInputFrames ?? 0} missingInputBlocks=${data.missingInputBlocks ?? 0} contextGapFrames=${data.contextGapFrames ?? 0} contextGapBlocks=${data.contextGapBlocks ?? 0} contextBackwardBlocks=${data.contextBackwardBlocks ?? 0} contextBackwardFrames=${data.contextBackwardFrames ?? 0} spanDifferenceFrames=${spanDifferenceFrames ?? 'unknown'} accountedDifferenceFrames=${accountedDifferenceFrames} firstContextBackward=${data.firstContextBackward ? JSON.stringify(data.firstContextBackward) : 'none'} firstMissingInput=${data.firstMissingInput ? JSON.stringify(data.firstMissingInput) : 'none'} firstContextGap=${data.firstContextGap ? JSON.stringify(data.firstContextGap) : 'none'}`);
-          resolve();
-        }
-      };
-      port.postMessage({ type: 'stop' });
-    });
-  }
-  let failure = recoveryReason || commitError;
-  try {
-    await commitChain;
-  } catch (error) {
-    failure ||= `Unable to save to IndexedDB: ${error.message}`;
-  }
-  await stopDiagnostics({ stopCapture: false });
-  if (mediaStream) startLocalPreview(mediaStream);
-  const status = failure ? 'recovered' : 'stopped';
-  activeTake = {
-    ...activeTake,
-    status,
-    endedAt: Date.now(),
-    tailUnknown: Boolean(failure),
-    recoveryReason: failure ? String(failure) : null
-  };
-  try {
-    const completedTake = activeTake;
-    const transaction = database.transaction('takes', 'readwrite');
-    const done = transactionComplete(transaction);
-    const store = transaction.objectStore('takes');
-    const request = store.get(completedTake.id);
-    request.addEventListener('success', () => {
-      if (!request.result) { transaction.abort(); return; }
-      activeTake = { ...mergeRecordingMetadata(request.result, completedTake),
-        status, endedAt: completedTake.endedAt, tailUnknown: completedTake.tailUnknown,
-        recoveryReason: completedTake.recoveryReason };
-      store.put(activeTake);
-    }, { once: true });
-    await done;
-  } catch (error) {
-    failure ||= `Unable to save the take completion status: ${error.message}`;
-  }
-  appendNetworkEvent(
-    'Recording save local',
-    `status=${failure ? 'recovered' : 'saved'} frames=${activeTake.frames} chunks=${activeTake.chunks}`
-  );
-  if (activeTake.transferGeneration) roomCall?.notifyTakeFinalized(activeTake);
-  $('timer').textContent = formatDuration(activeTake.frames / TARGET_RATE);
-  stopButton.disabled = true;
-  finalizing = false;
+  const result = await recordingController.finalize({
+    recoveryReason: recoveryReason || commitError,
+    stopCapture: async () => {
+      const data = await confirmWorkletStop(recorderNode?.port);
+      if (data) logRecordingDuration(data, stopRequestedAt, activeTake);
+      else appendNetworkEvent('Recording stop confirmation warning', 'AudioWorklet confirmation timed out or unavailable');
+      return data;
+    },
+    drain: async (observation) => {
+      await commitChain;
+      if (observation && observation.frames !== activeTake.frames) {
+        throw new Error('The saved frame count does not match the AudioWorklet stop confirmation.');
+      }
+    },
+    cleanup: () => stopDiagnostics({ stopCapture: false }),
+    persist: async (completion) => {
+      const completedTake = { ...activeTake, ...completion, endedAt: Date.now() };
+      const transaction = database.transaction('takes', 'readwrite');
+      const done = transactionComplete(transaction);
+      const store = transaction.objectStore('takes');
+      let savedTake;
+      const request = store.get(takeId);
+      request.addEventListener('success', () => {
+        if (!request.result) { transaction.abort(); return; }
+        savedTake = { ...mergeRecordingMetadata(request.result, completedTake),
+          ...completion, endedAt: completedTake.endedAt };
+        store.put(savedTake);
+      }, { once: true });
+      await done;
+      activeTake = savedTake;
+      return savedTake;
+    },
+    notify: (take) => { if (take.transferGeneration) roomCall?.notifyTakeFinalized(take); }
+  });
+  const take = result.take || activeTake;
+  appendNetworkEvent('Recording save local',
+    `status=${result.success ? 'saved' : result.completionSaved ? 'recovered' : 'unconfirmed'} frames=${take.frames} chunks=${take.chunks}`);
+  $('timer').textContent = formatDuration(take.frames / TARGET_RATE);
   takeFrameLimit = 0;
   preparedRecordingEvent = null;
-  setStatus(failure ? 'Recovery data saved. The unconfirmed final section is not included.' : 'Recording saved · Ready to export WAV', failure ? 'ready' : 'saved');
   $('waveformState').textContent = '';
   $('waveformState').classList.remove('live');
-  if (failure) errorText.textContent = `${failure} Saved chunks can be exported as a recovered WAV from the list.`;
+  if (result.failure) {
+    errorText.textContent = result.completionSaved
+      ? `${result.failure.message} Confirmed chunks are available as a recovered WAV.`
+      : `${result.failure.message} Completion could not be saved. Existing chunks remain; reload the page to recover them.`;
+  }
   activeTake = null;
   await renderTakes();
-  const sessionFrames = (await loadAll('takes'))
-    .filter((take) => take.sessionId === activeSession.id && !take.remote)
-    .reduce((total, take) => total + (take.frames || 0), 0);
-  sessionLimitReached = sessionFrames >= MAX_SESSION_FRAMES;
-  updateRecordButtonAvailability();
-  if (sessionLimitReached) setStatus('This session has reached the 2-hour recording limit.');
+  if (activeSession) {
+    const sessionFrames = (await loadAll('takes'))
+      .filter((take) => take.sessionId === activeSession.id && !take.remote)
+      .reduce((total, take) => total + (take.frames || 0), 0);
+    sessionLimitReached = sessionFrames >= MAX_SESSION_FRAMES;
+  }
   await updateSessionSavedSize();
   await refreshSessionList();
-  if (!failure) setMessage('Recording data (WAV chunks) has been saved in the browser. Select “Save WAV” to save an audio file.');
-  return !failure;
+  if (result.success) setMessage('Recording data (WAV chunks) has been saved in the browser. Select “Save WAV” to save an audio file.');
+  return result.success;
 }
 
 function audioContextTimeAtPerformanceTime(targetTime) {
@@ -2307,22 +2300,30 @@ function primeRecordingAudioContext() {
 }
 
 function releasePrimedRecordingAudioContext() {
-  if (!activeSession && !recording) void localAudioEngine.dispose();
+  if (!activeSession && !recordingController.snapshot.recording) void localAudioEngine.dispose();
 }
 
-async function startRecording(remoteSchedule = null, { prepareOnly = false, prepareEvent = null } = {}) {
-  if (recording) return true;
-  if (finalizing || starting || switchingMicrophone || !activeSession) return false;
+function startRecording(remoteSchedule = null, options = {}) {
+  if (switchingMicrophone || !activeSession) return Promise.resolve(false);
+  if (recordingController.snapshot.recording) return Promise.resolve(true);
+  if (recordingController.snapshot.finalizing || recordingController.snapshot.starting) return Promise.resolve(false);
+  let prepared;
+  try {
+    prepared = primeRecordingAudioContext();
+  } catch (error) {
+    errorText.textContent = `Unable to start recording: ${error.message}`;
+    return Promise.resolve(false);
+  }
+  return recordingController.start((operation) => performRecordingStart(remoteSchedule, options, operation, prepared));
+}
+
+async function performRecordingStart(remoteSchedule, { prepareOnly = false, prepareEvent = null }, operation, prepared) {
   if (roomCall?.isActive && !roomCall.isGuest && !roomCall.canStartRecording) {
     errorText.textContent = 'Connect the call and confirm both participants are ready before starting to record.';
     return false;
   }
   if (switchingMicrophone) return false;
-  starting = true;
-  captureOnAir = false;
-  captureStartPending = true;
   updateCaptureStatusBadge();
-  cancelRecordingStart = false;
   updateRecordButtonAvailability();
   scheduledRecordingStartAt = remoteSchedule?.startAt ?? null;
   scheduledRecordingWallStartAt = remoteSchedule?.hostStartedAt ?? null;
@@ -2332,9 +2333,7 @@ async function startRecording(remoteSchedule = null, { prepareOnly = false, prep
   let preparationAnnounced = false;
   let preparationEvent = null;
   try {
-    const prepared = preparedRecordingEvent
-      ? { context: audioContext, resume: Promise.resolve(null) }
-      : primeRecordingAudioContext();
+    if (!recordingController.isCurrent(operation)) throw new Error('The recording start was canceled.');
     if (!roomCall?.isGuest) {
       try {
         if (!await getHostSession()) {
@@ -2376,7 +2375,7 @@ async function startRecording(remoteSchedule = null, { prepareOnly = false, prep
         await localPreparation.catch(() => {});
         throw error;
       }
-      if (cancelRecordingStart) {
+      if (recordingController.snapshot.cancelRequested) {
         throw new Error('The synchronized recording start was canceled because the other participant could not prepare.');
       }
       const startLeadMs = Math.max(
@@ -2407,7 +2406,7 @@ async function startRecording(remoteSchedule = null, { prepareOnly = false, prep
     }
     if (schedule && preparedRecordingEvent) {
       await activatePreparedTake(schedule);
-      return recording;
+      return recordingController.snapshot.recording;
     }
     if (schedule && roomCall?.localRole === 'guest') {
       throw new Error('The synchronized start arrived before recording preparation completed.');
@@ -2419,16 +2418,16 @@ async function startRecording(remoteSchedule = null, { prepareOnly = false, prep
       preparedAudioContext: prepared.context,
       preparedAudioContextResume: prepared.resume
     });
-    return recording;
+    return recordingController.snapshot.recording;
   } catch (error) {
-    const unstartedPreparedTake = Boolean(preparedRecordingEvent && !recording);
     await stopDiagnostics({ stopCapture: false });
+    await commitChain.catch(() => {});
     if (preparationEvent) roomCall?.cancelGuestRecordingPreparation(preparationEvent.eventId);
-    if ((synchronizedStartAnnounced || preparationAnnounced) && !cancelRecordingStart) {
+    if ((synchronizedStartAnnounced || preparationAnnounced) && !recordingController.snapshot.cancelRequested) {
       roomCall.setHostRecordingState(false);
     }
     if (activeTake && ['preparing', 'recording'].includes(activeTake.status)) {
-      if ((cancelRecordingStart || unstartedPreparedTake || prepareOnly || preparationAnnounced) && !recording) {
+      if (!activeTake.startObservation && activeTake.frames === 0) {
         const cancelledTake = activeTake;
         activeTake = null;
         preparedRecordingEvent = null;
@@ -2465,8 +2464,6 @@ async function startRecording(remoteSchedule = null, { prepareOnly = false, prep
       : error.name === 'OverconstrainedError' && (error.constraint || error.constraintName) === 'deviceId'
         ? 'The selected microphone was not found or is unavailable. Select “Detect Devices” to refresh the list and choose another input.'
         : `Unable to start recording: ${errorDetails}`;
-    captureOnAir = false;
-    captureStartPending = false;
     setStatus('Unable to start recording');
     recordButton.disabled = false;
     stopButton.disabled = true;
@@ -2474,27 +2471,22 @@ async function startRecording(remoteSchedule = null, { prepareOnly = false, prep
     scheduledRecordingWallStartAt = null;
     return false;
   } finally {
-    if (!activeSession && !recording) await localAudioEngine.dispose();
-    starting = false;
-    cancelRecordingStart = false;
-    if (!recording && !captureOnAir && !preparedRecordingEvent) captureStartPending = false;
+    if (!activeSession && !recordingController.snapshot.recording) await localAudioEngine.dispose();
     updateCaptureStatusBadge();
     updateRecordingPreparation();
     updateRecordButtonAvailability();
-    if (!recording && !preparedRecordingEvent && activeSession && !studioView.hidden && mediaStream) {
+    if (!recordingController.snapshot.recording && !preparedRecordingEvent && activeSession && !studioView.hidden && mediaStream) {
       startLocalPreview(mediaStream);
     }
   }
 }
 
 async function discardPreparedTake() {
-  if (!preparedRecordingEvent || recording) return false;
+  if (!preparedRecordingEvent || recordingController.snapshot.recording) return false;
   const take = activeTake;
   await stopDiagnostics({ stopCapture: false });
   activeTake = null;
   preparedRecordingEvent = null;
-  captureOnAir = false;
-  captureStartPending = false;
   scheduledRecordingStartAt = null;
   scheduledRecordingWallStartAt = null;
   if (take) await deleteUnstartedTake(take.id);
@@ -2506,21 +2498,21 @@ async function discardPreparedTake() {
 }
 
 function applyHostRecordingState(isRecording, schedule = null) {
-  if (!isRecording && starting && !recording) cancelRecordingStart = true;
+  if (!isRecording && recordingController.snapshot.starting && !recordingController.snapshot.recording) recordingController.cancel();
   const previousState = lastHostRecordingState;
   lastHostRecordingState = isRecording;
   hostRecordingCommand = hostRecordingCommand.then(async () => {
     if (isRecording) {
       $('hostRecordingStatus').textContent = 'Starting recording in sync with the host…';
-      const started = recording || await startRecording(schedule);
-      $('hostRecordingStatus').textContent = recording
+      const started = recordingController.snapshot.recording || await startRecording(schedule);
+      $('hostRecordingStatus').textContent = recordingController.snapshot.recording
         ? scheduledRecordingStartAt !== null
           ? 'Waiting for the host to start recording. Wait until the recording indicator changes.'
           : 'Recording in sync with the host'
         : 'Unable to start recording on this device. Check the error below.';
       return started;
     }
-    if (recording) {
+    if (recordingController.snapshot.recording) {
       $('hostRecordingStatus').textContent = 'Saving in sync with the host’s stop…';
       const stopped = await stopRecording();
       $('hostRecordingStatus').textContent = stopped
@@ -2529,7 +2521,7 @@ function applyHostRecordingState(isRecording, schedule = null) {
       return stopped;
     }
     if (preparedRecordingEvent) {
-      const discarded = await discardPreparedTake();
+      const discarded = await stopRecording();
       $('hostRecordingStatus').textContent = discarded
         ? 'Recording preparation was canceled by the host'
         : 'Waiting for the host to record';
@@ -2638,6 +2630,7 @@ async function recoverInterruptedTakes() {
 }
 
 async function stopDiagnosticsOnUnload() {
+  recordingController.cancel();
   mediaStream?.getTracks().forEach((track) => {
     if (track.readyState !== 'ended') track.stop();
   });
@@ -2696,7 +2689,7 @@ stopButton.addEventListener('click', () => {
   if (!roomCall?.isGuest) void stopRecording();
 });
 $('backButton').addEventListener('click', async () => {
-  if (recording || finalizing) {
+  if (recordingController.snapshot.state !== 'idle' || recordingController.snapshot.starting) {
     setMessage('Stop and save the recording before returning to the session list.', true);
     return;
   }
@@ -2747,7 +2740,7 @@ async function initialize() {
     });
     $('logoutButton').hidden = false;
     $('logoutButton').addEventListener('click', async () => {
-      if (recording || finalizing) {
+      if (recordingController.snapshot.state !== 'idle' || recordingController.snapshot.starting) {
         $('statusMessage').textContent = 'Stop and save the recording before logging out.';
         return;
       }
@@ -2772,7 +2765,7 @@ async function initialize() {
       getParticipantName: () => participantNameInput.value,
       getMicrophoneStream: ensureCaptureStream,
       releaseMicrophone: releaseCaptureStream,
-      getRecordingState: () => recording,
+      getRecordingState: () => recordingController.snapshot.recording,
       checkReadiness: checkRecordingReadiness,
       onReadinessState: () => updateRecordButtonAvailability(),
       onRecordingPrepare: ({ eventId, sequence }) => startRecording(null, {
@@ -2829,11 +2822,11 @@ async function initialize() {
         if (switchingMicrophone) return;
         if (stream) {
           startLocalPreview(stream);
-        } else if (!recording && activeSession && !studioView.hidden && mediaStream) {
+        } else if (!recordingController.snapshot.recording && activeSession && !studioView.hidden && mediaStream) {
           void startLocalPreview(mediaStream);
         } else {
           stopLocalPreview();
-          if (!recording) setLocalWaveformState('Waiting');
+          if (!recordingController.snapshot.recording) setLocalWaveformState('Waiting');
         }
       },
       onError: (error) => { errorText.textContent = error.message; }
