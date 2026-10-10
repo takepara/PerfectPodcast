@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 import { RoomCall } from '../prototype/room-call.js';
+import { resetEventLog } from '../prototype/event-log.js';
 
 const source = readFileSync(new URL('../prototype/recorder.js', import.meta.url), 'utf8');
 const changeMicrophoneSource = source.slice(source.indexOf('async function changeMicrophone()'), source.indexOf('async function checkRecordingReadiness()'));
@@ -11,7 +12,7 @@ const primeRecordingAudioContextSource = source.slice(source.indexOf('function p
 const startRecordingSource = source.slice(source.indexOf('async function startRecording('), source.indexOf('\nfunction applyHostRecordingState'));
 const samplePreviewMeterSource = source.slice(source.indexOf('function samplePreviewMeter()'), source.indexOf('\nfunction startMeterMonitoring'));
 const microphoneMuteSource = source.slice(source.indexOf('function getLocalMicrophoneLabel()'), source.indexOf('\nfunction samplePreviewMeter'));
-const waveformStateSource = source.slice(source.indexOf('function setLocalWaveformState('), source.indexOf('\nfunction startLocalPreview'));
+const waveformStateSource = source.slice(source.indexOf('function setLocalWaveformState('), source.indexOf('\nasync function startLocalPreview'));
 
 function setupSession({ failure = false, recording = false, leaveDuringCapture = false } = {}) {
   const events = [];
@@ -19,10 +20,11 @@ function setupSession({ failure = false, recording = false, leaveDuringCapture =
   const stream = {};
   const context = vm.createContext({
     activeSession: null, roomCall: null, recording, starting: false,
+    resetEventLog, networkEventCount: 10, networkEventLogStartedAt: 0, performance: { now: () => 100 },
     waveformElapsedSeconds: 0, sessionLimitReached: false, MAX_SESSION_FRAMES: 100,
     setupView: {}, studioView: { hidden: true }, errorText: {},
     $: (id) => {
-      if (!elements.has(id)) elements.set(id, { classList: { remove() {} } });
+      if (!elements.has(id)) elements.set(id, { replaceChildren() {}, classList: { remove() {} } });
       return elements.get(id);
     },
     stopWaveformRendering: () => events.push('clear'), setStatus: () => {},
@@ -103,117 +105,19 @@ test('updates the input level meter during preview without recording', () => {
   assert.equal(typeof nextFrame, 'function');
 });
 
-test('primes the recording AudioContext before asynchronous host checks', async () => {
-  const events = [];
+test('primes the shared engine before asynchronous host checks', async () => {
+  const prepared = { context: { state: 'running', sampleRate: 48000 }, resume: Promise.resolve(null) };
+  let calls = 0;
   const context = vm.createContext({
-    TARGET_RATE: 48_000,
-    previewAudioContext: null,
-    primedRecordingAudioContext: null,
-    primedRecordingAudioContextResume: null,
-    primedRecordingAudioContextAnchor: null,
-    appendNetworkEvent: (event, details) => events.push(['log', event, details]),
-    AudioContext: class {
-      constructor(options) {
-        events.push(['create', options.sampleRate]);
-        this.state = 'running';
-        this.destination = {};
-      }
-      createOscillator() {
-        const oscillator = {
-          connect: () => gain,
-          start: () => events.push('oscillator start')
-        };
-        return oscillator;
-      }
-      createGain() {
-        return gain;
-      }
-      addEventListener(type) {
-        events.push(['listen', type]);
-      }
-      resume() {
-        events.push('resume');
-        return Promise.resolve();
-      }
-    }
-  });
-  const gain = {
-    gain: { value: 1 },
-    connect: () => gain
-  };
-  vm.runInContext(primeRecordingAudioContextSource, context);
-  const prepared = context.primeRecordingAudioContext();
-  await prepared.resume;
-
-  assert.deepEqual(events, [
-    ['create', 48_000],
-    'oscillator start',
-    ['log', 'Recording AudioContext', 'created context state=running'],
-    ['listen', 'statechange'],
-    ['log', 'Recording AudioContext', 'resume requested'],
-    'resume',
-    ['log', 'Recording AudioContext', 'resume completed']
-  ]);
-  assert.ok(startRecordingSource.indexOf('primeRecordingAudioContext()') <
-    startRecordingSource.indexOf('await getHostSession()'));
-  assert.ok(startRecordingSource.indexOf('primeRecordingAudioContext()') <
-    startRecordingSource.indexOf('await roomCall.synchronizeClock()'));
-});
-
-test('reuses an already running preview AudioContext for scheduled recording', async () => {
-  const events = [];
-  const previewAudioContext = { state: 'running' };
-  const context = vm.createContext({
-    previewAudioContext,
-    primedRecordingAudioContext: null,
-    primedRecordingAudioContextResume: null,
-    primedRecordingAudioContextAnchor: null,
-    appendNetworkEvent: (event, details) => events.push([event, details]),
-    AudioContext: class {
-      constructor() {
-        assert.fail('should not create a new context while the microphone preview is running');
-      }
-    }
+    localAudioEngine: { prime() { calls += 1; return prepared; } },
+    activeSession: {}, recording: false, appendNetworkEvent() {}
   });
   vm.runInContext(primeRecordingAudioContextSource, context);
-  const prepared = context.primeRecordingAudioContext();
-  assert.equal(prepared.context, previewAudioContext);
+  assert.equal(context.primeRecordingAudioContext(), prepared);
+  assert.equal(calls, 1);
   assert.equal(await prepared.resume, null);
-  assert.deepEqual(events, [[
-    'Recording AudioContext',
-    'prepared running microphone preview context'
-  ]]);
-
-  const createTakeSource = source.slice(source.indexOf('async function createTake('), source.indexOf('\nasync function activatePreparedTake('));
-  assert.match(createTakeSource, /const reusePreviewContext = previewAudioContext === preparedAudioContext;\s*stopLocalPreview\(\{ preserveAudioContext: reusePreviewContext \}\)/);
-  assert.match(createTakeSource, /if \(primedRecordingAudioContext === audioContext\) \{\s*primedRecordingAudioContext = null;/);
-});
-
-test('preview handoff disconnects every preview node while preserving the running AudioContext', () => {
-  const stopPreview = source.slice(source.indexOf('function stopLocalPreview('), source.indexOf('\nfunction stopWaveformRendering'));
-  const disconnected = [];
-  let closed = false;
-  const context = vm.createContext({
-    stopMeterMonitoring() {}, updateMicrophoneMuteButton() {},
-    previewSourceNode: { disconnect: () => disconnected.push('source') },
-    previewInputChannelNode: { disconnect: () => disconnected.push('input') },
-    previewAnalyserNode: { disconnect: () => disconnected.push('analyser') },
-    previewSilentGain: { disconnect: () => disconnected.push('gain') },
-    previewAudioContext: { state: 'running', close: () => { closed = true; } },
-    previewSamples: {}, previewStream: {}
-  });
-  vm.runInContext(stopPreview, context);
-  context.stopLocalPreview({ preserveAudioContext: true });
-  assert.deepEqual(disconnected, ['source', 'input', 'analyser', 'gain']);
-  assert.equal(closed, false);
-  assert.equal(context.previewSilentGain, null);
-});
-
-test('recording uses an input-only Worklet without a silent speaker connection', () => {
-  const createTake = source.slice(source.indexOf('async function createTake('), source.indexOf('\nasync function activatePreparedTake'));
-  assert.match(createTake, /numberOfOutputs: 0/);
-  assert.match(createTake, /analyserNode\.connect\(recorderNode\)/);
-  assert.doesNotMatch(createTake, /recorderNode\.connect|silentGain/);
+  assert.ok(startRecordingSource.indexOf('primeRecordingAudioContext()') < startRecordingSource.indexOf('await getHostSession()'));
+  assert.ok(startRecordingSource.indexOf('primeRecordingAudioContext()') < startRecordingSource.indexOf('await roomCall.synchronizeClock()'));
 });
 
 test('waits for both devices to prepare before scheduling a synchronized start', () => {

@@ -14,8 +14,8 @@ import { monitorRecordingTrack } from './recording-track-monitor.js';
 import { makeRecordingFilename } from './recording-filename.js';
 import { createStartPlan, sameStartPlan } from './recording-timing.js';
 import { mergeRecordingMetadata, synchronizationForTake } from './recording-ledger.js';
-import { eventLogSeverity } from './event-log.js';
-import { connectFirstMicrophoneChannel } from './microphone-input.js';
+import { eventLogSeverity, resetEventLog } from './event-log.js';
+import { LocalAudioEngine } from './local-audio-engine.js';
 import { appendAlignedWaveformPeak, resetWaveformHistory } from './waveform-history.js';
 
 const TARGET_RATE = 48000;
@@ -50,7 +50,7 @@ const errorText = $('errorText');
 const notice = $('notice');
 const meter = document.querySelector('[role="meter"]');
 const waveformCanvas = $('waveformCanvas');
-const networkEventLogStartedAt = performance.now();
+let networkEventLogStartedAt = performance.now();
 
 let database;
 let activeSession = null;
@@ -59,19 +59,22 @@ let studioTitleSaveFailed = false;
 let roomCall = null;
 let activeTake = null;
 let audioContext = null;
-let primedRecordingAudioContext = null;
-let primedRecordingAudioContextResume = null;
-let primedRecordingAudioContextAnchor = null;
+const localAudioEngine = new LocalAudioEngine({
+  onStateChange(state) {
+    appendNetworkEvent('Recording AudioContext state', state);
+    if (recording && state === 'closed') {
+      void stopRecording('AudioContext was closed. Saved chunks are available for recovery.')
+        .catch((error) => setMessage(`Unable to stop recording: ${error.message}`, true));
+    }
+  }
+});
 let mediaStream = null;
 let sourceNode = null;
 let inputChannelNode = null;
 let analyserNode = null;
 let recorderNode = null;
 let previewAudioContext = null;
-let previewSourceNode = null;
-let previewInputChannelNode = null;
 let previewAnalyserNode = null;
-let previewSilentGain = null;
 let previewSamples = null;
 let previewStream = null;
 let microphoneMuted = false;
@@ -338,68 +341,36 @@ function setLocalWaveformState(text, live = false) {
   $('waveformState').classList.toggle('live', live);
 }
 
-function startLocalPreview(stream) {
-  if (!stream || recording || starting || previewStream === stream) return;
-  stopLocalPreview();
-  previewStream = stream;
+async function startLocalPreview(stream) {
+  if (!stream || recording || starting) return false;
+  if (previewStream === stream && localAudioEngine.graph?.mode === 'preview') return true;
   for (const track of stream.getAudioTracks()) track.enabled = !microphoneMuted;
-  updateMicrophoneMuteButton();
-  if (!window.AudioContext) {
-    setLocalWaveformState('Waveform unavailable');
-    return;
-  }
   try {
-    previewAudioContext = new AudioContext();
-    previewSourceNode = previewAudioContext.createMediaStreamSource(stream);
-    previewAnalyserNode = previewAudioContext.createAnalyser();
-    previewAnalyserNode.fftSize = 2048;
-    previewSamples = new Float32Array(previewAnalyserNode.fftSize);
-    previewSilentGain = previewAudioContext.createGain();
-    previewSilentGain.gain.value = 0;
-    previewInputChannelNode = connectFirstMicrophoneChannel(previewAudioContext, previewSourceNode, previewAnalyserNode);
-    previewAnalyserNode.connect(previewSilentGain).connect(previewAudioContext.destination);
+    const graph = await localAudioEngine.startPreview(stream);
+    if (localAudioEngine.graph !== graph) return;
+    previewStream = stream;
+    previewAudioContext = graph.context;
+    previewAnalyserNode = graph.analyser;
+    previewSamples = new Float32Array(graph.analyser.fftSize);
     lastPeak = 0;
     updateMeter(0);
-    const context = previewAudioContext;
-    if (context.state === 'running') {
-      setLocalWaveformState('Waiting to record');
-      startMeterMonitoring();
-    } else if (context.state === 'suspended') {
-      setLocalWaveformState('Preparing waveform');
-      void context.resume().then(() => {
-        if (previewAudioContext === context && !recording) {
-          setLocalWaveformState('Waiting to record');
-          startMeterMonitoring();
-        }
-      }).catch((error) => {
-        if (previewAudioContext !== context) return;
-        setLocalWaveformState('Waveform stopped');
-        setMessage(`Unable to start your waveform: ${error.message}`, true);
-      });
-    } else {
-      setLocalWaveformState('Waveform stopped');
-    }
+    updateMicrophoneMuteButton();
+    setLocalWaveformState('Waiting to record');
+    startMeterMonitoring();
+    return true;
   } catch (error) {
-    stopLocalPreview();
+    if (switchingMicrophone) throw error;
+    if (recording || starting || !activeSession || studioView.hidden) return;
     setLocalWaveformState('Waveform error');
     setMessage(`Unable to start your waveform: ${error.message}`, true);
   }
 }
 
-function stopLocalPreview({ preserveAudioContext = false } = {}) {
+function stopLocalPreview() {
   stopMeterMonitoring();
-  previewSourceNode?.disconnect();
-  previewInputChannelNode?.disconnect();
-  previewAnalyserNode?.disconnect();
-  previewSilentGain?.disconnect();
-  if (!preserveAudioContext && previewAudioContext && previewAudioContext.state !== 'closed') {
-    void previewAudioContext.close();
-  }
+  if (localAudioEngine.graph?.mode === 'preview') localAudioEngine.stopGraph();
   previewAudioContext = null;
-  previewSourceNode = null;
-  previewInputChannelNode = null;
   previewAnalyserNode = null;
-  previewSilentGain = null;
   previewSamples = null;
   previewStream = null;
   updateMicrophoneMuteButton();
@@ -1572,6 +1543,12 @@ async function renderTakes() {
 }
 
 async function openSession(session) {
+  resetEventLog({
+    panel: $('networkEventPanel'), log: $('networkEventLog'), count: $('networkEventCount'),
+    isGuest: roomCall?.isGuest === true
+  });
+  networkEventCount = 0;
+  networkEventLogStartedAt = performance.now();
   if (roomCall?.isGuest && roomCall.remoteSessionName) {
     session.name = roomCall.remoteSessionName;
   }
@@ -1643,8 +1620,8 @@ async function deleteActiveSession() {
     await deleteSessionAndRecordings(session.id);
     deleted = true;
     stopLocalPreview();
-    await releaseCaptureStream();
     activeSession = null;
+    await releaseCaptureStream();
     sessionLimitReached = false;
     transferProgressCache = null;
     transferGraphSamples = [];
@@ -1740,19 +1717,32 @@ async function changeMicrophone() {
   updateRecordButtonAvailability();
   $('trackMicDeviceHint').textContent = 'Switching microphone…';
   let nextStream = null;
+  const previousStream = mediaStream;
+  let callReplaced = false;
   try {
     if (roomCall?.connected) await roomCall.checkLocalReadiness();
     nextStream = await acquireMicrophoneStream(deviceId);
     for (const track of nextStream.getAudioTracks()) track.enabled = !microphoneMuted;
-    if (roomCall?.connected) await roomCall.attachLocalAudio(nextStream);
-    const previousStream = mediaStream;
+    if (roomCall?.connected) {
+      await roomCall.attachLocalAudio(nextStream);
+      callReplaced = true;
+    }
+    await startLocalPreview(nextStream);
     mediaStream = nextStream;
     nextStream = null;
     micDevice.value = deviceId;
-    startLocalPreview(mediaStream);
-    previousStream?.getTracks().forEach((track) => track.stop());
+    previousStream?.getTracks().forEach((track) => {
+      if (track.readyState !== 'ended') track.stop();
+    });
     $('trackMicDeviceHint').textContent = 'Microphone changed.';
   } catch (error) {
+    if (callReplaced && previousStream) {
+      try {
+        await roomCall.attachLocalAudio(previousStream);
+      } catch (rollbackError) {
+        setMessage(`Unable to restore call microphone: ${rollbackError.message}`, true);
+      }
+    }
     nextStream?.getTracks().forEach((track) => track.stop());
     trackMicDevice.value = previousDevice;
     $('trackMicDeviceHint').textContent = `Unable to change microphone: ${error.message}`;
@@ -1771,13 +1761,7 @@ async function checkRecordingReadiness() {
     throw new Error('No active microphone input is available.');
   }
   if (!window.AudioContext) throw new Error('AudioContext is not available.');
-  const context = new AudioContext({ sampleRate: TARGET_RATE });
-  try {
-    if (context.sampleRate !== TARGET_RATE) throw new Error('Unable to create a 48 kHz AudioContext.');
-    await context.audioWorklet.addModule('./recorder-worklet.js');
-  } finally {
-    if (context.state !== 'closed') await context.close();
-  }
+  await localAudioEngine.checkReadiness(stream);
 
   const probeId = `readiness-${crypto.randomUUID()}`;
   const transaction = database.transaction('sessions', 'readwrite');
@@ -1791,7 +1775,12 @@ async function checkRecordingReadiness() {
 
 async function releaseCaptureStream() {
   if (recording) return;
-  mediaStream?.getTracks().forEach((track) => track.stop());
+  if (activeSession && !studioView.hidden) return;
+  stopLocalPreview();
+  mediaStream?.getTracks().forEach((track) => {
+    if (track.readyState !== 'ended') track.stop();
+  });
+  await localAudioEngine.dispose();
   mediaStream = null;
   updateMicrophoneMuteButton();
 }
@@ -1895,15 +1884,12 @@ async function createTake({
   if (!navigator.mediaDevices?.getUserMedia || !window.AudioWorkletNode) {
     throw new Error('AudioWorklet recording is not supported. Use Chrome or Edge.');
   }
-  await stopDiagnostics({ stopCapture: !roomCall?.isActive });
+  await stopDiagnostics({ stopCapture: false });
   await ensureCaptureStream();
-  const reusePreviewContext = previewAudioContext === preparedAudioContext;
-  stopLocalPreview({ preserveAudioContext: reusePreviewContext });
-  audioContext = preparedAudioContext || new AudioContext({ sampleRate: TARGET_RATE });
-  if (primedRecordingAudioContext === audioContext) {
-    primedRecordingAudioContext = null;
-    primedRecordingAudioContextResume = null;
-    primedRecordingAudioContextAnchor = null;
+  stopLocalPreview();
+  audioContext = localAudioEngine.prime().context;
+  if (preparedAudioContext && preparedAudioContext !== audioContext) {
+    throw new Error('The prepared AudioContext does not match the local audio engine.');
   }
   if (audioContext.sampleRate !== TARGET_RATE) {
     throw new Error(`This device’s AudioContext is ${audioContext.sampleRate} Hz. 48,000 Hz is required.`);
@@ -1946,18 +1932,12 @@ async function createTake({
   commitChain = Promise.resolve();
   finalizing = false;
 
-  await audioContext.audioWorklet.addModule('./recorder-worklet.js');
-  sourceNode = audioContext.createMediaStreamSource(mediaStream);
-  analyserNode = audioContext.createAnalyser();
-  analyserNode.fftSize = 2048;
-  analyserNode.smoothingTimeConstant = 0.65;
+  const graph = await localAudioEngine.startTake(mediaStream);
+  sourceNode = graph.source;
+  inputChannelNode = graph.input;
+  analyserNode = graph.analyser;
   waveformSamples = new Float32Array(analyserNode.fftSize);
-  recorderNode = new AudioWorkletNode(audioContext, 'perfectpodcast-local-recorder', {
-    numberOfInputs: 1,
-    numberOfOutputs: 0,
-    channelCount: 1,
-    channelCountMode: 'explicit'
-  });
+  recorderNode = graph.recorder;
   recorderNode.port.onmessage = ({ data }) => {
     if (data.type === 'started') {
       if (!recording || finalizing) return;
@@ -2018,8 +1998,6 @@ async function createTake({
       ));
     }
   };
-  inputChannelNode = connectFirstMicrophoneChannel(audioContext, sourceNode, analyserNode);
-  analyserNode.connect(recorderNode);
   const track = mediaStream.getAudioTracks()[0];
   if (!track) throw new Error('No active microphone input is available.');
   clearRecordingTrackMonitor();
@@ -2042,12 +2020,6 @@ async function createTake({
   });
   cleanupRecordingTrackMonitor = trackMonitor.cleanup;
   checkRecordingTrackMute = trackMonitor.checkCurrentMute;
-  audioContext.addEventListener('statechange', () => {
-    if (recording && audioContext?.state === 'closed') {
-      void stopRecording('AudioContext was closed. Saved chunks are available for recovery.')
-        .catch((error) => setMessage(`Unable to stop recording: ${error.message}`, true));
-    }
-  });
   if (preparedAudioContextResume) {
     const resumeError = await preparedAudioContextResume;
     if (resumeError) throw resumeError;
@@ -2186,14 +2158,8 @@ async function activatePreparedTake(schedule = null) {
 async function stopDiagnostics({ stopCapture = true } = {}) {
   clearRecordingTrackMonitor();
   checkRecordingTrackMute = null;
-  if (sourceNode) sourceNode.disconnect();
-  inputChannelNode?.disconnect();
-  if (recorderNode) {
-    recorderNode.port.onmessage = null;
-    recorderNode.disconnect();
-  }
-  if (stopCapture) mediaStream?.getTracks().forEach((track) => track.stop());
-  if (audioContext && audioContext.state !== 'closed') await audioContext.close();
+  if (localAudioEngine.graph?.mode === 'take') localAudioEngine.stopGraph();
+  if (stopCapture) await releaseCaptureStream();
   sourceNode = null;
   inputChannelNode = null;
   analyserNode = null;
@@ -2335,58 +2301,13 @@ function audioContextTimeAtPerformanceTime(targetTime) {
 }
 
 function primeRecordingAudioContext() {
-  if (primedRecordingAudioContext && primedRecordingAudioContext.state !== 'closed') {
-    appendNetworkEvent(
-      'Recording AudioContext',
-      `reusing prepared context state=${primedRecordingAudioContext.state}`
-    );
-    return {
-      context: primedRecordingAudioContext,
-      resume: primedRecordingAudioContextResume
-    };
-  }
-  const context = previewAudioContext?.state === 'running'
-    ? previewAudioContext
-    : new AudioContext({ sampleRate: TARGET_RATE });
-  primedRecordingAudioContext = context;
-  if (context === previewAudioContext) {
-    primedRecordingAudioContextResume = Promise.resolve(null);
-    appendNetworkEvent('Recording AudioContext', 'prepared running microphone preview context');
-    return { context, resume: primedRecordingAudioContextResume };
-  }
-
-  const keepAlive = context.createOscillator();
-  const silence = context.createGain();
-  silence.gain.value = 0;
-  keepAlive.connect(silence).connect(context.destination);
-  keepAlive.start();
-  primedRecordingAudioContextAnchor = { keepAlive, silence };
-  appendNetworkEvent('Recording AudioContext', `created context state=${context.state}`);
-  context.addEventListener('statechange', () => {
-    appendNetworkEvent('Recording AudioContext state', context.state);
-  });
-  appendNetworkEvent('Recording AudioContext', 'resume requested');
-  primedRecordingAudioContextResume = context.resume().then(() => {
-    appendNetworkEvent('Recording AudioContext', 'resume completed');
-    return null;
-  }, (error) => {
-    appendNetworkEvent('Recording AudioContext', `resume failed: ${error.message}`);
-    return error;
-  });
-  return { context, resume: primedRecordingAudioContextResume };
+  const prepared = localAudioEngine.prime();
+  appendNetworkEvent('Recording AudioContext', `shared local context state=${prepared.context.state} sampleRate=${prepared.context.sampleRate}`);
+  return prepared;
 }
 
 function releasePrimedRecordingAudioContext() {
-  const context = primedRecordingAudioContext;
-  const anchor = primedRecordingAudioContextAnchor;
-  primedRecordingAudioContext = null;
-  primedRecordingAudioContextResume = null;
-  primedRecordingAudioContextAnchor = null;
-  if (!context || context === audioContext || context === previewAudioContext || context.state === 'closed') return;
-  anchor?.keepAlive.stop();
-  anchor?.keepAlive.disconnect();
-  anchor?.silence.disconnect();
-  void context.close();
+  if (!activeSession && !recording) void localAudioEngine.dispose();
 }
 
 async function startRecording(remoteSchedule = null, { prepareOnly = false, prepareEvent = null } = {}) {
@@ -2407,7 +2328,6 @@ async function startRecording(remoteSchedule = null, { prepareOnly = false, prep
   scheduledRecordingWallStartAt = remoteSchedule?.hostStartedAt ?? null;
   updateRecordingPreparation();
   recordButton.disabled = true;
-  let preparedAudioContext = null;
   let synchronizedStartAnnounced = false;
   let preparationAnnounced = false;
   let preparationEvent = null;
@@ -2415,7 +2335,6 @@ async function startRecording(remoteSchedule = null, { prepareOnly = false, prep
     const prepared = preparedRecordingEvent
       ? { context: audioContext, resume: Promise.resolve(null) }
       : primeRecordingAudioContext();
-    preparedAudioContext = prepared.context;
     if (!roomCall?.isGuest) {
       try {
         if (!await getHostSession()) {
@@ -2435,7 +2354,6 @@ async function startRecording(remoteSchedule = null, { prepareOnly = false, prep
         preparedAudioContext: prepared.context,
         preparedAudioContextResume: prepared.resume
       });
-      preparedAudioContext = null;
       return preparedRecordingEvent !== null;
     }
     let schedule = remoteSchedule;
@@ -2450,7 +2368,6 @@ async function startRecording(remoteSchedule = null, { prepareOnly = false, prep
         preparedAudioContext: prepared.context,
         preparedAudioContextResume: prepared.resume
       });
-      preparedAudioContext = null;
       const guestPreparation = roomCall.prepareGuestRecording(event.eventId, event.sequence);
       try {
         await Promise.all([localPreparation, guestPreparation]);
@@ -2502,7 +2419,6 @@ async function startRecording(remoteSchedule = null, { prepareOnly = false, prep
       preparedAudioContext: prepared.context,
       preparedAudioContextResume: prepared.resume
     });
-    preparedAudioContext = null;
     return recording;
   } catch (error) {
     const unstartedPreparedTake = Boolean(preparedRecordingEvent && !recording);
@@ -2558,10 +2474,7 @@ async function startRecording(remoteSchedule = null, { prepareOnly = false, prep
     scheduledRecordingWallStartAt = null;
     return false;
   } finally {
-    if (preparedAudioContext && preparedAudioContext !== audioContext &&
-        preparedAudioContext.state !== 'closed') {
-      await preparedAudioContext.close();
-    }
+    if (!activeSession && !recording) await localAudioEngine.dispose();
     starting = false;
     cancelRecordingStart = false;
     if (!recording && !captureOnAir && !preparedRecordingEvent) captureStartPending = false;
@@ -2725,7 +2638,10 @@ async function recoverInterruptedTakes() {
 }
 
 async function stopDiagnosticsOnUnload() {
-  if (mediaStream) mediaStream.getTracks().forEach((track) => track.stop());
+  mediaStream?.getTracks().forEach((track) => {
+    if (track.readyState !== 'ended') track.stop();
+  });
+  await localAudioEngine.dispose();
 }
 
 setupForm.addEventListener('submit', async (event) => {
@@ -2794,8 +2710,8 @@ $('backButton').addEventListener('click', async () => {
   }
   if (!await saveStudioSessionName()) return;
   stopLocalPreview();
-  await releaseCaptureStream();
   activeSession = null;
+  await releaseCaptureStream();
   updateRecordButtonAvailability();
   stopWaveformRendering();
   studioView.hidden = true;
@@ -2811,6 +2727,7 @@ window.addEventListener('beforeunload', () => {
 async function initialize() {
   const invitation = new URLSearchParams(window.location.hash.slice(1));
   const guestInvitation = invitation.has('session') && invitation.has('invite') && invitation.has('host');
+  $('networkEventPanel').open = !['session', 'invite', 'host'].some((key) => invitation.has(key));
   if (!guestInvitation) {
     let authSession;
     try {
@@ -2909,8 +2826,11 @@ async function initialize() {
       storeIncomingTransferChunk,
       storeIncomingTransferManifest,
       onLocalStream: (stream) => {
+        if (switchingMicrophone) return;
         if (stream) {
           startLocalPreview(stream);
+        } else if (!recording && activeSession && !studioView.hidden && mediaStream) {
+          void startLocalPreview(mediaStream);
         } else {
           stopLocalPreview();
           if (!recording) setLocalWaveformState('Waiting');

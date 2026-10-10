@@ -1,3 +1,10 @@
+export function resetEventLog({ panel, log, count, isGuest }) {
+  log.replaceChildren();
+  log.scrollTop = 0;
+  count.textContent = '0 EVENTS';
+  panel.open = !isGuest;
+}
+
 export function eventLogSeverity(event, details = '') {
   if (/error|failed|failure/iu.test(event)) return 'error';
   if (/warning|unavailable|ignored|not sent/iu.test(event)) return 'warning';

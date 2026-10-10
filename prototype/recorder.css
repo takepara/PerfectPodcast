@@ -81,7 +81,14 @@ h1 { margin-bottom: 0; font-family: Georgia, "Yu Mincho", serif; font-size: clam
 .transfer-graph-summary span:last-child { color: #82aaff; }
 .network-event-panel { margin-top: 18px; padding: 18px; }
 .network-event-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
-.network-event-heading .terminal-section-code { margin: 0; }
+.terminal-ui .network-event-heading .terminal-section-code { margin: 0; }
+summary.network-event-heading { cursor: pointer; list-style: none; }
+summary.network-event-heading::-webkit-details-marker { display: none; }
+summary.network-event-heading::before { content: ''; flex: 0 0 auto; width: 0; height: 0; border-top: 5px solid transparent; border-bottom: 5px solid transparent; border-left: 7px solid var(--muted); }
+.network-event-panel[open] > summary::before { border-top: 7px solid var(--muted); border-right: 5px solid transparent; border-bottom: 0; border-left: 5px solid transparent; }
+summary.network-event-heading > div { flex: 1; }
+.network-event-panel:not([open]) > summary.network-event-heading { margin-bottom: 0; padding-bottom: 0; }
+summary.network-event-heading:focus-visible { outline: 2px solid var(--teal); outline-offset: 4px; }
 .network-event-count { color: var(--muted); font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
 .network-event-log { display: block; width: 100%; height: 280px; resize: vertical; overflow: auto; border: 1px solid var(--line); border-radius: 3px; outline: 0; background: #080e0b; color: #a5bca9; padding: 10px; font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; tab-size: 2; }
 .network-event-log:focus { border-color: var(--teal); box-shadow: 0 0 0 2px rgb(85 214 178 / 14%); }
@@ -320,8 +327,8 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
 .terminal-ui .panel { border-radius: 4px; background: var(--card); box-shadow: inset 0 1px rgb(255 255 255 / 2%); }
 .terminal-ui .setup-panel, .terminal-ui .recent-panel { padding: 20px; }
 .terminal-ui .setup-grid { grid-template-columns: minmax(0, 1.08fr) minmax(290px, .92fr); gap: 10px; }
-.terminal-ui .setup-panel .panel-heading { display: block; margin-bottom: 19px; border-bottom: 1px dashed var(--line); padding-bottom: 12px; }
-.terminal-ui .recent-panel .panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 19px; border-bottom: 1px dashed var(--line); padding-bottom: 12px; }
+.terminal-ui .setup-panel .panel-heading { display: block; margin-bottom: 19px; padding-bottom: 12px; }
+.terminal-ui .recent-panel .panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 19px; padding-bottom: 12px; }
 .terminal-ui .setup-panel .panel-heading::before { display: block; margin-bottom: 7px; color: var(--teal); content: "INITIALIZE"; font-size: 12px; font-weight: 850; letter-spacing: .1em; }
 .terminal-ui .recent-panel .panel-heading::before { display: block; margin: 0; color: var(--teal); content: "ARCHIVE / LOCAL SESSIONS"; font-size: 12px; font-weight: 850; letter-spacing: .1em; }
 .terminal-ui .field { color: #a5bca9; font-size: 14px; letter-spacing: .04em; }
@@ -386,7 +393,7 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
 .terminal-ui .waveform-panel { grid-area: wave; min-width: 0; margin: 0; padding: 14px; }
 .terminal-ui .storage-panel { grid-area: storage; min-width: 0; padding: 15px; }
 .terminal-ui .network-event-panel { margin-top: 9px; border-radius: 2px; background: #101610; box-shadow: none; padding: 14px; }
-.terminal-ui .network-event-heading { margin-bottom: 9px; border-bottom: 1px dashed var(--line); padding-bottom: 8px; }
+.terminal-ui .network-event-heading { margin-bottom: 9px; padding-bottom: 8px; }
 .terminal-ui .network-event-log { height: 320px; border-color: #27342b; border-radius: 2px; background: #050906; color: #a5c3a6; font-size: 11px; }
 .terminal-ui .record-panel, .terminal-ui .room-panel, .terminal-ui .network-panel { align-self: stretch; }
 .terminal-ui .storage-panel { align-self: start; }
@@ -444,7 +451,7 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
 .terminal-ui .connection-stats { color: var(--muted); font-family: inherit; font-size: 12px; text-align: left; }
 .terminal-ui #remoteAudio { width: min(100%, 210px); height: 28px; }
 .terminal-ui .remote-audio-row .button-quiet { margin: 0; }
-.terminal-ui .waveform-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; border-bottom: 1px dashed var(--line); padding-bottom: 10px; }
+.terminal-ui .waveform-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; padding-bottom: 10px; }
 .terminal-ui .waveform-panel-heading h2 { margin: 0; font-size: 16px; letter-spacing: .02em; }
 .terminal-ui .waveform-panel-heading .terminal-section-code { margin: 0 0 4px; }
 .terminal-ui .waveform-heading { gap: 12px; }
@@ -469,7 +476,7 @@ a.take-action { display: inline-flex; align-items: center; justify-content: cent
 .terminal-ui .waveform-track + .waveform-track, .terminal-ui .remote-waveform-tracks:not(:empty) { margin-top: 14px; border-color: var(--line); padding-top: 12px; }
 .terminal-ui .remote-waveform-tracks .waveform-track + .waveform-track { margin-top: 14px; border-color: var(--line); padding-top: 12px; }
 .terminal-ui .waveform-device-hint { color: var(--yellow); font-family: inherit; font-size: 12px; }
-.terminal-ui .storage-panel .panel-heading { display: block; margin-bottom: 12px; border-bottom: 1px dashed var(--line); padding-bottom: 9px; }
+.terminal-ui .storage-panel .panel-heading { display: block; margin-bottom: 12px; padding-bottom: 9px; }
 .terminal-ui .storage-icon { display: none; }
 .terminal-ui .storage-panel .terminal-section-code { margin-bottom: 5px; color: var(--teal); }
 .terminal-ui .saved-total { gap: 8px; border-bottom: 1px dashed var(--line); padding: 8px 0; font-family: inherit; font-size: 12px; }

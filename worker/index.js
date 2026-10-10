@@ -406,7 +406,7 @@ export class RoomSignaling {
     }
     if (message.type === 'recording-state' && message.recording &&
         (!Number.isFinite(message.startAt) || message.startAt <= 0 ||
-         !Number.isFinite(message.clockOffsetMs) || Math.abs(message.clockOffsetMs) > 60_000 ||
+         !Number.isFinite(message.clockOffsetMs) ||
          !Number.isFinite(message.startAt + message.clockOffsetMs) ||
          (message.hostStartedAt !== undefined &&
           (!Number.isFinite(message.hostStartedAt) || message.hostStartedAt <= 0)))) {

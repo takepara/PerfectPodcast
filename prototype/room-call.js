@@ -1017,7 +1017,7 @@ export class RoomCall {
       return null;
     }
     if (recording && (!Number.isFinite(startAt) || startAt <= performance.now() ||
-        !Number.isFinite(clockOffsetMs) || Math.abs(clockOffsetMs) > 60_000 ||
+        !Number.isFinite(clockOffsetMs) ||
         !Number.isFinite(startAt + clockOffsetMs) ||
         (hostStartedAt !== null && (!Number.isFinite(hostStartedAt) || hostStartedAt <= 0)))) {
       this.setStatus('There is no valid synchronized start time. Synchronize the clocks again.', true);
@@ -1125,7 +1125,7 @@ export class RoomCall {
       return;
     }
     if (message.recording && (!Number.isFinite(message.startAt) || message.startAt <= 0 ||
-        !Number.isFinite(message.clockOffsetMs) || Math.abs(message.clockOffsetMs) > 60_000 ||
+        !Number.isFinite(message.clockOffsetMs) ||
         !Number.isFinite(message.startAt + message.clockOffsetMs) ||
         (message.hostStartedAt !== undefined &&
           (!Number.isFinite(message.hostStartedAt) || message.hostStartedAt <= 0)))) {

@@ -38,6 +38,16 @@ test('removes recorder instructions but retains live statuses and errors', () =>
   assert.match(recorder, /id="trackMicDeviceHint"[^>]*><\/p>/);
 });
 
+test('panel titles have no dashed separator and event log has an accessible disclosure', () => {
+  const css = readPrototype('recorder.css');
+  for (const rule of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    if (/panel-heading|network-event-heading|waveform-panel-heading/.test(rule[1])) {
+      assert.doesNotMatch(rule[2], /border-bottom:\s*[^;]*dashed/);
+    }
+  }
+  assert.match(recorder, /<details id="networkEventPanel"[^>]*open>[\s\S]*<summary class="network-event-heading">[\s\S]*<\/summary>[\s\S]*id="networkEventLog"[\s\S]*<\/details>/);
+});
+
 test('shows a scrollable event log for studio events below the studio panels', () => {
   const studio = recorder.slice(recorder.indexOf('<section id="studioView"'), recorder.indexOf('<div id="notice"'));
   assert.match(studio, /class="panel network-event-panel"[\s\S]*>EVENT LOG<\/span>[\s\S]*id="networkEventCount"[\s\S]*id="networkEventLog"[^>]*aria-label="Event log"[^>]*role="log"[^>]*tabindex="0"/);

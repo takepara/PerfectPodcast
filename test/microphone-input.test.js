@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFileSync } from 'node:fs';
 import { connectFirstMicrophoneChannel } from '../prototype/microphone-input.js';
 import { createPcm24Wav } from '../prototype/wav-export.js';
 
@@ -25,12 +24,3 @@ for (const channels of [[0.5, 0], [0.5, -0.5], [0.5]]) {
     assert.ok(Math.abs(sample / 0x7fffff - 0.5) < 1 / 0x7fffff);
   });
 }
-
-test('both recording and preview select input 1 before analysis and mono conversion', () => {
-  const source = readFileSync(new URL('../prototype/recorder.js', import.meta.url), 'utf8');
-  assert.match(source, /channelCount: \{ ideal: 2 \}/);
-  assert.match(source, /connectFirstMicrophoneChannel\(previewAudioContext, previewSourceNode, previewAnalyserNode\)/);
-  assert.match(source, /connectFirstMicrophoneChannel\(audioContext, sourceNode, analyserNode\)/);
-  assert.match(source, /previewInputChannelNode\?\.disconnect\(\)/);
-  assert.match(source, /inputChannelNode\?\.disconnect\(\)/);
-});

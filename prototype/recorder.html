@@ -262,16 +262,16 @@
         </aside>
       </div>
 
-      <section class="panel network-event-panel" aria-labelledby="networkEventHeading">
-        <div class="network-event-heading">
+      <details id="networkEventPanel" class="panel network-event-panel" aria-labelledby="networkEventHeading" open>
+        <summary class="network-event-heading">
           <div>
             <span class="terminal-section-code">EVENT LOG</span>
             <h2 id="networkEventHeading" class="visually-hidden">Events</h2>
           </div>
           <span id="networkEventCount" class="network-event-count">0 EVENTS</span>
-        </div>
+        </summary>
         <div id="networkEventLog" class="network-event-log" aria-label="Event log" role="log" aria-live="off" tabindex="0"></div>
-      </section>
+      </details>
 
     </section>
   </main>
