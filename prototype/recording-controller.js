@@ -114,11 +114,12 @@ export class RecordingController {
       this.lastFailure = failure;
       return { success: false, completionSaved: false, failure, take: null, observation };
     }
+    let notificationFailure = null;
     if (notify) {
-      try { await notify(take); } catch (error) { failure ||= { stage: 'notification', message: error.message }; }
+      try { await notify(take); } catch (error) { notificationFailure = { stage: 'notification', message: error.message }; }
     }
     this.lastFailure = failure;
-    return { success: !failure, completionSaved: true, failure, take, observation };
+    return { success: !failure, completionSaved: true, failure, notificationFailure, take, observation };
   }
 }
 

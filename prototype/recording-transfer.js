@@ -1,12 +1,11 @@
 import { validWallTime, validStartPlan, validStartObservation } from './recording-timing.js';
 
-const CHUNK_BYTES_PER_FRAME = 3;
-const WAV_HEADER_BYTES = 44;
+import { validWavChunk, validWavSize, wavByteLength } from './wav-format.js';
 const MAX_CHUNK_FRAMES = 48_000;
 const MAX_TAKE_FRAMES = 2 * 60 * 60 * MAX_CHUNK_FRAMES;
 const MAX_TAKE_CHUNKS = 2 * 60 * 60;
 const MAX_TAKE_NUMBER = 1_000_000;
-const MAX_CHUNK_BYTES = WAV_HEADER_BYTES + MAX_CHUNK_FRAMES * CHUNK_BYTES_PER_FRAME;
+const MAX_CHUNK_BYTES = wavByteLength(MAX_CHUNK_FRAMES);
 const MESSAGE_BYTES = 16 * 1024;
 const BUFFERED_BYTES_LIMIT = 64 * 1024;
 const ACK_TIMEOUT_MS = 30_000;
@@ -40,7 +39,7 @@ function invalidChunkMetadataFields(message) {
       message.frames > MAX_CHUNK_FRAMES ||
       message.startFrame + message.frames > MAX_TAKE_FRAMES) invalid.push('frames');
   if (!Number.isSafeInteger(message.totalBytes) ||
-      message.totalBytes !== WAV_HEADER_BYTES + message.frames * CHUNK_BYTES_PER_FRAME ||
+      !validWavSize(message.totalBytes, message.frames) ||
       message.totalBytes > MAX_CHUNK_BYTES) invalid.push('totalBytes');
   if (typeof message.final !== 'boolean') invalid.push('final');
   if (!HASH_PATTERN.test(message.sha256 || '')) invalid.push('sha256');
@@ -54,24 +53,6 @@ function invalidChunkMetadataFields(message) {
     invalid.push('startedAtEstimated');
   }
   return invalid;
-}
-
-function validWavChunk(bytes, frames) {
-  if (bytes.byteLength !== WAV_HEADER_BYTES + frames * CHUNK_BYTES_PER_FRAME) return false;
-  const view = new DataView(bytes.buffer, bytes.byteOffset, WAV_HEADER_BYTES);
-  return view.getUint32(0, false) === 0x52494646 &&
-    view.getUint32(4, true) === bytes.byteLength - 8 &&
-    view.getUint32(8, false) === 0x57415645 &&
-    view.getUint32(12, false) === 0x666d7420 &&
-    view.getUint32(16, true) === 16 &&
-    view.getUint16(20, true) === 1 &&
-    view.getUint16(22, true) === 1 &&
-    view.getUint32(24, true) === 48_000 &&
-    view.getUint32(28, true) === 144_000 &&
-    view.getUint16(32, true) === 3 &&
-    view.getUint16(34, true) === 24 &&
-    view.getUint32(36, false) === 0x64617461 &&
-    view.getUint32(40, true) === frames * CHUNK_BYTES_PER_FRAME;
 }
 
 function validManifest(message) {
@@ -260,7 +241,7 @@ export class RecordingTransfer {
   async sendChunkWithRetry({ take, chunk }) {
     if (!(chunk.wav instanceof Blob) || chunk.wav.size > MAX_CHUNK_BYTES ||
         !Number.isSafeInteger(chunk.frames) || chunk.frames < 1 || chunk.frames > MAX_CHUNK_FRAMES ||
-        chunk.wav.size !== WAV_HEADER_BYTES + chunk.frames * CHUNK_BYTES_PER_FRAME ||
+        !validWavSize(chunk.wav.size, chunk.frames) ||
         !Number.isSafeInteger(chunk.sequence) || chunk.sequence < 0 ||
         !Number.isSafeInteger(chunk.startFrame) || chunk.startFrame < 0) {
       throw new Error('The WAV chunk format or size limit for sending is invalid.');

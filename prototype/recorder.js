@@ -5,7 +5,8 @@ import {
   RecordingTransfer,
   takeWithTransferParticipant
 } from './recording-transfer.js';
-import { canQueueRecordingCommit } from './recording-commit-queue.js';
+import { CommitQueue, publishRecordingCommit } from './recording-commit-queue.js';
+import { RecordingRepository, openDatabase, requestResult, transactionComplete } from './recording-repository.js';
 import { verifyIncomingStoredChunk, verifyIncomingStoredTake } from './recording-storage.js';
 import { reconcileTransferInventory } from './transfer-inventory.js';
 import { createPcm24Wav, writePcm24Wav } from './wav-export.js';
@@ -23,8 +24,6 @@ const TARGET_RATE = 48000;
 const SYNCHRONIZED_START_LEAD_MS = 500;
 const BYTES_PER_FRAME = 3;
 const CHUNK_FRAMES = TARGET_RATE;
-const DB_NAME = 'perfectpodcast-local-v1';
-const DB_VERSION = 3;
 const BLOB_DOWNLOAD_LIMIT = 256 * 1024 * 1024;
 const MAX_WAV_BYTES = 1024 * 1024 * 1024;
 const RAW_AUDIO_CONSTRAINTS = {
@@ -54,6 +53,7 @@ const waveformCanvas = $('waveformCanvas');
 let networkEventLogStartedAt = performance.now();
 
 let database;
+let repository;
 let activeSession = null;
 let studioTitleSavePromise = Promise.resolve(true);
 let studioTitleSaveFailed = false;
@@ -90,9 +90,7 @@ const recordingController = new RecordingController({
   }
 });
 let sessionLimitReached = false;
-let pendingCommits = 0;
-let commitChain = Promise.resolve();
-let commitError = null;
+let commitQueue = null;
 let nextSequence = 0;
 let capturedFrames = 0;
 let takeFrameLimit = 0;
@@ -131,53 +129,6 @@ let deletingSession = false;
 let participantNameEdited = false;
 let networkEventCount = 0;
 const selectedSessionIds = new Set();
-
-const requestResult = (request) => new Promise((resolve, reject) => {
-  request.addEventListener('success', () => resolve(request.result), { once: true });
-  request.addEventListener('error', () => reject(request.error || new Error('IndexedDB request failed')), { once: true });
-});
-
-function transactionComplete(transaction) {
-  return new Promise((resolve, reject) => {
-    transaction.addEventListener('complete', resolve, { once: true });
-    transaction.addEventListener('abort', () => reject(transaction.error || new Error('IndexedDB transaction aborted')), { once: true });
-    transaction.addEventListener('error', () => reject(transaction.error || new Error('IndexedDB transaction failed')), { once: true });
-  });
-}
-
-function openDatabase() {
-  return new Promise((resolve, reject) => {
-    if (!('indexedDB' in window)) {
-      reject(new Error('IndexedDB is not available in this browser. Use Chrome or Edge.'));
-      return;
-    }
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
-    request.addEventListener('upgradeneeded', () => {
-      const db = request.result;
-      if (!db.objectStoreNames.contains('sessions')) db.createObjectStore('sessions', { keyPath: 'id' });
-      if (!db.objectStoreNames.contains('takes')) {
-        const takes = db.createObjectStore('takes', { keyPath: 'id' });
-        takes.createIndex('sessionId', 'sessionId', { unique: false });
-      }
-      if (!db.objectStoreNames.contains('chunks')) {
-        const chunks = db.createObjectStore('chunks', { keyPath: ['takeId', 'sequence'] });
-        chunks.createIndex('takeId', 'takeId', { unique: false });
-      }
-      const takes = request.transaction.objectStore('takes');
-      if (!takes.indexNames.contains('transferGeneration')) {
-        takes.createIndex('transferGeneration', 'transferGeneration', { unique: false });
-      }
-      const chunks = request.transaction.objectStore('chunks');
-      if (chunks.indexNames.contains('transferState')) chunks.deleteIndex('transferState');
-      if (!chunks.indexNames.contains('transferGeneration')) {
-        chunks.createIndex('transferGeneration', 'transferGeneration', { unique: false });
-      }
-    });
-    request.addEventListener('success', () => resolve(request.result), { once: true });
-    request.addEventListener('error', () => reject(request.error || new Error('Unable to open the local recording database.')), { once: true });
-    request.addEventListener('blocked', () => reject(new Error('Another tab is blocking the database update. Close the recording tab and reload the page.')), { once: true });
-  });
-}
 
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes < 0) return '—';
@@ -450,11 +401,7 @@ function drawWaveform() {
 }
 
 async function runRequest(storeName, method, ...args) {
-  const transaction = database.transaction(storeName, 'readonly');
-  const done = transactionComplete(transaction);
-  const result = await requestResult(transaction.objectStore(storeName)[method](...args));
-  await done;
-  return result;
+  return repository.read(storeName, method, ...args);
 }
 
 async function loadAll(storeName) {
@@ -462,10 +409,7 @@ async function loadAll(storeName) {
 }
 
 async function persistSession(session) {
-  const transaction = database.transaction('sessions', 'readwrite');
-  const done = transactionComplete(transaction);
-  transaction.objectStore('sessions').put(session);
-  await done;
+  return repository.put('sessions', session);
 }
 
 function saveStudioSessionName() {
@@ -529,69 +473,28 @@ async function deleteSessionAndRecordings(sessionId) {
 }
 
 async function persistTake(take) {
-  const transaction = database.transaction('takes', 'readwrite');
-  const done = transactionComplete(transaction);
-  transaction.objectStore('takes').put(take);
-  await done;
+  const input = structuredClone(take);
+  const stored = await repository.read('takes', 'get', input.id);
+  if (!stored) return repository.put('takes', input);
+  const { id, frames, chunks, bytes, hostStoredChunks, hostStored, synchronization, startObservation, ...patch } = input;
+  return repository.updateTake(id, (latest) => ({
+    ...latest, ...patch,
+    startObservation: latest.startObservation ?? startObservation,
+    captureStatus: latest.startObservation ? 'started' : patch.captureStatus ?? latest.captureStatus,
+    synchronization: latest.synchronization ?? synchronization
+  }));
 }
 
 async function deleteUnstartedTake(takeId) {
-  const transaction = database.transaction('takes', 'readwrite');
-  const done = transactionComplete(transaction);
-  transaction.objectStore('takes').delete(takeId);
-  await done;
+  return repository.deleteUnstartedTake(takeId);
 }
 
 async function findIndexValue(storeName, indexName, range, predicate = () => true) {
-  const transaction = database.transaction(storeName, 'readonly');
-  const done = transactionComplete(transaction);
-  try {
-    const value = await new Promise((resolve, reject) => {
-      const request = transaction.objectStore(storeName).index(indexName).openCursor(range);
-      request.addEventListener('error', () => reject(request.error || new Error('IndexedDB cursor failed')), { once: true });
-      request.addEventListener('success', () => {
-        const cursor = request.result;
-        if (!cursor) {
-          resolve(null);
-        } else if (predicate(cursor.value)) {
-          resolve(cursor.value);
-        } else {
-          cursor.continue();
-        }
-      });
-    });
-    await done;
-    return value;
-  } catch (error) {
-    await done.catch(() => {});
-    throw error;
-  }
+  return repository.indexValues(storeName, indexName, range, predicate, (value) => value, true);
 }
 
 async function findIndexValues(storeName, indexName, range, predicate = () => true, project = (value) => value) {
-  const transaction = database.transaction(storeName, 'readonly');
-  const done = transactionComplete(transaction);
-  try {
-    const values = await new Promise((resolve, reject) => {
-      const result = [];
-      const request = transaction.objectStore(storeName).index(indexName).openCursor(range);
-      request.addEventListener('error', () => reject(request.error || new Error('IndexedDB cursor failed')), { once: true });
-      request.addEventListener('success', () => {
-        const cursor = request.result;
-        if (!cursor) {
-          resolve(result);
-          return;
-        }
-        if (predicate(cursor.value)) result.push(project(cursor.value));
-        cursor.continue();
-      });
-    });
-    await done;
-    return values;
-  } catch (error) {
-    await done.catch(() => {});
-    throw error;
-  }
+  return repository.indexValues(storeName, indexName, range, predicate, project);
 }
 
 async function getNextTransferChunk(generation) {
@@ -611,8 +514,7 @@ async function getNextTransferChunk(generation) {
 async function ensureTransferParticipant(take) {
   const updatedTake = takeWithTransferParticipant(take, activeSession?.participant);
   if (take.participant === updatedTake.participant) return take;
-  await persistTake(updatedTake);
-  return updatedTake;
+  return repository.patchTake(take.id, { participant: updatedTake.participant });
 }
 
 async function prepareTransferChunk(takeId, sequence, sha256) {
@@ -632,55 +534,7 @@ async function prepareTransferChunk(takeId, sequence, sha256) {
 }
 
 async function markTransferChunkStored(takeId, sequence, sha256) {
-  const transaction = database.transaction(['chunks', 'takes'], 'readwrite');
-  const done = transactionComplete(transaction);
-  const chunks = transaction.objectStore('chunks');
-  const takes = transaction.objectStore('takes');
-  const chunkRequest = chunks.get([takeId, sequence]);
-  const takeRequest = takes.get(takeId);
-  let chunkLoaded = false;
-  let takeLoaded = false;
-  let chunk;
-  let take;
-  let newlyStoredChunk = null;
-  const persistConfirmation = () => {
-    if (!chunkLoaded || !takeLoaded) return;
-    if (!take) {
-      transaction.abort();
-      return;
-    }
-    const confirmedChunks = Array.isArray(take.hostStoredChunks) ? [...take.hostStoredChunks] : [];
-    const existingConfirmation = confirmedChunks.find((item) => item.sequence === sequence);
-    if (existingConfirmation) {
-      if (existingConfirmation.sha256 !== sha256) transaction.abort();
-      return;
-    }
-    if (!chunk || (chunk.sha256 && chunk.sha256 !== sha256)) {
-      transaction.abort();
-      return;
-    }
-    newlyStoredChunk = chunk;
-    confirmedChunks.push({
-      sequence,
-      sha256,
-      bytes: chunk.byteLength ?? chunk.wav?.size ?? 0,
-      frames: chunk.frames
-    });
-    confirmedChunks.sort((left, right) => left.sequence - right.sequence);
-    takes.put({ ...take, hostStoredChunks: confirmedChunks });
-    chunks.delete([takeId, sequence]);
-  };
-  chunkRequest.addEventListener('success', () => {
-    chunk = chunkRequest.result;
-    chunkLoaded = true;
-    persistConfirmation();
-  }, { once: true });
-  takeRequest.addEventListener('success', () => {
-    take = takeRequest.result;
-    takeLoaded = true;
-    persistConfirmation();
-  }, { once: true });
-  await done;
+  const newlyStoredChunk = await repository.markTransferChunkStored(takeId, sequence, sha256);
   if (newlyStoredChunk?.transferGeneration) {
     const chunkBytes = newlyStoredChunk.byteLength ?? newlyStoredChunk.wav?.size ?? 0;
     updateTransferProgressCache(newlyStoredChunk.transferGeneration, 'guest', (progress) => ({
@@ -872,7 +726,7 @@ async function reconcileGuestTransferInventory(generation, hostItems) {
     const take = cursor.value;
     if (!take.remote && manifestStates.has(take.id)) {
       const stored = manifestStates.get(take.id) === true;
-      if (take.hostStored !== stored) cursor.update({ ...take, hostStored: stored });
+      if (take.hostStored !== true && take.hostStored !== stored) cursor.update({ ...take, hostStored: stored });
     }
     cursor.continue();
   });
@@ -1272,7 +1126,10 @@ async function storeIncomingTransferChunk(metadata, wav, sha256) {
     const store = transaction.objectStore('takes');
     const request = store.get(takeId);
     request.addEventListener('success', () => {
-      store.put({ ...nextTake, synchronization: request.result?.synchronization ?? synchronization });
+      const latest = request.result;
+      if (latest && (latest.frames !== take.frames || latest.chunks !== take.chunks)) { transaction.abort(); return; }
+      store.put({ ...nextTake, ...latest, frames: nextTake.frames, chunks: nextTake.chunks, bytes: nextTake.bytes,
+        synchronization: latest?.synchronization ?? synchronization });
     }, { once: true });
   }
   await done;
@@ -1285,14 +1142,14 @@ async function storeIncomingTransferChunk(metadata, wav, sha256) {
       'the displayed take timing may be approximate'
     );
   }
-  updateTransferProgressCache(metadata.generation, 'host', (progress) => ({
-    bytes: progress.bytes + wav.size,
-    frames: progress.frames + metadata.frames,
-    hostStoredBytes: progress.hostStoredBytes + wav.size,
-    hostStoredFrames: progress.hostStoredFrames + metadata.frames,
-    totalTakes: progress.totalTakes + (existingTake ? 0 : 1)
-  }));
-  scheduleTakeRefresh();
+  await publishRecordingCommit({ chunk, take: nextTake }, { update: () => {
+    updateTransferProgressCache(metadata.generation, 'host', (progress) => ({
+      bytes: progress.bytes + chunk.byteLength, frames: progress.frames + chunk.frames,
+      hostStoredBytes: progress.hostStoredBytes + chunk.byteLength, hostStoredFrames: progress.hostStoredFrames + chunk.frames,
+      totalTakes: progress.totalTakes + (existingTake ? 0 : 1)
+    }));
+    scheduleTakeRefresh();
+  }, onError: (stage, error) => appendNetworkEvent(`Recording ${stage} failed after save`, error.message) });
 }
 
 async function storeIncomingTransferManifest(manifest) {
@@ -1324,26 +1181,23 @@ async function storeIncomingTransferManifest(manifest) {
     startedAtEstimated: manifest.startedAtEstimated === true,
     hostStored: true
   };
-  const transaction = database.transaction('takes', 'readwrite');
-  const done = transactionComplete(transaction);
-  const store = transaction.objectStore('takes');
-  const request = store.get(takeId);
-  request.addEventListener('success', () => {
-    if (!request.result) { transaction.abort(); return; }
-    store.put({ ...nextTake, synchronization: request.result.synchronization ?? nextTake.synchronization });
-  }, { once: true });
-  await done;
-  updateTransferProgressCache(manifest.generation, 'host', (progress) => ({
-    completeTakes: progress.completeTakes + 1
+  await repository.updateTake(takeId, (latest) => ({
+    ...latest, status: nextTake.status, endedAt: nextTake.endedAt,
+    startObservation: latest.startObservation ?? nextTake.startObservation,
+    captureStatus: latest.startObservation ? 'started' : nextTake.captureStatus,
+    tailUnknown: nextTake.tailUnknown, startedAtEstimated: nextTake.startedAtEstimated, hostStored: true
   }));
-  await renderTakes();
+  await publishRecordingCommit({ take: nextTake }, { update: async () => {
+    updateTransferProgressCache(manifest.generation, 'host', (progress) => ({ completeTakes: progress.completeTakes + 1 }));
+    await renderTakes();
+  }, onError: (stage, error) => appendNetworkEvent(`Recording ${stage} failed after save`, error.message) });
 }
 
 async function updateSessionSavedSize() {
-  const saved = activeSession
-    ? (await loadAll('takes')).filter((take) => take.sessionId === activeSession.id).reduce((total, take) => total + (take.bytes || 0), 0)
-    : 0;
-  $('sessionSaved').textContent = `${(saved / 1_000_000).toFixed(2)} MB`;
+  const session = activeSession;
+  const summary = session ? await repository.sessionSummary(session.id) : { bytes: 0 };
+  if (activeSession !== session) return;
+  $('sessionSaved').textContent = `${(summary.bytes / 1_000_000).toFixed(2)} MB`;
 }
 
 function scheduleTakeRefresh() {
@@ -1352,16 +1206,20 @@ function scheduleTakeRefresh() {
     takeRefreshTimer = null;
     void (async () => {
       await renderTakes();
-      await updateSessionSavedSize();
     })().catch((error) => {
       errorText.textContent = `Unable to refresh the recording list: ${error.message}`;
     });
   }, 2000);
 }
 
+let renderedSessionSignature = null;
+let sessionRenderVersion = 0;
+
 async function refreshSessionList() {
+  const version = ++sessionRenderVersion;
   const sessions = (await loadAll('sessions')).sort((left, right) => right.createdAt - left.createdAt);
   const takes = await loadAll('takes');
+  if (version !== sessionRenderVersion) return;
   const takesBySession = new Map();
   for (const take of takes) {
     const sessionTakes = takesBySession.get(take.sessionId) || [];
@@ -1384,6 +1242,12 @@ async function refreshSessionList() {
   deleteSelectedSessionsButton.title = guestMode
     ? 'Deleting selected recordings that are not saved on the host will permanently remove audio stored only on this device.'
     : '';
+  const signature = JSON.stringify([guestMode, [...selectedSessionIds], visibleSessions.map((session) => {
+    const items = takesBySession.get(session.id) || [];
+    return [session, items.length, items.reduce((total, take) => total + (take.bytes || 0), 0), guestTakesAreStored(items)];
+  })]);
+  if (signature === renderedSessionSignature) return;
+  renderedSessionSignature = signature;
   sessionList.replaceChildren();
   if (!visibleSessions.length) {
     sessionList.innerHTML = guestMode
@@ -1487,17 +1351,37 @@ async function deleteSelectedSessions() {
   }
 }
 
+const renderedTakeRows = new Map();
+let renderedTakeSession = null;
+let takeRenderVersion = 0;
+
 async function renderTakes() {
-  if (!activeSession) return;
-  const takes = (await loadAll('takes'))
-    .filter((take) => take.sessionId === activeSession.id)
-    .sort((left, right) => left.startedAt - right.startedAt);
-  takeList.replaceChildren();
+  const session = activeSession;
+  if (!session) return;
+  const version = ++takeRenderVersion;
+  const summary = await repository.sessionSummary(session.id);
+  if (activeSession !== session || version !== takeRenderVersion) return;
+  const { takes } = summary;
+  $('sessionSaved').textContent = `${(summary.bytes / 1_000_000).toFixed(2)} MB`;
+  sessionLimitReached = summary.localFrames >= MAX_SESSION_FRAMES;
+  if (renderedTakeSession !== session.id) {
+    renderedTakeRows.clear();
+    takeList.replaceChildren();
+    renderedTakeSession = session.id;
+  }
+  const ids = new Set(takes.map((take) => take.id));
+  for (const [id, cached] of renderedTakeRows) {
+    if (!ids.has(id)) { cached.row.remove(); renderedTakeRows.delete(id); }
+  }
+  if (takes.length) takeList.querySelector('.empty-state')?.remove();
   if (!takes.length) {
-    takeList.innerHTML = '<p class="empty-state">Your recorded takes will appear here.</p>';
-    return;
+    if (!takeList.querySelector('.empty-state')) takeList.innerHTML = '<p class="empty-state">Your recorded takes will appear here.</p>';
+    return summary;
   }
   for (const take of takes) {
+    const signature = JSON.stringify([take, roomCall?.isGuest === true, session.participant]);
+    const cached = renderedTakeRows.get(take.id);
+    if (cached?.signature === signature) continue;
     const row = document.createElement('article');
     row.className = 'take-row';
     const info = document.createElement('div');
@@ -1543,8 +1427,14 @@ async function renderTakes() {
       }
       row.append(notice);
     }
-    takeList.append(row);
+    if (cached) cached.row.replaceWith(row);
+    else {
+      const next = takes.slice(takes.indexOf(take) + 1).find((item) => renderedTakeRows.has(item.id));
+      takeList.insertBefore(row, next ? renderedTakeRows.get(next.id).row : null);
+    }
+    renderedTakeRows.set(take.id, { signature, row });
   }
+  return summary;
 }
 
 async function openSession(session) {
@@ -1585,17 +1475,11 @@ async function openSession(session) {
     roomCall?.setSessionName(session.name);
   }
   setStatus('Ready to start recording');
-  await renderTakes();
-  const takes = (await loadAll('takes'))
-    .filter((take) => take.sessionId === session.id)
-    .sort((left, right) => left.startedAt - right.startedAt);
-  const savedFrames = takes.filter((take) => !take.remote)
-    .reduce((total, take) => total + (take.frames || 0), 0);
-  sessionLimitReached = savedFrames >= MAX_SESSION_FRAMES;
+  const summary = await renderTakes();
+  if (!summary || activeSession !== session) return;
   updateRecordButtonAvailability();
   if (sessionLimitReached) setStatus('This session has reached the 2-hour recording limit.');
-  $('chunkCount').textContent = String(takes.at(-1)?.chunks || 0);
-  await updateSessionSavedSize();
+  $('chunkCount').textContent = String(summary.takes.at(-1)?.chunks || 0);
   if (!recordingController.snapshot.recording && !recordingController.snapshot.starting) {
     try {
       const stream = await ensureCaptureStream();
@@ -1790,89 +1674,51 @@ async function releaseCaptureStream() {
   updateMicrophoneMuteButton();
 }
 
-async function commitChunk(samples, isFinal, startFrame) {
-  if (!activeTake || samples.length === 0) return;
-  if (startFrame !== capturedFrames) {
-    throw new Error(`Recording frames are discontinuous (expected ${capturedFrames} / received ${startFrame}). Recording stopped rather than treating the unknown interval as valid audio.`);
-  }
-  if (!canQueueRecordingCommit(pendingCommits, isFinal)) {
-    throw new Error('The IndexedDB save queue has reached 60 seconds. Recording stopped to prevent data loss.');
-  }
-  const sequence = nextSequence++;
-  capturedFrames += samples.length;
-  const wav = createPcm24Wav(samples);
-  const chunk = {
-    takeId: activeTake.id,
-    sequence,
-    startFrame,
-    frames: samples.length,
-    byteLength: wav.size,
-    wav,
-    transferGeneration: activeTake.transferGeneration,
-    hostStored: activeTake.transferGeneration ? false : null,
-    final: isFinal,
-    committedAt: Date.now()
-  };
-  pendingCommits += 1;
-  commitChain = commitChain.then(async () => {
-    const transaction = database.transaction(['chunks', 'takes'], 'readwrite');
-    const done = transactionComplete(transaction);
-    transaction.objectStore('chunks').put(chunk);
-    let committedTake;
-    const storedTakeRequest = transaction.objectStore('takes').get(chunk.takeId);
-    storedTakeRequest.addEventListener('success', () => {
-      const storedTake = storedTakeRequest.result;
-      if (!storedTake || activeTake?.id !== chunk.takeId) { transaction.abort(); return; }
-      committedTake = {
-        ...mergeRecordingMetadata(storedTake, activeTake),
-        frames: storedTake.frames + samples.length,
-        chunks: storedTake.chunks + 1,
-        bytes: storedTake.bytes + wav.size
-      };
-      transaction.objectStore('takes').put(committedTake);
-    }, { once: true });
-    await done;
-    if (activeTake?.id === committedTake.id) activeTake = mergeRecordingMetadata(committedTake, activeTake);
-  }).catch((error) => {
-    commitError = error;
-    throw error;
-  }).finally(() => {
-    pendingCommits -= 1;
-  });
-  await commitChain;
-  const take = activeTake;
-  if (!take) throw new Error('The saved recording take was not found.');
-  if (chunk.transferGeneration) {
-    updateTransferProgressCache(chunk.transferGeneration, 'guest', (progress) => ({
-      bytes: progress.bytes + wav.size,
-      frames: progress.frames + samples.length,
-      pendingBytes: progress.pendingBytes + wav.size,
-      pendingFrames: progress.pendingFrames + samples.length
+function commitChunk(samples, isFinal, startFrame) {
+  try {
+    if (!activeTake || samples.length === 0) return Promise.resolve();
+    if (startFrame !== capturedFrames) {
+      throw new Error(`Recording frames are discontinuous (expected ${capturedFrames} / received ${startFrame}). Recording stopped rather than treating the unknown interval as valid audio.`);
+    }
+    const wav = createPcm24Wav(samples);
+    const chunk = {
+      takeId: activeTake.id, sequence: nextSequence, startFrame, frames: samples.length,
+      byteLength: wav.size, wav, transferGeneration: activeTake.transferGeneration,
+      hostStored: activeTake.transferGeneration ? false : null,
+      final: isFinal, committedAt: Date.now()
+    };
+    const call = roomCall;
+    const task = commitQueue.enqueue(chunk);
+    nextSequence += 1;
+    capturedFrames += chunk.frames;
+    samples = null;
+    return task.then((result) => publishRecordingCommit(result, {
+      update: ({ chunk, take }) => {
+        if (activeTake?.id === take.id) {
+          activeTake = mergeRecordingMetadata(take, activeTake);
+          $('chunkCount').textContent = String(take.chunks);
+        }
+        if (chunk.transferGeneration) {
+          updateTransferProgressCache(chunk.transferGeneration, 'guest', (progress) => ({
+            bytes: progress.bytes + chunk.byteLength, frames: progress.frames + chunk.frames,
+            pendingBytes: progress.pendingBytes + chunk.byteLength, pendingFrames: progress.pendingFrames + chunk.frames
+          }));
+        }
+        scheduleTakeRefresh();
+      },
+      notify: ({ chunk, take }) => { if (roomCall === call) call?.notifyChunkCommitted(chunk, take); },
+      onError: (stage, error) => appendNetworkEvent(`Recording ${stage} failed after save`, error.message)
     }));
-  }
-  $('chunkCount').textContent = String(take.chunks);
-  scheduleTakeRefresh();
-  roomCall?.notifyChunkCommitted(chunk, take);
+  } catch (error) { return Promise.reject(error); }
 }
 
-
-
 function queueRecordingMetadata(patch) {
-  const update = { id: activeTake?.id, ...patch };
-  if (!update.id) return;
-  commitChain = commitChain.then(async () => {
-    try {
-      const transaction = database.transaction('takes', 'readwrite');
-      const done = transactionComplete(transaction);
-      const store = transaction.objectStore('takes');
-      const request = store.get(update.id);
-      request.addEventListener('success', () => {
-        if (!request.result) { transaction.abort(); return; }
-        store.put(mergeRecordingMetadata(request.result, update));
-      }, { once: true });
-      await done;
-    } catch (error) {
-      appendNetworkEvent('Recording metadata save failed', error.message);
+  const queue = commitQueue;
+  if (!queue) return;
+  void queue.patch(patch).catch((error) => {
+    appendNetworkEvent('Recording metadata save failed', error.message);
+    if (commitQueue === queue && activeTake?.id === queue.takeId) {
+      void stopRecording(error.message).catch((stopError) => setMessage(`Unable to stop recording: ${stopError.message}`, true));
     }
   });
 }
@@ -1903,8 +1749,7 @@ async function createTake({
   if (audioContext.sampleRate !== TARGET_RATE) {
     throw new Error(`This device’s AudioContext is ${audioContext.sampleRate} Hz. 48,000 Hz is required.`);
   }
-  const sessionTakes = (await loadAll('takes'))
-    .filter((take) => take.sessionId === activeSession.id && !take.remote);
+  const sessionTakes = (await repository.listSessionTakes(takeSession.id)).filter((take) => !take.remote);
   if (!isCurrent()) throw new Error('The recording preparation was canceled.');
   const savedFrames = sessionTakes.reduce((total, take) => total + (take.frames || 0), 0);
   takeFrameLimit = remainingSessionFrames(savedFrames);
@@ -1937,9 +1782,7 @@ async function createTake({
   resetWaveformHistory(localWaveform, null);
   waveformElapsedSeconds = 0;
   updateMeter(0);
-  pendingCommits = 0;
-  commitError = null;
-  commitChain = Promise.resolve();
+  commitQueue = new CommitQueue(repository, activeTake.id);
 
   const graph = await localAudioEngine.startTake(mediaStream);
   if (!isCurrent()) throw new Error('The recording preparation was canceled.');
@@ -1974,7 +1817,7 @@ async function createTake({
       takeStartedAt = observedAt;
       activeTake.startObservation = { frame: data.frame, localPerfMs: observedAt, contextTime: data.contextTime };
       activeTake.captureStatus = 'started';
-      queueRecordingMetadata({ startObservation: activeTake.startObservation });
+      queueRecordingMetadata({ startObservation: activeTake.startObservation, captureStatus: 'started' });
       resetWaveformHistory(localWaveform, observedAt, observedAt);
       waveformElapsedSeconds = 0;
       roomCall?.beginRecordingWaveform(observedAt);
@@ -1993,7 +1836,7 @@ async function createTake({
       return;
     }
     if (data.type === 'audio') {
-      if (commitError) return;
+      if (commitQueue?.failure) return;
       void commitChunk(data.samples, data.final, data.startFrame).catch((error) => {
         errorText.textContent = error.message || `Unable to save chunk: ${error}`;
         void stopRecording(errorText.textContent);
@@ -2208,6 +2051,8 @@ async function finishRecording(recoveryReason = null) {
   }
   if (activeTake.status === 'preparing' && !activeTake.startObservation) return discardPreparedTake();
   const takeId = activeTake.id;
+  const takeToFinish = structuredClone(activeTake);
+  const queue = commitQueue;
   const stopRequestedAt = performance.now();
   appendNetworkEvent('Recording stop local',
     `requestedAt=${stopRequestedAt.toFixed(3)} ms frames=${activeTake.frames} recovery=${Boolean(recoveryReason)}`);
@@ -2220,63 +2065,54 @@ async function finishRecording(recoveryReason = null) {
   window.clearTimeout(takeRefreshTimer);
   takeRefreshTimer = null;
   const result = await recordingController.finalize({
-    recoveryReason: recoveryReason || commitError,
+    recoveryReason: recoveryReason || queue?.failure?.message,
     stopCapture: async () => {
       const data = await confirmWorkletStop(recorderNode?.port);
-      if (data) logRecordingDuration(data, stopRequestedAt, activeTake);
+      if (data) logRecordingDuration(data, stopRequestedAt, takeToFinish);
       else appendNetworkEvent('Recording stop confirmation warning', 'AudioWorklet confirmation timed out or unavailable');
       return data;
     },
     drain: async (observation) => {
-      await commitChain;
-      if (observation && observation.frames !== activeTake.frames) {
+      await queue.drain();
+      const stored = await repository.read('takes', 'get', takeId);
+      if (observation && observation.frames !== stored?.frames) {
         throw new Error('The saved frame count does not match the AudioWorklet stop confirmation.');
       }
     },
     cleanup: () => stopDiagnostics({ stopCapture: false }),
     persist: async (completion) => {
-      const completedTake = { ...activeTake, ...completion, endedAt: Date.now() };
-      const transaction = database.transaction('takes', 'readwrite');
-      const done = transactionComplete(transaction);
-      const store = transaction.objectStore('takes');
-      let savedTake;
-      const request = store.get(takeId);
-      request.addEventListener('success', () => {
-        if (!request.result) { transaction.abort(); return; }
-        savedTake = { ...mergeRecordingMetadata(request.result, completedTake),
-          ...completion, endedAt: completedTake.endedAt };
-        store.put(savedTake);
-      }, { once: true });
-      await done;
-      activeTake = savedTake;
+      const savedTake = await repository.patchTake(takeId, { ...completion, endedAt: Date.now() });
+      if (activeTake?.id === takeId) activeTake = savedTake;
       return savedTake;
     },
     notify: (take) => { if (take.transferGeneration) roomCall?.notifyTakeFinalized(take); }
   });
-  const take = result.take || activeTake;
-  appendNetworkEvent('Recording save local',
-    `status=${result.success ? 'saved' : result.completionSaved ? 'recovered' : 'unconfirmed'} frames=${take.frames} chunks=${take.chunks}`);
-  $('timer').textContent = formatDuration(take.frames / TARGET_RATE);
+  const take = result.take || takeToFinish;
+  if (activeTake?.id === takeId) activeTake = null;
   takeFrameLimit = 0;
   preparedRecordingEvent = null;
-  $('waveformState').textContent = '';
-  $('waveformState').classList.remove('live');
-  if (result.failure) {
-    errorText.textContent = result.completionSaved
-      ? `${result.failure.message} Confirmed chunks are available as a recovered WAV.`
-      : `${result.failure.message} Completion could not be saved. Existing chunks remain; reload the page to recover them.`;
-  }
-  activeTake = null;
-  await renderTakes();
-  if (activeSession) {
-    const sessionFrames = (await loadAll('takes'))
-      .filter((take) => take.sessionId === activeSession.id && !take.remote)
-      .reduce((total, take) => total + (take.frames || 0), 0);
-    sessionLimitReached = sessionFrames >= MAX_SESSION_FRAMES;
-  }
-  await updateSessionSavedSize();
-  await refreshSessionList();
-  if (result.success) setMessage('Recording data (WAV chunks) has been saved in the browser. Select “Save WAV” to save an audio file.');
+  await publishRecordingCommit(result, { update: () => {
+      appendNetworkEvent('Recording save local',
+        `status=${result.success ? 'saved' : result.completionSaved ? 'recovered' : 'unconfirmed'} frames=${take.frames} chunks=${take.chunks}`);
+      $('timer').textContent = formatDuration(take.frames / TARGET_RATE);
+      $('waveformState').textContent = '';
+      $('waveformState').classList.remove('live');
+      if (result.failure) {
+        errorText.textContent = result.completionSaved
+          ? `${result.failure.message} Confirmed chunks are available as a recovered WAV.`
+          : `${result.failure.message} Completion could not be saved. Existing chunks remain; reload the page to recover them.`;
+      }
+      appendNetworkEvent('Recording commit queue metrics', JSON.stringify(queue.metrics));
+      if (result.notificationFailure) appendNetworkEvent('Recording notification failed after save', result.notificationFailure.message);
+  }, onError: (stage, error) => appendNetworkEvent(`Recording ${stage} failed after save`, error.message) });
+  await publishRecordingCommit(result, {
+    update: async () => {
+      await renderTakes();
+      await refreshSessionList();
+      if (result.success) setMessage('Recording data (WAV chunks) has been saved in the browser. Select “Save WAV” to save an audio file.');
+    },
+    onError: (stage, error) => appendNetworkEvent(`Recording ${stage} failed after save`, error.message)
+  });
   return result.success;
 }
 
@@ -2421,7 +2257,7 @@ async function performRecordingStart(remoteSchedule, { prepareOnly = false, prep
     return recordingController.snapshot.recording;
   } catch (error) {
     await stopDiagnostics({ stopCapture: false });
-    await commitChain.catch(() => {});
+    await commitQueue?.drain().catch(() => {});
     if (preparationEvent) roomCall?.cancelGuestRecordingPreparation(preparationEvent.eventId);
     if ((synchronizedStartAnnounced || preparationAnnounced) && !recordingController.snapshot.cancelRequested) {
       roomCall.setHostRecordingState(false);
@@ -2540,12 +2376,7 @@ function applyHostRecordingState(isRecording, schedule = null) {
 }
 
 async function getTakeChunks(takeId) {
-  const transaction = database.transaction('chunks', 'readonly');
-  const done = transactionComplete(transaction);
-  const index = transaction.objectStore('chunks').index('takeId');
-  const chunks = await requestResult(index.getAll(IDBKeyRange.only(takeId)));
-  await done;
-  return chunks.sort((left, right) => left.sequence - right.sequence);
+  return repository.getTakeChunks(takeId);
 }
 
 async function exportTake(take, exportButton) {
@@ -2613,20 +2444,8 @@ async function exportTake(take, exportButton) {
 }
 
 async function recoverInterruptedTakes() {
-  const takes = await loadAll('takes');
-  const preparing = takes.filter((take) => take.status === 'preparing');
-  for (const take of preparing) await deleteUnstartedTake(take.id);
-  const interrupted = takes.filter((take) => take.status === 'recording');
-  for (const take of interrupted) {
-    await persistTake({
-      ...take,
-      status: 'recovered',
-      endedAt: Date.now(),
-      tailUnknown: true,
-      recoveryReason: 'The tab or browser closed before recording ended. Recovery includes only confirmed chunks.'
-    });
-  }
-  if (interrupted.length) setMessage(`Loaded ${interrupted.length} interrupted take(s) for recovery.`);
+  const recovered = await repository.recoverInterruptedTakes();
+  if (recovered) setMessage(`Loaded ${recovered} interrupted take(s) for recovery.`);
 }
 
 async function stopDiagnosticsOnUnload() {
@@ -2759,6 +2578,7 @@ async function initialize() {
   }
   try {
     database = await openDatabase();
+    repository = new RecordingRepository(database);
     database.addEventListener('versionchange', () => database.close());
     roomCall = new RoomCall({
       getSession: () => activeSession,

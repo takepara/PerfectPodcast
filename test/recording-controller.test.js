@@ -100,6 +100,20 @@ test('stop ACK and completion save certify normal finalization once', async () =
   assert.deepEqual(events, ['stop', 'drain', 'cleanup']);
 });
 
+test('a finalized take stays successfully saved when transfer notification fails', async () => {
+  const controller = new RecordingController();
+  const result = await controller.finalize({
+    stopCapture: async () => ({ frames: 1 }), drain: async () => {}, cleanup: async () => {},
+    persist: async (completion) => ({ id: 'take', ...completion }),
+    notify: async () => { throw new Error('channel unavailable'); }
+  });
+  assert.equal(result.success, true);
+  assert.equal(result.completionSaved, true);
+  assert.equal(result.take.status, 'stopped');
+  assert.equal(result.failure, null);
+  assert.equal(result.notificationFailure.stage, 'notification');
+});
+
 test('stop timeout cannot certify an unknown tail as normally saved', async () => {
   const { result, saves, notifications } = await finalizeScenario({ confirmed: false });
   assert.equal(result.success, false);

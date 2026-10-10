@@ -38,8 +38,30 @@ test('verifies received take chunks using their IndexedDB WAV data and hashes', 
     await storedChunk(0, 0, new Uint8Array([1, 2, 3])),
     await storedChunk(1, 1, new Uint8Array([4, 5, 6]))
   ];
-  const result = await verifyIncomingStoredTake(take, chunks);
+  const result = await verifyIncomingStoredTake(take, [...chunks].reverse());
   assert.deepEqual(result.map((chunk) => chunk.sequence), [0, 1]);
+});
+
+test('rejects altered headers even with matching hashes and preserves transfer ledger checks', async () => {
+  const chunk = await storedChunk(0, 0, new Uint8Array([1, 2, 3]));
+  const bytes = new Uint8Array(await chunk.wav.arrayBuffer());
+  bytes[28] ^= 1;
+  await assert.rejects(verifyIncomingStoredChunk(take, {
+    ...chunk,
+    wav: new Blob([bytes]),
+    sha256: createHash('sha256').update(bytes).digest('hex')
+  }, 0), /Unable to verify received chunk/u);
+  await assert.rejects(verifyIncomingStoredChunk(take, {
+    ...chunk, sha256: '0'.repeat(64)
+  }, 0), /Unable to verify received chunk/u);
+  for (const change of [
+    { transferGeneration: 'old-generation' },
+    { sourceTakeId: 'other-take' },
+    { hostStored: false },
+    { sequence: 1 }
+  ]) {
+    await assert.rejects(verifyIncomingStoredChunk(take, { ...chunk, ...change }, 0), /ledger .* is invalid/u);
+  }
 });
 
 test('rejects missing, altered, or discontinuous IndexedDB chunks', async () => {

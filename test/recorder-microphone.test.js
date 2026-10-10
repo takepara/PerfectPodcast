@@ -28,7 +28,7 @@ function setupSession({ failure = false, recording = false, leaveDuringCapture =
       return elements.get(id);
     },
     stopWaveformRendering: () => events.push('clear'), setStatus: () => {},
-    renderTakes: async () => {}, loadAll: async () => [], updateRecordButtonAvailability: () => {},
+    renderTakes: async () => ({ takes: [], bytes: 0, localFrames: 0 }), loadAll: async () => [], updateRecordButtonAvailability: () => {},
     updateSessionSavedSize: async () => {},
     ensureCaptureStream: async () => {
       events.push('capture');

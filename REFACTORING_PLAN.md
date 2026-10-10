@@ -1,7 +1,38 @@
 # 録音基盤の段階的リファクタリング計画
 
 作成日: 2026-10-10
-状態: Phase 2の状態統廃合・完了契約修正・公開APIテストと短時間ブラウザー検証を実施（2026-10-10）。Phase 1で実機単独／同時／同期録音の結果も記録済み。Phase 2変更後の実機通話・長時間・背景化検証は未完了。DB形式・本番環境は未変更。
+状態: Phase 3の保存Repository・CommitQueue・保存後表示/通知分離と公開API／実IndexedDB検証を実施（2026-10-10）。Phase 0〜2の回帰契約を維持。短時間headless検証を実機通話・長時間・背景化の合格にしない。DBバージョン3・既存レコード形式・60チャンク上限・本番環境は未変更。
+
+## Phase 3 実機確認（2026-10-11受領、収録2026-10-10 UTC）
+
+- Chromeホスト／Edgeゲスト、通話あり、同一セッションの初回・再録音。提出4 WAVをローカルで解析し、RIFF／fmt／data、PCM24／48 kHz／mono、byte rate／block align、ファイルサイズ／dataサイズ／ログの保存フレーム数がすべて一致。フルスケールのクリッピングサンプルは4本とも0。聴取による音質評価は未実施。
+- 1st: Chrome 7,338,028 frames／152.875583秒／22,014,128 bytes、Edge 7,338,371 frames／152.882729秒／22,015,157 bytes、双方153 chunks。2nd: Chrome 6,754,588 frames／140.720583秒／20,263,808 bytes、Edge 6,754,801 frames／140.725021秒／20,264,447 bytes、双方141 chunks。
+- 両takeで同じeventのprepared／armed／実開始を双方確認。ログ推定開始差（guest−host）は1st −1.812 ms、2nd +0.962 ms。入力欠落／context飛び／逆行／contextSpanとaudioの差は全収録0。音声長は推定開始から停止要求までよりChrome約2.134／1.500 ms、Edge約0.600／1.000 ms短い。開始観測と停止境界の推定誤差を含むため、この差だけでドリフトや欠落とは判断しない。
+- WAV長さのguest−host差は1st 343 frames＝7.145833 ms、2nd 213 frames＝4.437500 ms。独立した開始・非同期停止の境界差を含むため、長さ差だけでドリフトと断定しない。両takeともEdgeの5〜35／55〜85／105〜135秒区間を10 ms RMS包絡で比較（Chromeオフセット±100 msを探索）。最大相関は全区間offset 0 ms、1st相関0.996028／0.992470／0.997053、2nd 0.996877／0.996521／0.997074。この10 ms分解能では累積位置ずれを観測せず。sample単位同期や独立した物理マイクの時計精度を保証しない。
+- 全収録で保存キュー最大48,000 frames＝1秒／144,044 bytes、終了時未確定0。最大最古滞留はChrome 1st 15.9 ms／2nd 9.0 ms、Edge 22.7／10.6 ms。直近（最終chunk）transactionはChrome 3.1／2.8 ms、Edge 5.4／4.5 msであり、全transactionの最大値やpercentileではない。今回の通常通話・転送負荷では保存キューの2秒目標内。作成途中／配送待ちの音声や実heap量は別計測。
+- 全take status=saved、ホスト側のゲスト停止保存確認、ゲスト側の全chunkホスト保存確認あり。ゲスト保存完了から全chunkホスト保存表示まで1st約617 ms、2nd約549 ms。再録音でも共有Contextはrunning／48 kHzで、間のsuspend／closedは提示ログにない。ただしContext生成回数と退出時close回数の直接計測ではない。
+- ICE 701警告は接続初期にあるが、収録中の提示ログにconnection failed／disconnectedや音声取得欠落はない。両take停止・転送完了後、22:46:57 UTCにホストがCall ended、同時にゲストDataChannel error／入力レベル同期エラー、約8秒後ICE disconnected、約18秒後PeerConnection failed。保存済みWAVへの影響は提示資料から認められないが、正常退出時のゲスト後始末・エラー表示は要調査として残す。退出操作の詳細や通話終了理由は未確認。録音中の切断復旧とは別事象。
+- 確認できた範囲: Phase 3変更後の通常同期収録・停止・同一セッション再録音、通常接続中の通話／転送並行、提出WAVと取得・保存ログの一致。未確認: 準備取消／退出競合、10分ネットワーク断と再接続・再送回収、長時間／背景化、保存キュー停滞時の上限品質、実quota枯渇、物理マイク／実時間比較、OS停止耐久性、実heap測定。正常退出のゲストエラーも未解決。過去の未検証項目はこの実機確認範囲だけ更新し、他は合格扱いにしない。コード修正・Phase 4・デプロイは行わない。
+
+## Phase 3 実施記録（2026-10-10）
+
+- 開始前にPhase 0〜2の計画・LocalAudioEngine・RecordingController・保存/停止契約と既存テストを確認。基準npm testは204件中202成功・ブラウザー用2件skip・失敗0・TODO0。
+- `prototype/recording-repository.js`にDB接続、読み書き、index検索、session集計、ローカルchunk＋takeカウンターの原子的commit、take metadata更新、既存take内ACK台帳＋確認済みchunk削除、復旧を抽出。DB名／version 3／store・index／既存レコード形式は維持し、DB移行やACK store独立を行わない。受信世代・順序・hashの判断は既存転送境界に残す。
+- `prototype/recording-commit-queue.js`のCommitQueueはtake IDと複製済みWAV／台帳入力を固定して順序保存。保存transactionはglobal activeTakeを参照しない。最初の保存失敗をdrainへ伝播し、後続chunkを保存せず、未確定量は全経路で解放する。開始観測metadataの保存失敗も停止／復旧対象とする。
+- commitはtransaction内の最新takeからカウンターだけを更新し、ACK・開始観測・同期結果を古いactiveTakeで上書きしない。完了は最新takeへ完了フィールドだけをpatch。prepared開始・開始失敗status更新も最新カウンター／ACK／観測／同期を維持。受信chunk／manifest保存も最新metadataを維持し、古いinventoryで確認済みmanifestを未確認へ戻さない。
+- `publishRecordingCommit`で保存後の表示と転送通知を別々に実行し、片方の失敗が他方や保存成功を否定しない。Controllerの完了通知失敗はnotificationFailureとして保存成否と分離。停止ACKなし、chunk保存失敗、完了transaction失敗のPhase 2契約は維持する。表示・通知失敗は保存後エラーとしてevent logへ記録する。
+- キューmetricsは未確定chunk数・frames・bytes（WAV header込み）・最古滞留ms・直近transaction msとピーク値を公開。処理中transactionも未確定に数え、停止時にevent logへ記録する。待機中の追加観測はmetrics getterで取得可能。元Float32配列は同期PCM24変換後に保持せず、キューへの不要samples入力も除去する。
+- 収録画面一覧と容量／ローカルframe集計は既存sessionId indexを用いた1回のsummaryから取得。遅い古い読み取りが新しいsession表示を上書きしない。変更のないtake行は再構築せず、変更行だけ更新。session一覧も表示内容が変わらない場合の全再構築を抑止する。
+- `prototype/wav-format.js`にPCM24／48 kHz／mono／44-byte header／3 bytes-frameと基本header・size検証を共通化。元PCM変換・chunk境界・1 GiB出力制限・転送世代／順序／SHA-256／台帳固有検証は維持。
+- 公開API unit: 不変入力、旧take固定、Float32不保持、キュー量／待機／transaction計測、60chunk上限とfinal例外、失敗伝播、表示と通知の独立失敗、Controller完了通知失敗、一覧のDOM再利用を検証。旧commitとACKのソース切り出しテストは公開Queue／Repository APIへ移行。
+- 実Chrome／Edge IndexedDB: 各69検査。DB version/store/index、chunk成功後take保存前abort／take成功後chunk保存前abortの双方で両方rollback、QuotaExceededError、重複／不連続／未存在拒否、並行ACK・観測・同期／完了patch、復旧／未開始取消、WAVペイロード一致、表示・通知throwの隔離を確認。Quotaは実transaction内のエラー注入であり、実ディスク枯渇は行わない。
+- 最終ブラウザーコマンド: `AUDIO_BROWSER_TESTS=1 AUDIO_DELAY_HOST=1 node --test test/local-audio-browser.test.js`、2件とも成功。実Workletから各ブラウザー2 take、各96,000 frames／WAV 288,044 bytes／997 Hz peak 0.25、連続PCM・共有Context生成1回／退出close1回を確認。実収録ページの取消→録音→停止→再録音・停止連打・停止ACK抑止・完了transaction abortも継続成功。
+- 最終実音声queue計測: 全take最大48,000 frames（1秒）／144,044 bytes。Chrome直近transaction 4.5／3.6 ms・最大最古滞留4.5／3.6 ms、Edge 2.2／3.6 ms・最大最古滞留3.3／3.6 ms。小入力の約70 ms人為待機シナリオは最大15 frames／177 bytes（音声負荷試験ではない）。短時間・偽マイク・合成入力・headless・認証模擬の結果を長時間／実通話の証明にしない。
+- 60個の48,000-frame chunkを意図的に滞留させた公開Queueテスト: 2,880,000 frames（60秒）／8,642,640 bytes。final chunk例外も現行どおり維持。したがって現在の停止上限自体は2秒目標を保証しない。
+- **ユーザー確認済みの2秒目標の意味**: 通常負荷時に、タブが落ちた際に失い得る未保存音声の合計を2秒分以内に抑える性能目標。transaction処理中も含む未確定PCM換算frames <= 96,000で評価する。各chunkの保存所要時間2秒という別の目標や、2秒で強制停止する仕様にはしない。最古滞留時間も観測するが合否基準を混同しない。60chunkは従来の異常時停止上限として維持。今後、長時間・背景化・ACK／再送／転送負荷下の実機計測で整合を判断し、上限変更は別途承認を得る。
+- 最終npm test: 213件中211成功・ブラウザー用2件skip・失敗0・TODO0。最終関連6ファイル42件成功。構文・diff空白チェック成功。依存追加・本番デプロイ・転送方式変更・Phase 4以降は実施しない。
+- **継続する未検証項目**: Phase 2変更後の実機準備取消／再録音、通話退出と準備完了の競合、長時間・背景化、物理マイク／実時間比較。Phase 2の正常同期録音実機結果は当時の確認として維持するが、Phase 3変更後の実機同期録音・通話継続・ACK／再送・転送負荷下の確認には流用しない。実ディスクquota枯渇、OS停止／電源断時の耐久性、メモリーの実機heap計測は未検証。これらを完了扱いにせず、Phase 3終了時点の残課題として継続管理して停止する。
+
 
 ## Phase 2 実施記録（2026-10-10）
 

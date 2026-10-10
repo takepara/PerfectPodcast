@@ -2,12 +2,9 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
+import { RecordingRepository } from '../prototype/recording-repository.js';
 
 const recorderSource = readFileSync(new URL('../prototype/recorder.js', import.meta.url), 'utf8');
-const markStoredFunction = recorderSource.slice(
-  recorderSource.indexOf('async function markTransferChunkStored(takeId, sequence, sha256)'),
-  recorderSource.indexOf('async function loadTakeChunks(takeId)')
-);
 const guestTakeValidation = recorderSource.slice(
   recorderSource.indexOf('function guestTakesAreStored(takes)'),
   recorderSource.indexOf('function clearRecordingTrackMonitor()')
@@ -86,18 +83,8 @@ test('deletes host-confirmed guest WAV chunks and keeps a lightweight confirmati
     }],
     takes: [{ id: 'take-a', transferGeneration: 'generation', chunks: 3 }]
   };
-  const context = vm.createContext({
-    database: { transaction: () => new FakeTransaction(data) },
-    transactionComplete: (tx) => new Promise((resolve, reject) => {
-      tx.addEventListener('complete', resolve, { once: true });
-      tx.addEventListener('abort', reject, { once: true });
-    }),
-    transferProgressCache: null,
-    updateTransferProgressCache() {}
-  });
-  vm.runInContext(markStoredFunction, context);
-
-  await context.markTransferChunkStored('take-a', 2, hash);
+  const repository = new RecordingRepository({ transaction: () => new FakeTransaction(data) });
+  await repository.markTransferChunkStored('take-a', 2, hash);
 
   assert.deepEqual(data.chunks, []);
   assert.equal(JSON.stringify(data.takes[0].hostStoredChunks), JSON.stringify([{
@@ -106,7 +93,7 @@ test('deletes host-confirmed guest WAV chunks and keeps a lightweight confirmati
     bytes: 144_044,
     frames: 48_000
   }]));
-  await context.markTransferChunkStored('take-a', 2, hash);
+  await repository.markTransferChunkStored('take-a', 2, hash);
   assert.equal(data.takes[0].hostStoredChunks.length, 1);
 });
 

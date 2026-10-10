@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createServer } from 'node:http';
 import { readFile, mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join, resolve, extname } from 'node:path';
 import { spawn } from 'node:child_process';
 
@@ -14,22 +13,16 @@ const browserPaths = {
 async function browserScenario() {
   const { LocalAudioEngine } = await import('/prototype/local-audio-engine.js');
   const { createPcm24Wav, writePcm24Wav } = await import('/prototype/wav-export.js');
+  const { openDatabase, RecordingRepository } = await import('/prototype/recording-repository.js');
+  const { CommitQueue } = await import('/prototype/recording-commit-queue.js');
+  const db = await openDatabase(indexedDB, 'local-audio-engine-test');
+  const repository = new RecordingRepository(db);
+  const queueMetrics = [];
   const contexts = [];
   const states = [];
   const engine = new LocalAudioEngine({
     createContext(options) { const context = new AudioContext(options); contexts.push(context); return context; },
     onStateChange(state) { states.push(state); }
-  });
-  const request = indexedDB.open('local-audio-engine-test', 1);
-  request.onupgradeneeded = () => {
-    request.result.createObjectStore('chunks', { keyPath: ['takeId', 'sequence'] });
-    request.result.createObjectStore('takes', { keyPath: 'id' });
-  };
-  const db = await new Promise((resolve, reject) => { request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
-  const transactionDone = (transaction) => new Promise((resolve, reject) => {
-    transaction.oncomplete = resolve;
-    transaction.onabort = () => reject(transaction.error || new Error('transaction aborted'));
-    transaction.onerror = () => reject(transaction.error);
   });
   const microphone = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 48000 } });
   await engine.startPreview(microphone);
@@ -45,6 +38,8 @@ async function browserScenario() {
   const captures = [];
   const writes = [];
   for (const id of ['first', 'second']) {
+    await repository.put('takes', { id, sessionId: 'audio', status: 'recording', frames: 0, chunks: 0, bytes: 0 });
+    const queue = new CommitQueue(repository, id);
     const graph = await engine.startTake(destination.stream);
     let sequence = 0, frames = 0, preparedResolve, startedResolve, stopResolve;
     const prepared = new Promise((resolve) => { preparedResolve = resolve; });
@@ -58,11 +53,7 @@ async function browserScenario() {
         const wav = createPcm24Wav(data.samples);
         const chunk = { takeId: id, sequence: sequence++, startFrame: frames, frames: data.samples.length, byteLength: wav.size, wav };
         frames += data.samples.length;
-        const transaction = db.transaction(['chunks', 'takes'], 'readwrite');
-        const done = transactionDone(transaction);
-        transaction.objectStore('chunks').put(chunk);
-        transaction.objectStore('takes').put({ id, frames, chunks: sequence });
-        writes.push(done);
+        writes.push(queue.enqueue(chunk));
       }
       if (data.type === 'limit-reached') graph.recorder.port.postMessage({ type: 'stop' });
       if (data.type === 'stopped') stopResolve(data);
@@ -73,31 +64,18 @@ async function browserScenario() {
     const start = await started;
     const stop = await stopped;
     if (stop.frames !== 96000 || stop.missingInputFrames || stop.contextGapFrames) throw new Error('unexpected capture duration or gap');
+    await queue.patch({ status: 'stopped', startObservation: start });
+    await queue.drain();
+    queueMetrics.push(queue.metrics);
     captures.push({ frames: stop.frames, spanFrames: Math.round((stop.endSampleContextTime - start.contextTime) * 48000) });
     engine.stopGraph();
     await engine.startPreview(destination.stream);
   }
   await Promise.all(writes);
-  const read = db.transaction(['chunks', 'takes'], 'readonly');
-  const done = transactionDone(read);
-  const chunksRequest = read.objectStore('chunks').getAll();
-  const takesRequest = read.objectStore('takes').getAll();
-  await done;
-  const aborted = db.transaction(['chunks', 'takes'], 'readwrite');
-  const abortDone = transactionDone(aborted);
-  aborted.objectStore('takes').put({ id: 'aborted', frames: 1 });
-  aborted.objectStore('chunks').put({ takeId: 'aborted', sequence: 0 });
-  aborted.abort();
-  await abortDone.catch(() => {});
-  const check = db.transaction(['takes', 'chunks'], 'readonly');
-  const checkDone = transactionDone(check);
-  const abortedTake = check.objectStore('takes').get('aborted');
-  const abortedChunk = check.objectStore('chunks').get(['aborted', 0]);
-  await checkDone;
-  if (abortedTake.result || abortedChunk.result) throw new Error('partial transaction persisted');
+  const takes = await repository.listSessionTakes('audio');
   const exports = [];
-  for (const take of takesRequest.result) {
-    const chunks = chunksRequest.result.filter((chunk) => chunk.takeId === take.id);
+  for (const take of takes) {
+    const chunks = await repository.getTakeChunks(take.id);
     const parts = [];
     await writePcm24Wav(take, chunks, { async write(part) { parts.push(part); } });
     const bytes = new Uint8Array(await new Blob(parts).arrayBuffer());
@@ -115,7 +93,213 @@ async function browserScenario() {
   signal.stop(); signal.disconnect(); gain.disconnect();
   await engine.dispose();
   db.close();
-  return { contexts: contexts.length, rate: context.sampleRate, closed: context.state, states, captures, exports };
+  return { contexts: contexts.length, rate: context.sampleRate, closed: context.state, states, captures, exports, queueMetrics };
+}
+
+async function repositoryScenario() {
+  const { DB_VERSION, openDatabase, RecordingRepository, transactionComplete } = await import('/prototype/recording-repository.js');
+  const { CommitQueue, publishRecordingCommit } = await import('/prototype/recording-commit-queue.js');
+  const { createPcm24Wav, writePcm24Wav } = await import('/prototype/wav-export.js');
+  let checks = 0;
+  const check = (condition, message) => { if (!condition) throw new Error(message); checks += 1; };
+  const equal = (actual, expected, message) => check(JSON.stringify(actual) === JSON.stringify(expected), message);
+  const rejects = async (operation, pattern) => {
+    let failure;
+    try { await operation(); } catch (error) { failure = error; }
+    check(failure && pattern.test(`${failure.name}: ${failure.message}`), `expected rejection ${pattern}, got ${failure}`);
+    return failure;
+  };
+  const name = 'recording-repository-browser-test';
+  const db = await openDatabase({ open: (...args) => indexedDB.open(...args) }, name);
+  const repository = new RecordingRepository(db);
+  const samples = new Float32Array([-1, -0.5, 0, 0.5, 1]);
+  const wav = createPcm24Wav(samples);
+  const chunk = (takeId, sequence = 0) => ({ takeId, sequence, startFrame: sequence * samples.length,
+    frames: samples.length, byteLength: wav.size, wav });
+  const seed = (id, status = 'recording') => repository.put('takes', {
+    id, sessionId: 'repository', startedAt: 1, status, frames: 0, chunks: 0, bytes: 0, hostStoredChunks: []
+  });
+  const schema = (database) => {
+    const transaction = database.transaction([...database.objectStoreNames], 'readonly');
+    return [...database.objectStoreNames].map((name) => {
+      const store = transaction.objectStore(name);
+      return { name, keyPath: store.keyPath, autoIncrement: store.autoIncrement,
+        indexes: [...store.indexNames].map((name) => {
+          const index = store.index(name);
+          return { name, keyPath: index.keyPath, unique: index.unique, multiEntry: index.multiEntry };
+        }) };
+    });
+  };
+  const index = (name) => ({ name, keyPath: name, unique: false, multiEntry: false });
+  const expectedSchema = [
+    { name: 'chunks', keyPath: ['takeId', 'sequence'], autoIncrement: false, indexes: [index('takeId'), index('transferGeneration')] },
+    { name: 'sessions', keyPath: 'id', autoIncrement: false, indexes: [] },
+    { name: 'takes', keyPath: 'id', autoIncrement: false, indexes: [index('sessionId'), index('transferGeneration')] }
+  ];
+  try {
+    equal(DB_VERSION, 3, 'public DB version changed');
+    equal(db.version, 3, 'actual DB version changed');
+    equal(schema(db), expectedSchema, 'stores or indexes changed');
+    await seed('success');
+    const metrics = [];
+    const queue = new CommitQueue({ async commitChunk(input) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return repository.commitChunk(input);
+    }, patchTake: (...args) => repository.patchTake(...args) }, 'success', {
+      onMetrics(value) { metrics.push(value); throw new Error('metrics UI failed'); }
+    });
+    const tasks = [0, 1, 2].map((sequence) => queue.enqueue(chunk('success', sequence)));
+    const pending = queue.metrics;
+    equal([pending.pendingChunks, pending.pendingFrames, pending.pendingBytes], [3, 15, wav.size * 3], 'pending metrics wrong');
+    const startObservation = { frame: 17, localPerfMs: 42, contextTime: 1 };
+    const synchronization = { eventId: 'browser-sync', offsetMs: 2 };
+    await repository.patchTake('success', { startObservation, synchronization, captureStatus: 'started' });
+    const results = await Promise.all(tasks);
+    await queue.patch({ status: 'stopped', endedAt: 123 });
+    await queue.drain();
+    const take = await repository.read('takes', 'get', 'success');
+    equal([take.frames, take.chunks, take.bytes], [15, 3, wav.size * 3], 'atomic counters wrong');
+    equal([take.startObservation, take.synchronization, take.status],
+      [startObservation, synchronization, 'stopped'], 'metadata lost at commit/completion');
+    await seed('ack');
+    await repository.commitChunk(chunk('ack'));
+    const ackQueue = new CommitQueue(repository, 'ack');
+    const hash = 'a'.repeat(64);
+    const ackResults = await Promise.all([
+      ackQueue.enqueue(chunk('ack', 1)),
+      repository.markTransferChunkStored('ack', 0, hash),
+      repository.patchTake('ack', { startObservation, synchronization })
+    ]);
+    await ackQueue.patch({ status: 'stopped' });
+    await ackQueue.drain();
+    const acknowledged = await repository.read('takes', 'get', 'ack');
+    equal([acknowledged.frames, acknowledged.chunks, acknowledged.bytes, acknowledged.startObservation,
+      acknowledged.synchronization, acknowledged.status], [10, 2, wav.size * 2, startObservation, synchronization, 'stopped'], 'parallel ACK lost counters or metadata');
+    equal(acknowledged.hostStoredChunks, [{ sequence: 0, sha256: hash, bytes: wav.size, frames: 5 }], 'parallel ACK ledger lost');
+    equal(ackResults[1].sequence, 0, 'ACK did not return confirmed chunk');
+    equal((await repository.getTakeChunks('ack')).map((item) => item.sequence), [1], 'ACK did not atomically delete chunk');
+    equal(await repository.markTransferChunkStored('ack', 0, hash), null, 'duplicate ACK not idempotent');
+    await rejects(() => repository.markTransferChunkStored('ack', 0, 'b'.repeat(64)), /abort/i);
+    equal(await repository.read('takes', 'get', 'ack'), acknowledged, 'conflicting ACK changed ledger');
+    await Promise.all([
+      ackQueue.patch({ status: 'stopped', endedAt: 456 }),
+      repository.markTransferChunkStored('ack', 1, hash),
+      repository.patchTake('ack', { startObservation, synchronization })
+    ]);
+    await ackQueue.drain();
+    const completedAck = await repository.read('takes', 'get', 'ack');
+    equal([completedAck.hostStoredChunks.length, completedAck.frames, completedAck.chunks, completedAck.bytes,
+      completedAck.status, completedAck.endedAt, completedAck.startObservation, completedAck.synchronization],
+      [2, 10, 2, wav.size * 2, 'stopped', 456, startObservation, synchronization], 'ACK lost during completion');
+    equal(await repository.getTakeChunks('ack'), [], 'completion ACK chunk retained');
+    const chunks = await repository.getTakeChunks('success');
+    equal(chunks.map((item) => [item.sequence, item.startFrame, item.frames]), [[0, 0, 5], [1, 5, 5], [2, 10, 5]], 'saved chunks wrong');
+    equal(results.map((result) => result.take.frames), [5, 10, 15], 'queue ordering wrong');
+    check(metrics.length > 0 && metrics.every((item) => Number.isFinite(item.transactionMs) && item.transactionMs >= 0), 'transaction timings invalid');
+    const drained = queue.metrics;
+    equal([drained.pendingChunks, drained.pendingFrames, drained.pendingBytes, drained.oldestWaitMs], [0, 0, 0, 0], 'queue did not drain');
+    check(drained.maxOldestWaitMs >= 20 && drained.maxPendingFrames === 15 && drained.maxPendingBytes === wav.size * 3, 'queue maxima missing');
+    const failures = await publishRecordingCommit(results.at(-1), {
+      update() { throw new Error('display failed'); }, async notify() { throw new Error('notify failed'); },
+      onError() { throw new Error('error UI failed'); }
+    });
+    equal(failures.map((failure) => failure.stage), ['display', 'notification'], 'publish failures not isolated');
+    equal(await repository.read('takes', 'get', 'success'), take, 'publish changed storage');
+    const parts = [];
+    await writePcm24Wav(take, chunks, { async write(part) { parts.push(part); } });
+    const output = new Uint8Array(await new Blob(parts).arrayBuffer());
+    const expected = new Uint8Array(await createPcm24Wav(new Float32Array([...samples, ...samples, ...samples])).arrayBuffer());
+    equal([...output], [...expected], 'WAV header/payload round trip differs');
+    await rejects(() => writePcm24Wav(take, chunks.slice(1), { async write() {} }), /ledger|frame count/);
+    await rejects(() => writePcm24Wav(take, [chunks[0], { ...chunks[1], startFrame: 6 }, chunks[2]], { async write() {} }), /ledger/);
+    await rejects(() => writePcm24Wav(take, [chunks[0], chunks[0], chunks[2]], { async write() {} }), /ledger/);
+    await rejects(() => repository.commitChunk(chunk('missing')), /saved ledger/);
+    await rejects(() => repository.commitChunk(chunk('success', 0)), /saved ledger/);
+    await rejects(() => repository.commitChunk({ ...chunk('success', 3), startFrame: 16 }), /saved ledger/);
+    equal(await repository.read('takes', 'get', 'success'), take, 'rejected commit mutated ledger');
+    equal((await repository.getTakeChunks('success')).length, 3, 'rejected commit mutated chunks');
+    await seed('duplicate-key', 'stopped');
+    await repository.put('chunks', chunk('duplicate-key'));
+    const duplicateBefore = await repository.read('takes', 'get', 'duplicate-key');
+    await rejects(() => repository.commitChunk(chunk('duplicate-key')), /ConstraintError/);
+    equal(await repository.read('takes', 'get', 'duplicate-key'), duplicateBefore, 'duplicate key request did not roll back take write');
+    equal((await repository.getTakeChunks('duplicate-key')).length, 1, 'duplicate key changed stored chunk');
+    const rollbacks = [];
+    for (const mode of ['chunk-success-before-take', 'take-success-before-chunk', 'quota']) {
+      await seed(mode);
+      const before = await repository.read('takes', 'get', mode);
+      const nativeTransaction = db.transaction;
+      let succeeded = null, transactionStarted = false;
+      db.transaction = function(stores, access, ...args) {
+        const transaction = nativeTransaction.call(this, stores, access, ...args);
+        if (access !== 'readwrite' || !Array.isArray(stores) || !stores.includes('chunks')) return transaction;
+        transactionStarted = true;
+        const nativeObjectStore = transaction.objectStore.bind(transaction);
+        const takes = nativeObjectStore('takes'), chunks = nativeObjectStore('chunks');
+        const nativePut = takes.put.bind(takes), nativeAdd = chunks.add.bind(chunks);
+        let deferredChunk;
+        if (mode === 'take-success-before-chunk') {
+          chunks.add = (input) => { deferredChunk = input; };
+          takes.put = (input) => {
+            const request = nativePut(input);
+            request.addEventListener('success', () => {
+              succeeded = 'takes';
+              check(!!deferredChunk, 'chunk failure was not deferred');
+              transaction.abort();
+            }, { once: true });
+            return request;
+          };
+        } else if (mode === 'chunk-success-before-take') {
+          chunks.add = (input) => {
+            const request = nativeAdd(input);
+            request.addEventListener('success', () => { succeeded = 'chunks'; transaction.abort(); }, { once: true });
+            return request;
+          };
+          takes.put = () => {};
+        } else {
+          takes.put = () => { throw new DOMException('Injected quota failure (no disk exhaustion)', 'QuotaExceededError'); };
+        }
+        transaction.objectStore = (name) => name === 'takes' ? takes : name === 'chunks' ? chunks : nativeObjectStore(name);
+        return transaction;
+      };
+      const failedQueue = new CommitQueue(repository, mode);
+      let error;
+      try {
+        error = await rejects(() => failedQueue.enqueue(chunk(mode)), mode === 'quota' ? /QuotaExceededError/ : /abort/i);
+        await rejects(() => failedQueue.drain(), mode === 'quota' ? /QuotaExceededError/ : /abort/i);
+      } finally { db.transaction = nativeTransaction; }
+      check(transactionStarted, 'failure did not use a real IndexedDB transaction');
+      equal(succeeded, mode === 'quota' ? null : mode.startsWith('chunk') ? 'chunks' : 'takes', 'first write did not succeed before abort');
+      equal(await repository.read('takes', 'get', mode), before, 'aborted take counters persisted');
+      equal(await repository.getTakeChunks(mode), [], 'aborted chunk persisted');
+      equal(failedQueue.metrics.pendingChunks, 0, 'failed queue did not drain');
+      check(Number.isFinite(error.transactionMs) && error.transactionMs >= 0, 'failure transaction timing missing');
+      rollbacks.push({ mode, succeeded, error: error.name, transactionMs: error.transactionMs });
+    }
+    await seed('interrupted');
+    await repository.commitChunk(chunk('interrupted'));
+    await seed('preparing', 'preparing');
+    await seed('canceled', 'preparing');
+    await repository.deleteUnstartedTake('canceled');
+    equal(await repository.read('takes', 'get', 'canceled'), undefined, 'preparing cancellation persisted');
+    equal(await repository.recoverInterruptedTakes(), 4, 'recovery count wrong');
+    equal(await repository.read('takes', 'get', 'preparing'), undefined, 'recovery retained preparing take');
+    const recovered = await repository.read('takes', 'get', 'interrupted');
+    equal([recovered.status, recovered.frames, recovered.chunks, recovered.bytes, recovered.tailUnknown],
+      ['recovered', 5, 1, wav.size, true], 'recovery counters or unknown tail wrong');
+    equal((await repository.getTakeChunks('interrupted')).length, 1, 'recovery lost confirmed chunk');
+    equal(await repository.recoverInterruptedTakes(), 0, 'recovery not idempotent');
+    equal(await repository.read('takes', 'get', 'success'), take, 'recovery modified stopped take');
+    equal(schema(db), expectedSchema, 'scenario modified stores/indexes');
+    const reopened = await openDatabase(indexedDB, name);
+    equal(schema(reopened), expectedSchema, 'reopen modified schema');
+    equal(await new RecordingRepository(reopened).read('takes', 'get', 'success'), take, 'commits not persistent across reopen');
+    reopened.close();
+    // Ensure all schema-read transactions complete before closing the connection.
+    await transactionComplete(db.transaction('takes', 'readonly'));
+    return { checks, version: db.version, commits: results.length, metricSamples: metrics.length,
+      metrics: drained, rollbacks, wavBytes: output.length };
+  } finally { db.close(); }
 }
 
 async function recorderScenario() {
@@ -209,7 +393,7 @@ for (const [name, executable] of Object.entries(browserPaths)) {
   test(`${name}: real Worklet, shared context, IndexedDB and PCM WAV round trip`, {
     skip: process.env.AUDIO_BROWSER_TESTS !== '1', timeout: 45000
   }, async () => {
-    const profile = await mkdtemp(join(tmpdir(), 'perfectpodcast-audio-test-'));
+    const profile = await mkdtemp(join(resolve('.'), '.audio-browser-profile-'));
     const root = resolve('.');
     const server = createServer(async (request, response) => {
       if (request.url === '/') { response.setHeader('Content-Type', 'text/html'); response.end('<!doctype html><title>Audio test</title>'); return; }
@@ -257,6 +441,14 @@ for (const [name, executable] of Object.entries(browserPaths)) {
         if (Date.now() > initialDeadline) throw new Error('Initial browser navigation timed out');
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
+      const repositoryResult = await command('Runtime.evaluate', {
+        expression: `(${repositoryScenario.toString()})()`, awaitPromise: true, returnByValue: true
+      });
+      assert.equal(repositoryResult.exceptionDetails, undefined, JSON.stringify(repositoryResult.exceptionDetails));
+      assert.ok(repositoryResult.result.value.checks >= 60);
+      assert.equal(repositoryResult.result.value.commits, 3);
+      assert.equal(repositoryResult.result.value.rollbacks.length, 3);
+      console.log(`${name} repository verification: ${JSON.stringify(repositoryResult.result.value)}`);
       const result = await command('Runtime.evaluate', { expression: `(${browserScenario.toString()})()`, awaitPromise: true, returnByValue: true });
       assert.equal(result.exceptionDetails, undefined, JSON.stringify(result.exceptionDetails));
       const value = result.result.value;
